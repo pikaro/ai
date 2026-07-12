@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     voice: str = 'alba'
     torch_threads: int = Field(default=2, ge=1)
     maximum_input_characters: int = Field(default=4_000, ge=1)
-    port: int = Field(default=8001, ge=1, le=65_535)
+    port: int = Field(default=8080, ge=1, le=65_535)
 
 
 class HealthResponse(BaseModel):
