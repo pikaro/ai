@@ -29,6 +29,7 @@ FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     DO_NOT_TRACK=1 \
+    HOME=/tmp \
     HF_HUB_DISABLE_TELEMETRY=1 \
     PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -36,6 +37,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     WANDB_DISABLED=true \
     TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor \
     HF_HOME=/models/huggingface \
+    MPLCONFIGDIR=/tmp/ai-cache/matplotlib \
+    NUMBA_CACHE_DIR=/tmp/ai-cache/numba \
+    XDG_CACHE_HOME=/tmp/ai-cache \
     STT_PORT=8080
 
 RUN apt-get update \
@@ -46,7 +50,7 @@ RUN apt-get update \
     libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
-    && useradd --uid 10001 --gid app --create-home app
+    && useradd --uid 10001 --gid app --home-dir /tmp --no-create-home app
 
 WORKDIR /app
 
@@ -54,9 +58,9 @@ COPY --from=builder /opt/venv /opt/venv
 
 COPY --chown=app:app stt/src/ ./
 
-RUN python -c "import importlib.util; import nemo.collections.asr; import main; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None"
-
 USER 10001:10001
+
+RUN python -c "import importlib.util; import librosa.filters; import nemo.collections.asr; import main; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None"
 
 EXPOSE 8080
 
