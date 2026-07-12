@@ -11,7 +11,7 @@ class SettingsTest(unittest.TestCase):
     def test_environment_configuration(self) -> None:
         environment = {
             'TTS_LANGUAGE': 'german',
-            'TTS_MAX_INPUT_CHARACTERS': '120',
+            'TTS_MAXIMUM_INPUT_CHARACTERS': '120',
             'TTS_VOICE': 'juergen',
         }
         with patch.dict(os.environ, environment, clear=True):

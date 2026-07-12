@@ -10,9 +10,9 @@ from stt.src.main import RealtimeEvent, Settings, stable_word_prefix, transcript
 class SettingsTest(unittest.TestCase):
     def test_environment_configuration(self) -> None:
         environment = {
-            'ASR_ATT_CONTEXT_SIZE': '70,0',
-            'ASR_MAX_UPLOAD_BYTES': '1024',
-            'ASR_ONLINE_NORMALIZATION': 'true',
+            'STT_ATTENTION_CONTEXT_SIZE': '70,0',
+            'STT_MAXIMUM_UPLOAD_BYTES': '1024',
+            'STT_ONLINE_NORMALIZATION': 'true',
         }
         with patch.dict(os.environ, environment, clear=True):
             settings = Settings()
