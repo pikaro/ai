@@ -21,9 +21,9 @@ WORKDIR /app
 COPY requirements.txt ./requirements.txt
 
 RUN python -m pip install --no-cache-dir \
-        --index-url https://download.pytorch.org/whl/cpu \
-        "torch==${PYTORCH_VERSION}" \
-        "torchaudio==${PYTORCH_VERSION}"
+    --index-url https://download.pytorch.org/whl/cpu \
+    "torch==${PYTORCH_VERSION}" \
+    "torchaudio==${PYTORCH_VERSION}"
 
 RUN python -m pip install --no-cache-dir --requirement requirements.txt \
     && python -c "import importlib.util; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None"
@@ -32,7 +32,7 @@ RUN python -m pip install --no-cache-dir --requirement requirements.txt \
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends patchelf \
     && find /opt/venv -path '*/editdistance/bycython*.so' \
-        -exec patchelf --add-needed libstdc++.so.6 {} + \
+    -exec patchelf --add-needed libstdc++.so.6 {} + \
     && rm -rf /var/lib/apt/lists/*
 
 FROM python:3.14-slim-bookworm
@@ -43,7 +43,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    WANDB_DISABLED=true
+    WANDB_DISABLED=true \
+    HF_HOME=/models/huggingface
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ffmpeg libsndfile1 libstdc++6 \

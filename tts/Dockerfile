@@ -6,7 +6,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DO_NOT_TRACK=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/models/huggingface
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends libsndfile1 \
@@ -19,8 +20,8 @@ WORKDIR /app
 COPY requirements.txt ./requirements.txt
 
 RUN python -m pip install --no-cache-dir \
-        --index-url https://download.pytorch.org/whl/cpu \
-        "torch==${PYTORCH_VERSION}" \
+    --index-url https://download.pytorch.org/whl/cpu \
+    "torch==${PYTORCH_VERSION}" \
     && python -m pip install --no-cache-dir --requirement requirements.txt
 
 COPY --chown=app:app src/ ./
