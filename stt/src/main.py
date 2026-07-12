@@ -6,7 +6,6 @@ import binascii
 import importlib
 import json
 import logging
-import os
 import tempfile
 import threading
 import time
@@ -26,7 +25,8 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -39,78 +39,81 @@ SUPPORTED_UPLOAD_SUFFIXES: Final = frozenset(
 )
 
 
-def _env_bool(name: str) -> bool:
-    value = os.getenv(name)
-    return False if value is None else value.casefold() in {'1', 'true', 'yes', 'on'}
-
-
-class Settings(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix='STT_',
+        case_sensitive=False,
+        frozen=True,
+        extra='ignore',
+    )
 
     model_id: str = 'nvidia/stt_en_fastconformer_hybrid_large_streaming_multi'
     device: str = 'cpu'
     torch_threads: int = Field(default=4, ge=1)
     decoder_type: Literal['rnnt', 'ctc'] = 'rnnt'
-    attention_context_size: tuple[int, int] | None = (70, 1)
+
+    attention_context_size: Annotated[
+        tuple[int, int] | None,
+        NoDecode,
+    ] = (70, 1)
+
     input_audio_seconds: float = Field(default=0.25, gt=0)
     final_flush_seconds: float = Field(default=0.25, ge=0)
     preprocess_holdback_seconds: float = Field(default=0.1, ge=0)
     minimum_delta_characters: int = Field(default=1, ge=1)
+
     online_normalization: bool = False
     pad_and_drop_preencoded: bool = False
-    stream_sample_rate: int = Field(default=16_000, ge=8_000)
-    maximum_upload_bytes: int = Field(default=100 * 1024 * 1024, ge=1)
-    maximum_stream_bytes: int = Field(default=30 * 60 * 16_000 * 2, ge=1)
-    maximum_websocket_message_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
-    port: int = Field(default=8002, ge=1, le=65_535)
 
+    stream_sample_rate: int = Field(default=16_000, ge=8_000)
+    maximum_upload_bytes: int = Field(default=100 * 1024**2, ge=1)
+    maximum_stream_bytes: int = Field(
+        default=30 * 60 * 16_000 * 2,
+        ge=1,
+    )
+    maximum_websocket_message_bytes: int = Field(
+        default=2 * 1024**2,
+        ge=1,
+    )
+    port: int = Field(default=8080, ge=1, le=65_535)
+
+    @model_validator(mode='before')
     @classmethod
-    def from_environment(cls) -> Settings:
-        input_seconds = float(
-            os.getenv('ASR_INPUT_AUDIO_SECONDS', os.getenv('ASR_EMIT_AUDIO_SECONDS', '0.25')),
-        )
-        values: dict[str, object] = {
-            'model_id': os.getenv('ASR_MODEL', cls.model_fields['model_id'].default),
-            'device': os.getenv('ASR_DEVICE', cls.model_fields['device'].default),
-            'torch_threads': int(os.getenv('ASR_TORCH_THREADS', '4')),
-            'decoder_type': os.getenv('ASR_DECODER_TYPE', 'rnnt'),
-            'attention_context_size': os.getenv('ASR_ATT_CONTEXT_SIZE', '[70,1]'),
-            'input_audio_seconds': input_seconds,
-            'final_flush_seconds': float(
-                os.getenv('ASR_FINAL_FLUSH_SECONDS', str(input_seconds)),
-            ),
-            'preprocess_holdback_seconds': float(
-                os.getenv('ASR_PREPROCESS_HOLDBACK_SECONDS', '0.1'),
-            ),
-            'minimum_delta_characters': int(os.getenv('ASR_MIN_DELTA_CHARS', '1')),
-            'online_normalization': _env_bool('ASR_ONLINE_NORMALIZATION'),
-            'pad_and_drop_preencoded': _env_bool('ASR_PAD_AND_DROP_PREENCODED'),
-            'stream_sample_rate': int(os.getenv('ASR_STREAM_SAMPLE_RATE', '16000')),
-            'maximum_upload_bytes': int(os.getenv('ASR_MAX_UPLOAD_BYTES', str(100 * 1024**2))),
-            'maximum_stream_bytes': int(
-                os.getenv('ASR_MAX_STREAM_BYTES', str(30 * 60 * 16_000 * 2)),
-            ),
-            'maximum_websocket_message_bytes': int(
-                os.getenv('ASR_MAX_WEBSOCKET_MESSAGE_BYTES', str(2 * 1024**2)),
-            ),
-            'port': int(os.getenv('ASR_PORT', '8002')),
-        }
-        return cls.model_validate(values)
+    def default_final_flush_to_input_size(cls, values: object) -> object:
+        if not isinstance(values, dict):
+            return values
+
+        values = values.copy()
+
+        if 'final_flush_seconds' not in values:
+            values['final_flush_seconds'] = values.get(
+                'input_audio_seconds',
+                cls.model_fields['input_audio_seconds'].default,
+            )
+
+        return values
 
     @field_validator('attention_context_size', mode='before')
     @classmethod
-    def parse_attention_context_size(cls, value: object) -> object:
-        if value in {None, ''}:
+    def parse_attention_context_size(
+        cls,
+        value: object,
+    ) -> object:
+        if value is None or value == '':
             return None
+
         if not isinstance(value, str):
             return value
+
         try:
             parsed = json.loads(value)
         except json.JSONDecodeError:
             parsed = [item.strip() for item in value.split(',') if item.strip()]
-        if not isinstance(parsed, list) or len(parsed) != 2:  # noqa: PLR2004
-            msg = 'ASR_ATT_CONTEXT_SIZE must contain exactly two integers'
-            raise ValueError(msg)
+
+        if not isinstance(parsed, (list, tuple)) or len(parsed) != 2:  # noqa: PLR2004
+            _err = f'expected a JSON array or comma-separated pair of integers, got {value!r}'
+            raise ValueError(_err)
+
         return tuple(int(item) for item in parsed)
 
 
@@ -519,7 +522,7 @@ class CacheAwareStreamingSession:
         return []
 
 
-SETTINGS = Settings.from_environment()
+SETTINGS = Settings()
 
 
 @asynccontextmanager

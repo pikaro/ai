@@ -4,7 +4,6 @@ import asyncio
 import importlib
 import io
 import logging
-import os
 import threading
 import time
 import wave
@@ -15,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator
@@ -23,8 +23,13 @@ LOGGER = logging.getLogger('tts')
 MODEL_ID: Final = 'kyutai/pocket-tts'
 
 
-class Settings(BaseModel):
-    model_config = ConfigDict(frozen=True)
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix='TTS_',
+        case_sensitive=False,
+        frozen=True,
+        extra='ignore',
+    )
 
     model_id: str = MODEL_ID
     language: str = 'english'
@@ -32,17 +37,6 @@ class Settings(BaseModel):
     torch_threads: int = Field(default=2, ge=1)
     maximum_input_characters: int = Field(default=4_000, ge=1)
     port: int = Field(default=8001, ge=1, le=65_535)
-
-    @classmethod
-    def from_environment(cls) -> Settings:
-        return cls(
-            model_id=os.getenv('TTS_MODEL', MODEL_ID),
-            language=os.getenv('TTS_LANGUAGE', 'english'),
-            voice=os.getenv('TTS_VOICE', 'alba'),
-            torch_threads=int(os.getenv('TTS_THREADS', '2')),
-            maximum_input_characters=int(os.getenv('TTS_MAX_INPUT_CHARACTERS', '4000')),
-            port=int(os.getenv('TTS_PORT', '8001')),
-        )
 
 
 class HealthResponse(BaseModel):
@@ -203,7 +197,7 @@ class TtsRuntime:
         return output.getvalue()
 
 
-SETTINGS = Settings.from_environment()
+SETTINGS = Settings()
 
 
 @asynccontextmanager
