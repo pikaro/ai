@@ -1,0 +1,91 @@
+[project]
+name         = "ai"
+version      = "0.1.0"
+description  = "AI tools for various tasks"
+dependencies = [
+    "fastapi>=0.139.0",
+    "pydantic>=2.13.4",
+    "python-multipart>=0.0.32",
+    "uvicorn>=0.51.0",
+]
+requires-python = ">=3.14,<3.15"
+
+[tool.pydoclint]
+style                       = "google"
+arg-type-hints-in-docstring = false
+check-return-types          = true
+check-yield-types           = true
+
+[tool.pyright]
+exclude                             = ["**/.venv", "**/__pycache__", "**/*.pyc", "workspace", "build", "dist"]
+venv                                = ".venv"
+venvPath                            = "."
+
+reportConstantRedefinition          = "error"
+reportDeprecated                    = "warning"
+reportImplicitStringConcatenation   = "warning"
+reportInconsistentConstructor       = "warning"
+reportMissingSuperCall              = false
+reportMissingTypeArgument           = "warning"
+reportPrivateUsage                  = "error"
+reportPropertyTypeMismatch          = "warning"
+reportUninitializedInstanceVariable = "warning"
+reportUnnecessaryCast               = "information"
+reportUnnecessaryComparison         = "information"
+reportUnnecessaryContains           = "information"
+reportUnnecessaryIsInstance         = "information"
+reportUntypedBaseClass              = "warning"
+reportUntypedClassDecorator         = "warning"
+reportUntypedFunctionDecorator      = "warning"
+reportUntypedNamedTuple             = "warning"
+reportUnusedCallResult              = "warning"
+reportUnusedExpression              = "warning"
+reportUnusedImport                  = "information"
+reportUnreachable                   = "information"
+
+[tool.ruff]
+exclude        = [".venv", "**/.venv", "workspace"]
+line-length    = 100
+indent-width   = 4
+target-version = "py314"
+
+[tool.ruff.lint]
+
+select = ["ALL"]
+fixable = ["ALL"]
+unfixable = []
+ignore = [
+    "COM812", # Formatter controls trailing commas
+    "D",
+    "T201", # Print found
+    "Q000", # Single-quote
+    "Q003", # Formatter controls avoidable escaped quotes
+    # Covered by Pyright
+    "F821", # Unknown name
+    "F401", # Unused import
+]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PT009", "PT027"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 5
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style               = "space"
+skip-magic-trailing-comma  = false
+line-ending                = "auto"
+docstring-code-format      = true
+docstring-code-line-length = "dynamic"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.411",
+]

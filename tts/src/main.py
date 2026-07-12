@@ -1,0 +1,284 @@
+from __future__ import annotations
+
+import asyncio
+import importlib
+import io
+import logging
+import os
+import threading
+import time
+import wave
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, Iterator
+
+LOGGER = logging.getLogger('tts')
+MODEL_ID: Final = 'kyutai/pocket-tts'
+
+
+class Settings(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    model_id: str = MODEL_ID
+    language: str = 'english'
+    voice: str = 'alba'
+    torch_threads: int = Field(default=2, ge=1)
+    maximum_input_characters: int = Field(default=4_000, ge=1)
+    port: int = Field(default=8001, ge=1, le=65_535)
+
+    @classmethod
+    def from_environment(cls) -> Settings:
+        return cls(
+            model_id=os.getenv('TTS_MODEL', MODEL_ID),
+            language=os.getenv('TTS_LANGUAGE', 'english'),
+            voice=os.getenv('TTS_VOICE', 'alba'),
+            torch_threads=int(os.getenv('TTS_THREADS', '2')),
+            maximum_input_characters=int(os.getenv('TTS_MAX_INPUT_CHARACTERS', '4000')),
+            port=int(os.getenv('TTS_PORT', '8001')),
+        )
+
+
+class HealthResponse(BaseModel):
+    status: Literal['ok']
+    model: str
+    voice: str
+    language: str
+    streaming: Literal[True] = True
+    stream_endpoint: Literal['/v1/audio/speech'] = '/v1/audio/speech'
+    sample_rate: int
+    load_seconds: float
+    voice_load_seconds: float
+
+
+class SpeechRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    model: str = MODEL_ID
+    input: str = Field(min_length=1)
+    voice: str | None = None
+    response_format: Literal['pcm', 'wav'] = 'wav'
+    speed: float = Field(default=1.0, gt=0)
+
+
+class LegacySpeechRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    text: str = Field(min_length=1)
+
+
+class ModelDescription(BaseModel):
+    id: str
+    object: Literal['model'] = 'model'
+    owned_by: Literal['local'] = 'local'
+
+
+class ModelList(BaseModel):
+    object: Literal['list'] = 'list'
+    data: list[ModelDescription]
+
+
+class TtsRuntime:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.model: Any | None = None
+        self.voice_state: Any | None = None
+        self.torch: Any | None = None
+        self.load_seconds = 0.0
+        self.voice_load_seconds = 0.0
+        self.lock = threading.Lock()
+
+    def load(self) -> None:
+        LOGGER.info('loading TTS model', extra={'model': self.settings.model_id})
+        self.torch = importlib.import_module('torch')
+        pocket_tts = importlib.import_module('pocket_tts')
+        self.torch.set_num_threads(self.settings.torch_threads)
+
+        started = time.perf_counter()
+        model = pocket_tts.TTSModel.load_model(language=self.settings.language)
+        self.model = model
+        self.load_seconds = time.perf_counter() - started
+
+        started = time.perf_counter()
+        self.voice_state = model.get_state_for_audio_prompt(self.settings.voice)
+        self.voice_load_seconds = time.perf_counter() - started
+        LOGGER.info(
+            'TTS model ready',
+            extra={
+                'load_seconds': self.load_seconds,
+                'voice_load_seconds': self.voice_load_seconds,
+            },
+        )
+
+    def close(self) -> None:
+        self.voice_state = None
+        self.model = None
+
+    def health(self) -> HealthResponse:
+        if self.model is None or self.voice_state is None:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return HealthResponse(
+            status='ok',
+            model=self.settings.model_id,
+            voice=self.settings.voice,
+            language=self.settings.language,
+            sample_rate=int(self.model.sample_rate),
+            load_seconds=self.load_seconds,
+            voice_load_seconds=self.voice_load_seconds,
+        )
+
+    def validate_request(self, request: SpeechRequest) -> str:
+        text = request.input.strip()
+        if request.model != self.settings.model_id:
+            detail = f'loaded model is {self.settings.model_id}, not {request.model}'
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+        if request.voice is not None and request.voice != self.settings.voice:
+            detail = f'loaded voice is {self.settings.voice}, not {request.voice}'
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+        if request.speed != 1.0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Pocket TTS does not support speed adjustment',
+            )
+        if len(text) > self.settings.maximum_input_characters:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail='input exceeds TTS_MAX_INPUT_CHARACTERS',
+            )
+        return text
+
+    def generate_wav(self, text: str) -> bytes:
+        model, voice_state = self._loaded_model()
+        with self.lock:
+            audio = model.generate_audio(voice_state, text)
+        return self._wav_bytes(int(model.sample_rate), audio)
+
+    def stream_pcm(self, text: str) -> Iterator[bytes]:
+        model, voice_state = self._loaded_model()
+        with self.lock:
+            for audio_chunk in model.generate_audio_stream(voice_state, text):
+                chunk = self._pcm16_bytes(audio_chunk)
+                if chunk:
+                    yield chunk
+
+    def pcm_headers(self) -> dict[str, str]:
+        model, _ = self._loaded_model()
+        return {
+            'X-Audio-Format': 'pcm_s16le',
+            'X-Audio-Sample-Rate': str(model.sample_rate),
+            'X-Audio-Sample-Width': '2',
+            'X-Audio-Channels': '1',
+        }
+
+    def _loaded_model(self) -> tuple[Any, Any]:
+        if self.model is None or self.voice_state is None:
+            message = 'TTS model is not loaded'
+            raise RuntimeError(message)
+        return self.model, self.voice_state
+
+    def _pcm16_bytes(self, audio: Any) -> bytes:  # noqa: ANN401
+        torch_module = self.torch
+        if torch_module is None:
+            message = 'PyTorch is not loaded'
+            raise RuntimeError(message)
+        tensor = audio.detach().cpu().flatten()
+        if tensor.dtype.is_floating_point:
+            tensor = tensor.clamp(-1.0, 1.0).mul(32767.0)
+        tensor = tensor.to(torch_module.int16).contiguous()
+        return cast('bytes', tensor.numpy().tobytes())
+
+    def _wav_bytes(self, sample_rate: int, audio: Any) -> bytes:  # noqa: ANN401
+        output = io.BytesIO()
+        with wave.open(output, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(self._pcm16_bytes(audio))
+        return output.getvalue()
+
+
+SETTINGS = Settings.from_environment()
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
+    runtime = TtsRuntime(SETTINGS)
+    application.state.runtime = runtime
+    await asyncio.to_thread(runtime.load)
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(runtime.close)
+
+
+app = FastAPI(title='TTS', version='1.0.0', lifespan=lifespan)
+
+
+def _runtime(request: Request) -> TtsRuntime:
+    return cast('TtsRuntime', request.app.state.runtime)
+
+
+def _speech_response(runtime: TtsRuntime, speech_request: SpeechRequest) -> Response:
+    text = runtime.validate_request(speech_request)
+    if speech_request.response_format == 'pcm':
+        return StreamingResponse(
+            runtime.stream_pcm(text),
+            media_type='application/octet-stream',
+            headers=runtime.pcm_headers(),
+        )
+    return Response(runtime.generate_wav(text), media_type='audio/wav')
+
+
+@app.get('/health/live')
+async def live() -> dict[str, str]:
+    return {'status': 'ok'}
+
+
+@app.get('/health', response_model=HealthResponse)
+@app.get('/health/ready', response_model=HealthResponse)
+async def ready(request: Request) -> HealthResponse:
+    return _runtime(request).health()
+
+
+@app.get('/v1/models', response_model=ModelList)
+async def models(request: Request) -> ModelList:
+    runtime = _runtime(request)
+    return ModelList(data=[ModelDescription(id=runtime.settings.model_id)])
+
+
+@app.post('/v1/audio/speech')
+def speech(request: Request, speech_request: SpeechRequest) -> Response:
+    return _speech_response(_runtime(request), speech_request)
+
+
+@app.post('/synthesize')
+def synthesize(request: Request, speech_request: LegacySpeechRequest) -> Response:
+    runtime = _runtime(request)
+    return _speech_response(
+        runtime,
+        SpeechRequest(model=runtime.settings.model_id, input=speech_request.text),
+    )
+
+
+@app.post('/synthesize_stream')
+def synthesize_stream(request: Request, speech_request: LegacySpeechRequest) -> Response:
+    runtime = _runtime(request)
+    return _speech_response(
+        runtime,
+        SpeechRequest(
+            model=runtime.settings.model_id,
+            input=speech_request.text,
+            response_format='pcm',
+        ),
+    )
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    uvicorn.run(app, host='0.0.0.0', port=SETTINGS.port)  # noqa: S104
