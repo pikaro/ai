@@ -15,7 +15,7 @@ class SettingsTest(unittest.TestCase):
             'TTS_VOICE': 'juergen',
         }
         with patch.dict(os.environ, environment, clear=True):
-            settings = Settings.from_environment()
+            settings = Settings()
 
         self.assertEqual(settings.language, 'german')
         self.assertEqual(settings.maximum_input_characters, 120)

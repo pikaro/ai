@@ -15,7 +15,7 @@ class SettingsTest(unittest.TestCase):
             'ASR_ONLINE_NORMALIZATION': 'true',
         }
         with patch.dict(os.environ, environment, clear=True):
-            settings = Settings.from_environment()
+            settings = Settings()
 
         self.assertEqual(settings.attention_context_size, (70, 0))
         self.assertEqual(settings.maximum_upload_bytes, 1024)
