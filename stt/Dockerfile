@@ -44,10 +44,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     WANDB_DISABLED=true \
-    HF_HOME=/models/huggingface
+    TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor \
+    HF_HOME=/models/huggingface \
+    STT_PORT=8080
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ffmpeg libsndfile1 libstdc++6 \
+    && apt-get install --yes --no-install-recommends \
+    dumb-init \
+    ffmpeg \
+    libsndfile1 \
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --create-home app
@@ -62,6 +68,8 @@ RUN python -c "import importlib.util; import nemo.collections.asr; import main; 
 
 USER 10001:10001
 
-EXPOSE 8002
+EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002", "--workers", "1"]
+ENTRYPOINT ["dumb-init", "--"]
+
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"$STT_PORT\" --workers 1"]

@@ -7,10 +7,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_DISABLE_TELEMETRY=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HF_HOME=/models/huggingface
+    HF_HOME=/models/huggingface \
+    TTS_PORT=8080
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends libsndfile1 \
+    && apt-get install --yes --no-install-recommends libsndfile1 dumb-init \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --create-home app
@@ -30,6 +31,8 @@ RUN python -c "import importlib.util; import main; import pocket_tts; assert imp
 
 USER 10001:10001
 
-EXPOSE 8001
+EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]
+ENTRYPOINT ["dumb-init", "--"]
+
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"$TTS_PORT\" --workers 1"]
