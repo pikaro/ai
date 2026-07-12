@@ -1,0 +1,13 @@
+*
+!pyproject.toml
+!uv.lock
+!stt/
+!stt/Dockerfile
+!stt/pyproject.toml
+!stt/src/
+!stt/src/**
+!tts/
+!tts/Dockerfile
+!tts/pyproject.toml
+!tts/src/
+!tts/src/**

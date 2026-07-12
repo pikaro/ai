@@ -1,10 +1,11 @@
+import asyncio
 import os
 import unittest
 from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from tts.src.main import MODEL_ID, Settings, SpeechRequest, TtsRuntime
+from tts.src.main import MODEL_ID, Settings, SpeechRequest, TtsRuntime, metrics
 
 
 class SettingsTest(unittest.TestCase):
@@ -46,3 +47,11 @@ class RequestValidationTest(unittest.TestCase):
         request = SpeechRequest(model=MODEL_ID, input='a' * 11)
         with self.assertRaises(HTTPException):
             _ = self.runtime.validate_request(request)
+
+
+class MetricsTest(unittest.TestCase):
+    def test_prometheus_metrics_include_model_state(self) -> None:
+        response = asyncio.run(metrics())
+
+        self.assertIn(b'tts_model_ready', response.body)
+        self.assertTrue(response.headers['content-type'].startswith('text/plain;'))

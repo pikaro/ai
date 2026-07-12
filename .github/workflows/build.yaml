@@ -23,7 +23,7 @@ jobs:
       - name: Install uv and Python
         uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
-          python-version: "3.14"
+          python-version: "3.12"
 
       - name: Install project dependencies
         run: uv sync --frozen
@@ -98,7 +98,7 @@ jobs:
       - name: Build and optionally publish image
         uses: docker/build-push-action@v7
         with:
-          context: ./${{ matrix.service }}
+          context: .
           file: ./${{ matrix.service }}/Dockerfile
           platforms: linux/amd64
           push: ${{ steps.publish.outputs.enabled == 'true' }}

@@ -1,10 +1,11 @@
+import asyncio
 import os
 import unittest
 from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from stt.src.main import RealtimeEvent, Settings, stable_word_prefix, transcript_delta
+from stt.src.main import RealtimeEvent, Settings, metrics, stable_word_prefix, transcript_delta
 
 
 class SettingsTest(unittest.TestCase):
@@ -41,3 +42,11 @@ class RealtimeEventTest(unittest.TestCase):
             _ = RealtimeEvent.model_validate(
                 {'type': 'input_audio_buffer.commit', 'unexpected': True},
             )
+
+
+class MetricsTest(unittest.TestCase):
+    def test_prometheus_metrics_include_model_state(self) -> None:
+        response = asyncio.run(metrics())
+
+        self.assertIn(b'stt_model_ready', response.body)
+        self.assertTrue(response.headers['content-type'].startswith('text/plain;'))

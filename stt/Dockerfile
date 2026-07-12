@@ -1,6 +1,4 @@
-FROM python:3.14-slim-bookworm AS builder
-
-ARG PYTORCH_VERSION=2.11.0
+FROM python:3.12-slim-bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
     DO_NOT_TRACK=1 \
@@ -8,34 +6,26 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never \
     WANDB_DISABLED=true
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -m venv /opt/venv
-
 WORKDIR /app
 
-COPY requirements.txt ./requirements.txt
+COPY --from=ghcr.io/astral-sh/uv:0.11.22 /uv /bin/uv
 
-RUN python -m pip install --no-cache-dir \
-    --index-url https://download.pytorch.org/whl/cpu \
-    "torch==${PYTORCH_VERSION}" \
-    "torchaudio==${PYTORCH_VERSION}"
+COPY pyproject.toml uv.lock ./
+COPY stt/pyproject.toml stt/pyproject.toml
+COPY tts/pyproject.toml tts/pyproject.toml
 
-RUN python -m pip install --no-cache-dir --requirement requirements.txt \
+RUN uv sync --frozen --no-dev --package ai-stt --no-install-local \
     && python -c "import importlib.util; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None"
 
-# editdistance 0.8.1's Python 3.14 build omits its C++ runtime dependency.
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends patchelf \
-    && find /opt/venv -path '*/editdistance/bycython*.so' \
-    -exec patchelf --add-needed libstdc++.so.6 {} + \
-    && rm -rf /var/lib/apt/lists/*
-
-FROM python:3.14-slim-bookworm
+FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     DO_NOT_TRACK=1 \
@@ -62,7 +52,7 @@ WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
 
-COPY --chown=app:app src/ ./
+COPY --chown=app:app stt/src/ ./
 
 RUN python -c "import importlib.util; import nemo.collections.asr; import main; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None"
 

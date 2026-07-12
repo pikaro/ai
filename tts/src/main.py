@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, cast
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import Response, StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -21,6 +22,9 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger('tts')
 MODEL_ID: Final = 'kyutai/pocket-tts'
+MODEL_READY = Gauge('tts_model_ready', 'Whether the TTS model and voice are loaded and ready')
+MODEL_LOAD_SECONDS = Gauge('tts_model_load_seconds', 'Time spent loading the TTS model')
+VOICE_LOAD_SECONDS = Gauge('tts_voice_load_seconds', 'Time spent loading the TTS voice')
 
 
 class Settings(BaseSettings):
@@ -102,6 +106,9 @@ class TtsRuntime:
         started = time.perf_counter()
         self.voice_state = model.get_state_for_audio_prompt(self.settings.voice)
         self.voice_load_seconds = time.perf_counter() - started
+        MODEL_LOAD_SECONDS.set(self.load_seconds)
+        VOICE_LOAD_SECONDS.set(self.voice_load_seconds)
+        MODEL_READY.set(1)
         LOGGER.info(
             'TTS model ready',
             extra={
@@ -111,6 +118,7 @@ class TtsRuntime:
         )
 
     def close(self) -> None:
+        MODEL_READY.set(0)
         self.voice_state = None
         self.model = None
 
@@ -232,6 +240,11 @@ def _speech_response(runtime: TtsRuntime, speech_request: SpeechRequest) -> Resp
 @app.get('/health/live')
 async def live() -> dict[str, str]:
     return {'status': 'ok'}
+
+
+@app.get('/metrics', include_in_schema=False)
+async def metrics() -> Response:
+    return Response(generate_latest(), headers={'Content-Type': CONTENT_TYPE_LATEST})
 
 
 @app.get('/health', response_model=HealthResponse)

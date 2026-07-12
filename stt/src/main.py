@@ -25,6 +25,8 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.responses import Response
+from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -37,6 +39,8 @@ READ_CHUNK_BYTES: Final = 1024 * 1024
 SUPPORTED_UPLOAD_SUFFIXES: Final = frozenset(
     {'.flac', '.m4a', '.mp3', '.mp4', '.mpeg', '.mpga', '.ogg', '.wav', '.webm'},
 )
+MODEL_READY = Gauge('stt_model_ready', 'Whether the STT model is loaded and ready')
+MODEL_LOAD_SECONDS = Gauge('stt_model_load_seconds', 'Time spent loading the STT model')
 
 
 class Settings(BaseSettings):
@@ -232,9 +236,12 @@ class AsrRuntime:
         self._configure_model(model)
         self.model = model.to(self.settings.device) if hasattr(model, 'to') else model
         self.load_seconds = time.perf_counter() - started
+        MODEL_LOAD_SECONDS.set(self.load_seconds)
+        MODEL_READY.set(1)
         LOGGER.info('ASR model ready', extra={'load_seconds': self.load_seconds})
 
     def close(self) -> None:
+        MODEL_READY.set(0)
         self.model = None
         self.streaming_buffer_type = None
 
@@ -592,6 +599,11 @@ async def live() -> dict[str, str]:
     return {'status': 'ok'}
 
 
+@app.get('/metrics', include_in_schema=False)
+async def metrics() -> Response:
+    return Response(generate_latest(), headers={'Content-Type': CONTENT_TYPE_LATEST})
+
+
 @app.get('/health', response_model=HealthResponse)
 @app.get('/health/ready', response_model=HealthResponse)
 async def ready(request: Request) -> HealthResponse:
@@ -662,7 +674,7 @@ async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912
                     continue
                 try:
                     pcm = base64.b64decode(event.audio, validate=True)
-                except binascii.Error, ValueError:
+                except (binascii.Error, ValueError):
                     await _send_error(websocket, 'audio must be valid base64')
                     continue
                 stream = stream or runtime.create_stream(sample_rate, channels)

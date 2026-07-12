@@ -1,12 +1,13 @@
-FROM python:3.14-slim-bookworm
-
-ARG PYTORCH_VERSION=2.12.1
+FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
     DO_NOT_TRACK=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
+    PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never \
     HF_HOME=/models/huggingface \
     TTS_PORT=8080
 
@@ -18,14 +19,15 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY requirements.txt ./requirements.txt
+COPY --from=ghcr.io/astral-sh/uv:0.11.22 /uv /bin/uv
 
-RUN python -m pip install --no-cache-dir \
-    --index-url https://download.pytorch.org/whl/cpu \
-    "torch==${PYTORCH_VERSION}" \
-    && python -m pip install --no-cache-dir --requirement requirements.txt
+COPY pyproject.toml uv.lock ./
+COPY stt/pyproject.toml stt/pyproject.toml
+COPY tts/pyproject.toml tts/pyproject.toml
 
-COPY --chown=app:app src/ ./
+RUN uv sync --frozen --no-dev --package ai-tts --no-install-local
+
+COPY --chown=app:app tts/src/ ./
 
 RUN python -c "import importlib.util; import main; import pocket_tts; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None"
 

@@ -3,13 +3,28 @@ name         = "ai"
 version      = "0.1.0"
 description  = "AI tools for various tasks"
 dependencies = [
-    "fastapi>=0.139.0",
-    "pydantic>=2.13.4",
-    "pydantic-settings>=2.14.2",
-    "python-multipart>=0.0.32",
-    "uvicorn>=0.51.0",
+    "fastapi",
+    "prometheus-client",
+    "pydantic",
+    "pydantic-settings",
+    "uvicorn[standard]",
 ]
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.12,<3.13"
+
+[tool.uv.workspace]
+members = ["stt", "tts"]
+
+[tool.uv]
+environments = [
+    "sys_platform == 'darwin'",
+    "sys_platform == 'linux'",
+]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.pydoclint]
 style                       = "google"
@@ -48,7 +63,7 @@ reportUnreachable                   = "information"
 exclude        = [".venv", "**/.venv", "workspace"]
 line-length    = 100
 indent-width   = 4
-target-version = "py314"
+target-version = "py312"
 
 [tool.ruff.lint]
 
@@ -88,5 +103,6 @@ docstring-code-line-length = "dynamic"
 
 [dependency-groups]
 dev = [
-    "pyright>=1.1.411",
+    "pyright",
+    "python-multipart",
 ]
