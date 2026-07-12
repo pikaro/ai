@@ -25,7 +25,7 @@ COPY tts/pyproject.toml tts/pyproject.toml
 RUN uv sync --frozen --no-dev --package ai-stt --no-install-local \
     && python -c "import importlib.util; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None"
 
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     DO_NOT_TRACK=1 \
@@ -58,9 +58,17 @@ COPY --from=builder /opt/venv /opt/venv
 
 COPY --chown=app:app stt/src/ ./
 
-USER 10001:10001
+FROM runtime AS verification
 
-RUN python -c "import importlib.util; import librosa.filters; import nemo.collections.asr; import main; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None"
+USER 65532:65532
+
+RUN python -c "import importlib.util; from pathlib import Path; import librosa.filters; import nemo.collections.asr; import main; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None; Path('/tmp/runtime-verified').touch()"
+
+FROM runtime
+
+COPY --from=verification /tmp/runtime-verified /usr/local/share/runtime-verified
+
+USER 10001:10001
 
 EXPOSE 8080
 

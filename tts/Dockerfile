@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     DO_NOT_TRACK=1 \
@@ -33,9 +33,17 @@ RUN uv sync --frozen --no-dev --package ai-tts --no-install-local
 
 COPY --chown=app:app tts/src/ ./
 
-USER 10001:10001
+FROM runtime AS verification
 
-RUN python -c "import importlib.util; import main; import pocket_tts; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None"
+USER 65532:65532
+
+RUN python -c "import importlib.util; from pathlib import Path; import main; import pocket_tts; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None; Path('/tmp/runtime-verified').touch()"
+
+FROM runtime
+
+COPY --from=verification /tmp/runtime-verified /usr/local/share/runtime-verified
+
+USER 10001:10001
 
 EXPOSE 8080
 
