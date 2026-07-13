@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_PYTHON_DOWNLOADS=never \
     XDG_CACHE_HOME=/tmp/ai-cache \
-    ASSISTANT_PORT=8080
+    LISTEN_PORT=8080
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends dumb-init \
@@ -46,4 +46,4 @@ EXPOSE 8080
 
 ENTRYPOINT ["dumb-init", "--"]
 
-CMD ["sh", "-c", "exec uvicorn assistant.src.main:app --host 0.0.0.0 --port \"$ASSISTANT_PORT\" --workers 1"]
+CMD ["sh", "-c", "exec uvicorn assistant.src.main:app --host 0.0.0.0 --port \"$LISTEN_PORT\" --workers 1"]

@@ -11,6 +11,7 @@ from stt.src.main import RealtimeEvent, Settings, metrics, stable_word_prefix, t
 class SettingsTest(unittest.TestCase):
     def test_environment_configuration(self) -> None:
         environment = {
+            'LISTEN_PORT': '9001',
             'STT_ATTENTION_CONTEXT_SIZE': '70,0',
             'STT_MAXIMUM_UPLOAD_BYTES': '1024',
             'STT_ONLINE_NORMALIZATION': 'true',
@@ -19,6 +20,7 @@ class SettingsTest(unittest.TestCase):
             settings = Settings()
 
         self.assertEqual(settings.attention_context_size, (70, 0))
+        self.assertEqual(settings.listen_port, 9001)
         self.assertEqual(settings.maximum_upload_bytes, 1024)
         self.assertTrue(settings.online_normalization)
 

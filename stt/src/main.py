@@ -48,6 +48,7 @@ class Settings(BaseSettings):
         env_prefix='STT_',
         case_sensitive=False,
         frozen=True,
+        populate_by_name=True,
         extra='ignore',
     )
 
@@ -79,7 +80,12 @@ class Settings(BaseSettings):
         default=2 * 1024**2,
         ge=1,
     )
-    port: int = Field(default=8080, ge=1, le=65_535)
+    listen_port: int = Field(
+        default=8080,
+        ge=1,
+        le=65_535,
+        validation_alias='LISTEN_PORT',
+    )
 
     @model_validator(mode='before')
     @classmethod
@@ -701,4 +707,4 @@ async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    uvicorn.run(app, host='0.0.0.0', port=SETTINGS.port)  # noqa: S104
+    uvicorn.run(app, host='0.0.0.0', port=SETTINGS.listen_port)  # noqa: S104

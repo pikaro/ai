@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 class SettingsTest(unittest.TestCase):
     def test_environment_supports_nested_mcp_servers(self) -> None:
         environment = {
+            'LISTEN_PORT': '9003',
             'ASSISTANT_LLM_SLOTS': '[1,2]',
             'ASSISTANT_MCP__CALENDAR__HOST': 'calendar-mcp',
             'ASSISTANT_MCP__CALENDAR__TRIGGERS': '["calendar","meeting"]',
@@ -38,14 +39,24 @@ class SettingsTest(unittest.TestCase):
             settings = Settings()
 
         self.assertEqual(settings.llm_slots, (1, 2))
+        self.assertEqual(settings.listen_port, 9003)
         self.assertEqual(settings.mcp['calendar'].endpoint, 'http://calendar-mcp:8080/mcp')
         self.assertEqual(settings.mcp['calendar'].triggers, {'calendar', 'meeting'})
 
     def test_yaml_file_is_overridden_by_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'assistant.yaml'
+            yaml_lines = [
+                'model_id: yaml-model',
+                'listen_port: 9100',
+                'mcp:',
+                '  home:',
+                '    host: home-mcp',
+                '    triggers: [home]',
+            ]
+            yaml_config = '\n'.join(yaml_lines)
             _ = path.write_text(
-                'model_id: yaml-model\nmcp:\n  home:\n    host: home-mcp\n    triggers: [home]\n',
+                f'{yaml_config}\n',
                 encoding='utf-8',
             )
             environment = {
@@ -56,6 +67,7 @@ class SettingsTest(unittest.TestCase):
                 settings = Settings()
 
         self.assertEqual(settings.model_id, 'environment-model')
+        self.assertEqual(settings.listen_port, 9100)
         self.assertEqual(settings.mcp['home'].host, 'home-mcp')
 
     def test_json_configuration_file_is_supported(self) -> None:

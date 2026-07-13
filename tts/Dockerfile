@@ -13,13 +13,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MPLCONFIGDIR=/tmp/ai-cache/matplotlib \
     NUMBA_CACHE_DIR=/tmp/ai-cache/numba \
     XDG_CACHE_HOME=/tmp/ai-cache \
-    TTS_PORT=8080
+    LISTEN_PORT=8080 \
+    TTS_DATA_DIRECTORY=/data
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends libsndfile1 dumb-init \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
-    && useradd --uid 10001 --gid app --home-dir /tmp --no-create-home app
+    && useradd --uid 10001 --gid app --home-dir /tmp --no-create-home app \
+    && install --directory --owner=app --group=app /data
 
 WORKDIR /app
 
@@ -50,4 +52,4 @@ EXPOSE 8080
 
 ENTRYPOINT ["dumb-init", "--"]
 
-CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"$TTS_PORT\" --workers 1"]
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"$LISTEN_PORT\" --workers 1"]

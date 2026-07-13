@@ -208,6 +208,7 @@ source = { virtual = "tts" }
 dependencies = [
     { name = "ai", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "pocket-tts", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
+    { name = "python-multipart", marker = "sys_platform == 'darwin' or sys_platform == 'linux'" },
     { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'linux'" },
 ]
@@ -216,6 +217,7 @@ dependencies = [
 requires-dist = [
     { name = "ai", virtual = "." },
     { name = "pocket-tts" },
+    { name = "python-multipart" },
     { name = "torch", marker = "sys_platform != 'linux'", specifier = "==2.11.0" },
     { name = "torch", marker = "sys_platform == 'linux'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu" },
 ]

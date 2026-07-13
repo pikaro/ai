@@ -4,14 +4,18 @@ import asyncio
 import importlib
 import io
 import logging
+import os
+import re
+import tempfile
 import threading
 import time
 import wave
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, cast
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,6 +26,8 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger('tts')
 MODEL_ID: Final = 'kyutai/pocket-tts'
+READ_CHUNK_BYTES: Final = 1024 * 1024
+VOICE_NAME_PATTERN: Final = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
 MODEL_READY = Gauge('tts_model_ready', 'Whether the TTS model and voice are loaded and ready')
 MODEL_LOAD_SECONDS = Gauge('tts_model_load_seconds', 'Time spent loading the TTS model')
 VOICE_LOAD_SECONDS = Gauge('tts_voice_load_seconds', 'Time spent loading the TTS voice')
@@ -32,15 +38,23 @@ class Settings(BaseSettings):
         env_prefix='TTS_',
         case_sensitive=False,
         frozen=True,
+        populate_by_name=True,
         extra='ignore',
     )
 
     model_id: str = MODEL_ID
     language: str = 'english'
     voice: str = 'alba'
+    data_directory: Path = Path('/data')
     torch_threads: int = Field(default=2, ge=1)
     maximum_input_characters: int = Field(default=4_000, ge=1)
-    port: int = Field(default=8080, ge=1, le=65_535)
+    maximum_voice_upload_bytes: int = Field(default=100 * 1024**2, ge=1)
+    listen_port: int = Field(
+        default=8080,
+        ge=1,
+        le=65_535,
+        validation_alias='LISTEN_PORT',
+    )
 
 
 class HealthResponse(BaseModel):
@@ -82,6 +96,12 @@ class ModelList(BaseModel):
     data: list[ModelDescription]
 
 
+class VoiceUploadResponse(BaseModel):
+    name: str
+    filename: str
+    replaced: bool
+
+
 class TtsRuntime:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -94,6 +114,7 @@ class TtsRuntime:
 
     def load(self) -> None:
         LOGGER.info('loading TTS model', extra={'model': self.settings.model_id})
+        self.settings.data_directory.mkdir(parents=True, exist_ok=True)
         self.torch = importlib.import_module('torch')
         pocket_tts = importlib.import_module('pocket_tts')
         self.torch.set_num_threads(self.settings.torch_threads)
@@ -104,7 +125,8 @@ class TtsRuntime:
         self.load_seconds = time.perf_counter() - started
 
         started = time.perf_counter()
-        self.voice_state = model.get_state_for_audio_prompt(self.settings.voice)
+        voice_source = self.voice_source()
+        self.voice_state = model.get_state_for_audio_prompt(voice_source)
         self.voice_load_seconds = time.perf_counter() - started
         MODEL_LOAD_SECONDS.set(self.load_seconds)
         VOICE_LOAD_SECONDS.set(self.voice_load_seconds)
@@ -114,8 +136,33 @@ class TtsRuntime:
             extra={
                 'load_seconds': self.load_seconds,
                 'voice_load_seconds': self.voice_load_seconds,
+                'voice_source': voice_source,
             },
         )
+
+    def voice_source(self) -> str:
+        if VOICE_NAME_PATTERN.fullmatch(self.settings.voice):
+            voice_path = self.settings.data_directory / f'{self.settings.voice}.safetensors'
+            if voice_path.is_file():
+                return str(voice_path)
+        return self.settings.voice
+
+    def save_voice(self, name: str, upload: UploadFile) -> VoiceUploadResponse:
+        if VOICE_NAME_PATTERN.fullmatch(name) is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail='voice name must contain only letters, numbers, underscores, and hyphens',
+            )
+        if Path(upload.filename or '').suffix.casefold() != '.safetensors':
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail='voice upload must be a .safetensors file',
+            )
+
+        destination = self.settings.data_directory / f'{name}.safetensors'
+        replaced = destination.exists()
+        _save_upload_atomic(upload, destination, self.settings.maximum_voice_upload_bytes)
+        return VoiceUploadResponse(name=name, filename=destination.name, replaced=replaced)
 
     def close(self) -> None:
         MODEL_READY.set(0)
@@ -237,6 +284,48 @@ def _speech_response(runtime: TtsRuntime, speech_request: SpeechRequest) -> Resp
     return Response(runtime.generate_wav(text), media_type='audio/wav')
 
 
+def _save_upload_atomic(upload: UploadFile, destination: Path, maximum_bytes: int) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    total_bytes = 0
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent,
+            prefix=f'.{destination.name}.',
+            suffix='.tmp',
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            while chunk := upload.file.read(READ_CHUNK_BYTES):
+                total_bytes += len(chunk)
+                _check_voice_upload_size(total_bytes, maximum_bytes)
+                _ = temporary.write(chunk)
+            _check_voice_upload_not_empty(total_bytes)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        _ = temporary_path.replace(destination)
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _check_voice_upload_size(total_bytes: int, maximum_bytes: int) -> None:
+    if total_bytes > maximum_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail='voice upload exceeds TTS_MAXIMUM_VOICE_UPLOAD_BYTES',
+        )
+
+
+def _check_voice_upload_not_empty(total_bytes: int) -> None:
+    if total_bytes == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='voice upload is empty',
+        )
+
+
 @app.get('/health/live')
 async def live() -> dict[str, str]:
     return {'status': 'ok'}
@@ -264,6 +353,18 @@ def speech(request: Request, speech_request: SpeechRequest) -> Response:
     return _speech_response(_runtime(request), speech_request)
 
 
+@app.post('/v1/voices', response_model=VoiceUploadResponse, status_code=status.HTTP_201_CREATED)
+async def upload_voice(
+    request: Request,
+    name: Annotated[str, Form()],
+    file: Annotated[UploadFile, File()],
+) -> VoiceUploadResponse:
+    try:
+        return await asyncio.to_thread(_runtime(request).save_voice, name, file)
+    finally:
+        await file.close()
+
+
 @app.post('/synthesize')
 def synthesize(request: Request, speech_request: LegacySpeechRequest) -> Response:
     runtime = _runtime(request)
@@ -288,4 +389,4 @@ def synthesize_stream(request: Request, speech_request: LegacySpeechRequest) -> 
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    uvicorn.run(app, host='0.0.0.0', port=SETTINGS.port)  # noqa: S104
+    uvicorn.run(app, host='0.0.0.0', port=SETTINGS.listen_port)  # noqa: S104

@@ -317,4 +317,4 @@ async def realtime(websocket: WebSocket) -> None:
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
-    uvicorn.run(app, host='0.0.0.0', port=SETTINGS.port)  # noqa: S104
+    uvicorn.run(app, host='0.0.0.0', port=SETTINGS.listen_port)  # noqa: S104

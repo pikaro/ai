@@ -1,4 +1,5 @@
 model_id: qwen3-4b
+listen_port: 8080
 llm_base_url: http://llama-server.llama-server
 stt_base_url: http://nemo-asr.nemo-asr
 tts_base_url: http://pockettts.pockettts

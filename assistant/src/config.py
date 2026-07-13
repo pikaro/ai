@@ -59,6 +59,7 @@ class Settings(BaseSettings):
         env_nested_delimiter='__',
         case_sensitive=False,
         frozen=True,
+        populate_by_name=True,
         extra='ignore',
     )
 
@@ -80,7 +81,12 @@ class Settings(BaseSettings):
     maximum_tool_iterations: int = Field(default=2, ge=1, le=5)
     maximum_tool_result_characters: int = Field(default=8_000, ge=128)
     default_timezone: str = 'local'
-    port: int = Field(default=8080, ge=1, le=65_535)
+    listen_port: int = Field(
+        default=8080,
+        ge=1,
+        le=65_535,
+        validation_alias='LISTEN_PORT',
+    )
     mcp: dict[str, MCPConfig] = Field(default_factory=dict)
 
     @model_validator(mode='after')

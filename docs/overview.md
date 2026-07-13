@@ -3,6 +3,11 @@
 This repository builds independently deployable speech and assistant services.
 The LLM remains a separately deployed llama.cpp server.
 
+All three service images listen on port 8080 by default. Override the listener
+with the unprefixed `LISTEN_PORT` environment variable; service-specific
+`*_PORT` names are intentionally avoided because Kubernetes reserves those for
+service-link variables.
+
 ## Assistant
 
 `assistant/src/main.py` combines the STT, llama.cpp, and TTS services through:
@@ -108,6 +113,7 @@ libraries.
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics`
 - `GET /v1/models`
+- `POST /v1/voices`
 - `POST /v1/audio/speech`
 - compatibility endpoints `POST /synthesize` and `POST /synthesize_stream`
 
@@ -115,6 +121,21 @@ libraries.
 PCM16 and includes format headers. Pocket TTS is not thread-safe, so generation
 is serialized within the single worker. Relevant settings use the `TTS_` prefix;
 defaults are declared in `tts/src/main.py`.
+
+Upload a Pocket TTS voice-state file as multipart form data. The endpoint does
+not require authentication:
+
+```sh
+curl -F name=foo -F file=@foo.safetensors http://localhost:8080/v1/voices
+```
+
+Uploads are stored atomically as `<name>.safetensors` in
+`TTS_DATA_DIRECTORY`, which defaults to `/data`. `TTS_MAXIMUM_VOICE_UPLOAD_BYTES`
+limits each upload and defaults to 100 MiB. When the service next starts with
+`TTS_VOICE=foo`, `/data/foo.safetensors` (or the corresponding file in the
+configured data directory) is loaded in place of the canned `foo` voice. Mount
+the data directory on persistent storage when uploads must survive container
+replacement.
 
 The STT and TTS `/metrics` endpoints use Prometheus' text exposition format.
 They include the Python process collectors and service gauges for model

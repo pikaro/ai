@@ -41,7 +41,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MPLCONFIGDIR=/tmp/ai-cache/matplotlib \
     NUMBA_CACHE_DIR=/tmp/ai-cache/numba \
     XDG_CACHE_HOME=/tmp/ai-cache \
-    STT_PORT=8080
+    LISTEN_PORT=8080
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -75,4 +75,4 @@ EXPOSE 8080
 
 ENTRYPOINT ["dumb-init", "--"]
 
-CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"$STT_PORT\" --workers 1"]
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"$LISTEN_PORT\" --workers 1"]
