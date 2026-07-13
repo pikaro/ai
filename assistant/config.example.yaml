@@ -1,0 +1,30 @@
+model_id: qwen3-4b
+llm_base_url: http://llama-server.llama-server
+stt_base_url: http://nemo-asr.nemo-asr
+tts_base_url: http://pockettts.pockettts
+llm_slots: [0]
+default_timezone: Europe/Berlin
+
+mcp:
+  home:
+    host: home-mcp
+    port: 8080
+    scheme: http
+    path: /mcp
+    enabled: true
+    transport: streamable-http
+    timeout_seconds: 10
+    retry_seconds: 30
+    triggers: [home, lights]
+    tool_triggers:
+      get_temperature: [temperature]
+
+  calendar:
+    url: http://calendar-mcp:8080/mcp
+    enabled: true
+    transport: streamable-http
+    timeout_seconds: 10
+    retry_seconds: 30
+    triggers: [calendar]
+    tool_triggers:
+      list_events: [appointment, appointments, schedule]

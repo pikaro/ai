@@ -12,7 +12,7 @@ dependencies = [
 requires-python = ">=3.12,<3.13"
 
 [tool.uv.workspace]
-members = ["stt", "tts"]
+members = ["assistant", "stt", "tts"]
 
 [tool.uv]
 environments = [
@@ -103,6 +103,9 @@ docstring-code-line-length = "dynamic"
 
 [dependency-groups]
 dev = [
+    "httpx",
+    "mcp>=1.24,<2",
     "pyright",
+    "pyyaml",
     "python-multipart",
 ]

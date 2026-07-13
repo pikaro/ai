@@ -19,6 +19,7 @@ WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:0.11.22 /uv /bin/uv
 
 COPY pyproject.toml uv.lock ./
+COPY assistant/pyproject.toml assistant/pyproject.toml
 COPY stt/pyproject.toml stt/pyproject.toml
 COPY tts/pyproject.toml tts/pyproject.toml
 

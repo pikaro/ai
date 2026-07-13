@@ -1,0 +1,19 @@
+[project]
+name = "ai-assistant"
+version = "0.1.0"
+description = "Realtime STT, LLM, tools, and TTS orchestration service"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "ai",
+    "httpx",
+    "mcp>=1.24,<2",
+    "pyyaml",
+    "tzdata",
+    "websockets",
+]
+
+[tool.uv.sources]
+ai = { workspace = true }
+
+[tool.uv]
+package = false

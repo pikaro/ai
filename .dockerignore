@@ -1,6 +1,12 @@
 *
 !pyproject.toml
 !uv.lock
+!assistant/
+!assistant/Dockerfile
+!assistant/__init__.py
+!assistant/pyproject.toml
+!assistant/src/
+!assistant/src/**
 !stt/
 !stt/Dockerfile
 !stt/pyproject.toml

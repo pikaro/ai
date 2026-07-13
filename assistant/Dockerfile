@@ -1,22 +1,17 @@
 FROM python:3.12-slim-bookworm AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    DO_NOT_TRACK=1 \
     HOME=/tmp \
-    HF_HUB_DISABLE_TELEMETRY=1 \
     PATH=/opt/venv/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     UV_PYTHON_DOWNLOADS=never \
-    HF_HOME=/models/huggingface \
-    MPLCONFIGDIR=/tmp/ai-cache/matplotlib \
-    NUMBA_CACHE_DIR=/tmp/ai-cache/numba \
     XDG_CACHE_HOME=/tmp/ai-cache \
-    TTS_PORT=8080
+    ASSISTANT_PORT=8080
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends libsndfile1 dumb-init \
+    && apt-get install --yes --no-install-recommends dumb-init \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --home-dir /tmp --no-create-home app
@@ -30,15 +25,16 @@ COPY assistant/pyproject.toml assistant/pyproject.toml
 COPY stt/pyproject.toml stt/pyproject.toml
 COPY tts/pyproject.toml tts/pyproject.toml
 
-RUN uv sync --frozen --no-dev --package ai-tts --no-install-local
+RUN uv sync --frozen --no-dev --package ai-assistant --no-install-local
 
-COPY --chown=app:app tts/src/ ./
+COPY --chown=app:app assistant/__init__.py assistant/__init__.py
+COPY --chown=app:app assistant/src/ assistant/src/
 
 FROM runtime AS verification
 
 USER 65532:65532
 
-RUN python -c "import importlib.util; from pathlib import Path; import main; import pocket_tts; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None; Path('/tmp/runtime-verified').touch()"
+RUN python -c "from pathlib import Path; import assistant.src.main; import mcp; Path('/tmp/runtime-verified').touch()"
 
 FROM runtime
 
@@ -50,4 +46,4 @@ EXPOSE 8080
 
 ENTRYPOINT ["dumb-init", "--"]
 
-CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"$TTS_PORT\" --workers 1"]
+CMD ["sh", "-c", "exec uvicorn assistant.src.main:app --host 0.0.0.0 --port \"$ASSISTANT_PORT\" --workers 1"]
