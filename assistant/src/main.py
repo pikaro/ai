@@ -96,10 +96,12 @@ class AssistantRuntime:
 
     async def health(self) -> HealthResponse:
         upstream = await upstream_health(self.http, self.settings)
-        if not all(upstream.values()):
+        unhealthy = [name for name, healthy in upstream.items() if not healthy]
+        if unhealthy:
+            LOGGER.warning('upstream services unhealthy: %s', ', '.join(unhealthy))
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={'status': 'unavailable', 'upstream': upstream},
+                detail={'status': 'unavailable', 'upstream': upstream, 'unhealthy': unhealthy},
             )
         return HealthResponse(
             status='ok',
