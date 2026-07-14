@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 import os
 import tempfile
 import unittest
@@ -9,13 +10,22 @@ from unittest.mock import MagicMock, patch
 import httpx
 from fastapi import HTTPException, UploadFile
 
-from tts.src.main import MODEL_ID, Settings, SpeechRequest, TtsRuntime, app, metrics
+from tts.src.main import (
+    MODEL_ID,
+    Settings,
+    SpeechRequest,
+    SuccessfulHealthCheckFilter,
+    TtsRuntime,
+    app,
+    metrics,
+)
 
 
 class SettingsTest(unittest.TestCase):
     def test_environment_configuration(self) -> None:
         environment = {
             'LISTEN_PORT': '9002',
+            'LOG_LEVEL': 'DEBUG',
             'TTS_DATA_DIRECTORY': '/voices',
             'TTS_LANGUAGE': 'german',
             'TTS_MAXIMUM_INPUT_CHARACTERS': '120',
@@ -27,6 +37,7 @@ class SettingsTest(unittest.TestCase):
 
         self.assertEqual(settings.language, 'german')
         self.assertEqual(settings.listen_port, 9002)
+        self.assertEqual(settings.log_level, 'DEBUG')
         self.assertEqual(settings.maximum_input_characters, 120)
         self.assertEqual(settings.maximum_voice_upload_bytes, 2048)
         self.assertEqual(settings.voice, 'juergen')
@@ -133,6 +144,32 @@ class RequestValidationTest(unittest.TestCase):
         request = SpeechRequest(model=MODEL_ID, input='a' * 11)
         with self.assertRaises(HTTPException):
             _ = self.runtime.validate_request(request)
+
+
+class AccessLogFilterTest(unittest.TestCase):
+    def test_successful_health_checks_are_suppressed_but_failures_are_retained(self) -> None:
+        access_filter = SuccessfulHealthCheckFilter()
+        successful_health = logging.LogRecord(
+            'uvicorn.access',
+            logging.INFO,
+            __file__,
+            1,
+            '%s - "%s %s HTTP/%s" %d',
+            ('client', 'GET', '/health', '1.1', 200),
+            None,
+        )
+        failed_health = logging.LogRecord(
+            'uvicorn.access',
+            logging.INFO,
+            __file__,
+            1,
+            '%s - "%s %s HTTP/%s" %d',
+            ('client', 'GET', '/health', '1.1', 503),
+            None,
+        )
+
+        self.assertFalse(access_filter.filter(successful_health))
+        self.assertTrue(access_filter.filter(failed_health))
 
 
 class MetricsTest(unittest.TestCase):

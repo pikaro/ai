@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from assistant.src import metrics
+
+LOGGER = logging.getLogger('assistant.upstream')
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -264,8 +267,20 @@ async def upstream_health(
         try:
             response = await client.get(url, timeout=settings.health_timeout_seconds)
             ready = response.status_code == 200  # noqa: PLR2004
-        except httpx.HTTPError:
+            if not ready:
+                LOGGER.warning(
+                    'upstream health check returned HTTP %d (service=%s)',
+                    response.status_code,
+                    name,
+                )
+        except httpx.HTTPError as error:
             ready = False
+            LOGGER.warning(
+                'upstream health check failed (service=%s, error=%s: %s)',
+                name,
+                type(error).__name__,
+                error,
+            )
         metrics.UPSTREAM_READY.labels(service=name).set(int(ready))
         return name, ready
 

@@ -8,6 +8,15 @@ with the unprefixed `LISTEN_PORT` environment variable; service-specific
 `*_PORT` names are intentionally avoided because Kubernetes reserves those for
 service-link variables.
 
+## Logging
+
+All services log operational activity at `INFO` without request payloads. Set
+the unprefixed `LOG_LEVEL=DEBUG` environment variable to also log transcripts,
+generated responses, and text sent to speech synthesis. Successful `200`
+responses from `/health`, `/health/live`, and `/health/ready` are omitted from
+Uvicorn access logs; failed health checks and all other access logs remain
+visible.
+
 ## Assistant
 
 `assistant/src/main.py` combines the STT, llama.cpp, and TTS services through:
@@ -41,6 +50,11 @@ those slot IDs.
 LLM output is streamed immediately. Complete sentences are sent to TTS while
 the LLM continues decoding, and PCM is streamed to the caller without storing a
 WAV file.
+
+The assistant retires idle pooled upstream HTTP connections after four seconds,
+before the five-second idle timeout used by Uvicorn and llama.cpp. This avoids
+reusing a connection while its peer is closing it; the next request establishes
+a clean in-cluster connection instead.
 
 ### Tools and MCP
 
@@ -96,7 +110,15 @@ The realtime endpoint accepts `session.update`, `input_audio_buffer.append`, and
 emits partial, stable delta, and completed transcription events.
 
 The model is single-worker and internally serialized. Relevant settings use the
-`ASR_` prefix; defaults are declared in `stt/src/main.py`.
+`STT_` prefix; defaults are declared in `stt/src/main.py`.
+
+Set `STT_SAVE_LATEST_WAV=true` to atomically overwrite the most recently
+committed realtime input recording. `STT_LATEST_WAV_PATH` defaults to
+`/tmp/latest.wav`; point it at mounted storage when the recording must be read
+after a pod replacement. The WAV header preserves the client-declared sample
+rate and channel count, and the saved PCM excludes the silence used internally
+to flush the streaming decoder. Capture failures are logged without failing the
+transcription request.
 
 The STT service uses NeMo 2.4, which provides the required streaming API without
 requiring OneLogger. NeMo's published aggregate extras are not used because they

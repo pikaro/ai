@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     )
 
     model_id: str = 'qwen3-4b'
+    log_level: Literal['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] = Field(
+        default='INFO',
+        validation_alias='LOG_LEVEL',
+    )
     llm_base_url: str = 'http://llama-server.llama-server'
     stt_base_url: str = 'http://nemo-asr.nemo-asr'
     tts_base_url: str = 'http://pockettts.pockettts'

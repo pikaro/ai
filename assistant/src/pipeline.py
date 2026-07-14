@@ -27,6 +27,11 @@ BASE_SYSTEM_PROMPT = (
 EventSender = Callable[[dict[str, object]], Awaitable[None]]
 
 
+def _log_generated_response(response_text: str) -> None:
+    LOGGER.info('assistant response generated (%d characters)', len(response_text))
+    LOGGER.debug('assistant response: %r', response_text)
+
+
 class LlmProtocol(Protocol):
     async def warm_cache(self, prompt: str, slot: int) -> None: ...
 
@@ -290,6 +295,7 @@ class AssistantUtterance:
             response_text = clean_response(''.join(parts))
             if not response_text:
                 self._raise_empty_response()
+            _log_generated_response(response_text)
             if pending_text.strip():
                 await self._queue_or_raise(queue, pending_text.strip(), tts_task)
             await send({'type': 'response.text.done', 'text': response_text})
@@ -311,6 +317,7 @@ class AssistantUtterance:
         cleaned = clean_response(response_text)
         if not cleaned:
             self._raise_empty_response()
+        _log_generated_response(cleaned)
         await send({'type': 'response.text.delta', 'delta': cleaned})
         await send({'type': 'response.text.done', 'text': cleaned})
         metrics.LLM_OUTPUT_CHARACTERS.inc(len(cleaned))
@@ -341,6 +348,8 @@ class AssistantUtterance:
         expected_format: AudioFormat | None = None
         first_audio = True
         while (text := await queue.get()) is not None:
+            LOGGER.info('TTS segment requested (%d characters)', len(text))
+            LOGGER.debug('TTS segment: %r', text)
             async for chunk, audio_format in self.tts.stream(text):
                 if expected_format is None:
                     expected_format = audio_format

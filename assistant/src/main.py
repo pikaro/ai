@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Final, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -30,6 +30,34 @@ if TYPE_CHECKING:
     from assistant.src.tooling import ToolDefinition
 
 LOGGER = logging.getLogger('assistant')
+HEALTH_ENDPOINTS = frozenset({'/health', '/health/live', '/health/ready'})
+UPSTREAM_KEEPALIVE_EXPIRY_SECONDS: Final = 4.0
+
+
+class SuccessfulHealthCheckFilter(logging.Filter):
+    """Suppress successful health checks while retaining failures and other requests."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        arguments = record.args
+        if not isinstance(arguments, tuple) or len(arguments) < 5:  # noqa: PLR2004
+            return True
+        method, path, status_code = arguments[1], arguments[2], arguments[4]
+        request_path = path.partition('?')[0] if isinstance(path, str) else path
+        return not (
+            method == 'GET'
+            and request_path in HEALTH_ENDPOINTS
+            and status_code == status.HTTP_200_OK
+        )
+
+
+def _configure_logging(level: str) -> None:
+    LOGGER.setLevel(level)
+    if not LOGGER.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(levelname)s: %(name)s: %(message)s'))
+        LOGGER.addHandler(handler)
+    LOGGER.propagate = False
+    logging.getLogger('uvicorn.access').addFilter(SuccessfulHealthCheckFilter())
 
 
 class SessionOptions(BaseModel):
@@ -80,7 +108,14 @@ class AssistantRuntime:
             settings.request_timeout_seconds,
             connect=settings.connect_timeout_seconds,
         )
-        self.http = httpx.AsyncClient(timeout=timeout)
+        # Every deployed upstream closes idle HTTP connections after five seconds.
+        # Retire pooled connections first to avoid racing a peer-initiated close.
+        limits = httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=UPSTREAM_KEEPALIVE_EXPIRY_SECONDS,
+        )
+        self.http = httpx.AsyncClient(timeout=timeout, limits=limits)
         self.slots = SlotPool(settings.llm_slots)
         self.llm = LlmClient(self.http, settings)
         self.tts = TtsClient(self.http, settings)
@@ -133,6 +168,7 @@ class EventSink:
 
 
 SETTINGS = Settings()
+_configure_logging(SETTINGS.log_level)
 
 
 @asynccontextmanager
@@ -242,11 +278,16 @@ async def _consume_transcription(  # noqa: C901, PLR0912
                 if isinstance(delta, str):
                     transcript = f'{transcript} {delta}'.strip()
             if transcript:
+                LOGGER.info('STT transcription update received (%d characters)', len(transcript))
+                LOGGER.debug('STT transcription update: %r', transcript)
                 selected_tools = await utterance.select_and_warm(transcript, reason='delta')
         elif message_type.endswith('transcription.completed'):
             completed = message.get('transcript')
             if isinstance(completed, str) and completed.strip():
                 transcript = completed.strip()
+            if transcript:
+                LOGGER.info('STT transcription completed (%d characters)', len(transcript))
+                LOGGER.debug('STT transcription completed: %r', transcript)
             break
     if not transcript:
         message = 'STT produced an empty transcript'
@@ -298,13 +339,22 @@ async def realtime(websocket: WebSocket) -> None:
     utterance = runtime.utterance()
     outcome = 'success'
     await websocket.accept()
+    LOGGER.info('realtime assistant session started')
     metrics.ACTIVE_SESSIONS.inc()
     try:
         await _run_realtime_session(websocket, runtime, utterance)
         await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
-    except (WebSocketDisconnect, ConnectionClosed):
+        LOGGER.info('realtime assistant session completed')
+    except WebSocketDisconnect as error:
         outcome = 'disconnected'
-        LOGGER.info('realtime assistant client disconnected')
+        LOGGER.info('realtime assistant client disconnected (code=%s)', error.code)
+    except ConnectionClosed as error:
+        outcome = 'upstream_disconnected'
+        LOGGER.warning(
+            'realtime STT connection closed (code=%s, reason=%s)',
+            error.code,
+            error.reason or 'none',
+        )
     except Exception:
         outcome = 'error'
         LOGGER.exception('realtime assistant session failed')
@@ -318,5 +368,4 @@ async def realtime(websocket: WebSocket) -> None:
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
     uvicorn.run(app, host='0.0.0.0', port=SETTINGS.listen_port)  # noqa: S104

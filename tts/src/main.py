@@ -31,6 +31,33 @@ VOICE_NAME_PATTERN: Final = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
 MODEL_READY = Gauge('tts_model_ready', 'Whether the TTS model and voice are loaded and ready')
 MODEL_LOAD_SECONDS = Gauge('tts_model_load_seconds', 'Time spent loading the TTS model')
 VOICE_LOAD_SECONDS = Gauge('tts_voice_load_seconds', 'Time spent loading the TTS voice')
+HEALTH_ENDPOINTS = frozenset({'/health', '/health/live', '/health/ready'})
+
+
+class SuccessfulHealthCheckFilter(logging.Filter):
+    """Suppress successful health checks while retaining failures and other requests."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        arguments = record.args
+        if not isinstance(arguments, tuple) or len(arguments) < 5:  # noqa: PLR2004
+            return True
+        method, path, status_code = arguments[1], arguments[2], arguments[4]
+        request_path = path.partition('?')[0] if isinstance(path, str) else path
+        return not (
+            method == 'GET'
+            and request_path in HEALTH_ENDPOINTS
+            and status_code == status.HTTP_200_OK
+        )
+
+
+def _configure_logging(level: str) -> None:
+    LOGGER.setLevel(level)
+    if not LOGGER.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(levelname)s: %(name)s: %(message)s'))
+        LOGGER.addHandler(handler)
+    LOGGER.propagate = False
+    logging.getLogger('uvicorn.access').addFilter(SuccessfulHealthCheckFilter())
 
 
 class Settings(BaseSettings):
@@ -43,6 +70,10 @@ class Settings(BaseSettings):
     )
 
     model_id: str = MODEL_ID
+    log_level: Literal['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] = Field(
+        default='INFO',
+        validation_alias='LOG_LEVEL',
+    )
     language: str = 'english'
     voice: str = 'alba'
     data_directory: Path = Path('/data')
@@ -113,7 +144,7 @@ class TtsRuntime:
         self.lock = threading.Lock()
 
     def load(self) -> None:
-        LOGGER.info('loading TTS model', extra={'model': self.settings.model_id})
+        LOGGER.info('loading TTS model %s', self.settings.model_id)
         self.settings.data_directory.mkdir(parents=True, exist_ok=True)
         self.torch = importlib.import_module('torch')
         pocket_tts = importlib.import_module('pocket_tts')
@@ -132,12 +163,10 @@ class TtsRuntime:
         VOICE_LOAD_SECONDS.set(self.voice_load_seconds)
         MODEL_READY.set(1)
         LOGGER.info(
-            'TTS model ready',
-            extra={
-                'load_seconds': self.load_seconds,
-                'voice_load_seconds': self.voice_load_seconds,
-                'voice_source': voice_source,
-            },
+            'TTS model ready in %.3f seconds (voice=%s loaded in %.3f seconds)',
+            self.load_seconds,
+            voice_source,
+            self.voice_load_seconds,
         )
 
     def voice_source(self) -> str:
@@ -162,6 +191,7 @@ class TtsRuntime:
         destination = self.settings.data_directory / f'{name}.safetensors'
         replaced = destination.exists()
         _save_upload_atomic(upload, destination, self.settings.maximum_voice_upload_bytes)
+        LOGGER.info('stored TTS voice %s (replaced=%s)', name, replaced)
         return VoiceUploadResponse(name=name, filename=destination.name, replaced=replaced)
 
     def close(self) -> None:
@@ -210,11 +240,14 @@ class TtsRuntime:
 
     def stream_pcm(self, text: str) -> Iterator[bytes]:
         model, voice_state = self._loaded_model()
+        output_bytes = 0
         with self.lock:
             for audio_chunk in model.generate_audio_stream(voice_state, text):
                 chunk = self._pcm16_bytes(audio_chunk)
                 if chunk:
+                    output_bytes += len(chunk)
                     yield chunk
+        LOGGER.info('speech synthesis completed (format=pcm, audio_bytes=%d)', output_bytes)
 
     def pcm_headers(self) -> dict[str, str]:
         model, _ = self._loaded_model()
@@ -253,6 +286,7 @@ class TtsRuntime:
 
 
 SETTINGS = Settings()
+_configure_logging(SETTINGS.log_level)
 
 
 @asynccontextmanager
@@ -275,13 +309,21 @@ def _runtime(request: Request) -> TtsRuntime:
 
 def _speech_response(runtime: TtsRuntime, speech_request: SpeechRequest) -> Response:
     text = runtime.validate_request(speech_request)
+    LOGGER.info(
+        'speech synthesis requested (format=%s, characters=%d)',
+        speech_request.response_format,
+        len(text),
+    )
+    LOGGER.debug('speech synthesis input: %r', text)
     if speech_request.response_format == 'pcm':
         return StreamingResponse(
             runtime.stream_pcm(text),
             media_type='application/octet-stream',
             headers=runtime.pcm_headers(),
         )
-    return Response(runtime.generate_wav(text), media_type='audio/wav')
+    wav = runtime.generate_wav(text)
+    LOGGER.info('speech synthesis completed (format=wav, audio_bytes=%d)', len(wav))
+    return Response(wav, media_type='audio/wav')
 
 
 def _save_upload_atomic(upload: UploadFile, destination: Path, maximum_bytes: int) -> None:
@@ -388,5 +430,4 @@ def synthesize_stream(request: Request, speech_request: LegacySpeechRequest) -> 
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
     uvicorn.run(app, host='0.0.0.0', port=SETTINGS.listen_port)  # noqa: S104

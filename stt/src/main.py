@@ -6,10 +6,12 @@ import binascii
 import importlib
 import json
 import logging
+import os
 import tempfile
 import threading
 import time
-from contextlib import asynccontextmanager, nullcontext
+import wave
+from contextlib import asynccontextmanager, nullcontext, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, cast
 
@@ -41,6 +43,38 @@ SUPPORTED_UPLOAD_SUFFIXES: Final = frozenset(
 )
 MODEL_READY = Gauge('stt_model_ready', 'Whether the STT model is loaded and ready')
 MODEL_LOAD_SECONDS = Gauge('stt_model_load_seconds', 'Time spent loading the STT model')
+HEALTH_ENDPOINTS = frozenset({'/health', '/health/live', '/health/ready'})
+
+
+class SuccessfulHealthCheckFilter(logging.Filter):
+    """Suppress successful health checks while retaining failures and other requests."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        arguments = record.args
+        if not isinstance(arguments, tuple) or len(arguments) < 5:  # noqa: PLR2004
+            return True
+        method, path, status_code = arguments[1], arguments[2], arguments[4]
+        request_path = path.partition('?')[0] if isinstance(path, str) else path
+        return not (
+            method == 'GET'
+            and request_path in HEALTH_ENDPOINTS
+            and status_code == status.HTTP_200_OK
+        )
+
+
+def _configure_logging(level: str) -> None:
+    LOGGER.setLevel(level)
+    if not LOGGER.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(levelname)s: %(name)s: %(message)s'))
+        LOGGER.addHandler(handler)
+    LOGGER.propagate = False
+    logging.getLogger('uvicorn.access').addFilter(SuccessfulHealthCheckFilter())
+
+
+def _log_transcription(stage: str, text: str) -> None:
+    LOGGER.info('%s transcription produced (%d characters)', stage, len(text))
+    LOGGER.debug('%s transcription: %r', stage, text)
 
 
 class Settings(BaseSettings):
@@ -53,6 +87,10 @@ class Settings(BaseSettings):
     )
 
     model_id: str = 'nvidia/stt_en_fastconformer_hybrid_large_streaming_multi'
+    log_level: Literal['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] = Field(
+        default='INFO',
+        validation_alias='LOG_LEVEL',
+    )
     device: str = 'cpu'
     torch_threads: int = Field(default=4, ge=1)
     decoder_type: Literal['rnnt', 'ctc'] = 'rnnt'
@@ -80,6 +118,8 @@ class Settings(BaseSettings):
         default=2 * 1024**2,
         ge=1,
     )
+    save_latest_wav: bool = False
+    latest_wav_path: Path = Path(tempfile.gettempdir()) / 'latest.wav'
     listen_port: int = Field(
         default=8080,
         ge=1,
@@ -227,7 +267,7 @@ class AsrRuntime:
 
     def load(self) -> None:
         started = time.perf_counter()
-        LOGGER.info('loading ASR model', extra={'model': self.settings.model_id})
+        LOGGER.info('loading ASR model %s', self.settings.model_id)
         self.numpy = importlib.import_module('numpy')
         self.torch = importlib.import_module('torch')
         nemo_asr = importlib.import_module('nemo.collections.asr')
@@ -244,7 +284,7 @@ class AsrRuntime:
         self.load_seconds = time.perf_counter() - started
         MODEL_LOAD_SECONDS.set(self.load_seconds)
         MODEL_READY.set(1)
-        LOGGER.info('ASR model ready', extra={'load_seconds': self.load_seconds})
+        LOGGER.info('ASR model ready in %.3f seconds', self.load_seconds)
 
     def close(self) -> None:
         MODEL_READY.set(0)
@@ -285,6 +325,41 @@ class AsrRuntime:
         if isinstance(result, tuple):
             result = result[0]
         return _extract_first_text(result)
+
+    def save_latest_wav(self, pcm: bytes, sample_rate: int, channels: int) -> None:
+        """Atomically replace the latest diagnostic recording with raw client PCM."""
+        destination = self.settings.latest_wav_path
+        temporary_path: Path | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                dir=destination.parent,
+                prefix=f'.{destination.name}.',
+                suffix='.tmp',
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                with wave.open(temporary, 'wb') as wav_file:
+                    wav_file.setnchannels(channels)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(sample_rate)
+                    wav_file.writeframes(pcm)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            _ = temporary_path.replace(destination)
+        except (OSError, wave.Error):
+            if temporary_path is not None:
+                with suppress(OSError):
+                    temporary_path.unlink(missing_ok=True)
+            LOGGER.exception('failed to save latest input recording to %s', destination)
+            return
+        LOGGER.info(
+            'saved latest input recording (%d PCM bytes, %d Hz, %d channels) to %s',
+            len(pcm),
+            sample_rate,
+            channels,
+            destination,
+        )
 
     def pcm16_to_float32(self, pcm: bytes, channels: int) -> Any:  # noqa: ANN401
         if self.numpy is None:
@@ -398,7 +473,7 @@ class CacheAwareStreamingSession:
 
     def append_pcm(self, pcm: bytes) -> list[dict[str, object]]:
         if len(self.raw_pcm) + len(pcm) > self.runtime.settings.maximum_stream_bytes:
-            message = 'audio stream exceeds ASR_MAX_STREAM_BYTES'
+            message = 'audio stream exceeds STT_MAXIMUM_STREAM_BYTES'
             raise OverflowError(message)
         self.raw_pcm.extend(pcm)
         self.unprocessed_bytes += len(pcm)
@@ -412,6 +487,8 @@ class CacheAwareStreamingSession:
 
     def finish(self) -> list[dict[str, object]]:
         with self.runtime.lock:
+            if self.runtime.settings.save_latest_wav:
+                self.runtime.save_latest_wav(bytes(self.raw_pcm), self.sample_rate, self.channels)
             if self.runtime.settings.final_flush_seconds > 0 and self.raw_pcm:
                 flush_samples = max(
                     1,
@@ -422,6 +499,7 @@ class CacheAwareStreamingSession:
             messages = self._process_ready(final=True)
         completed = self.latest_transcript or self.emitted_text
         if completed:
+            _log_transcription('completed', completed)
             messages.append(
                 {
                     'type': 'conversation.item.input_audio_transcription.completed',
@@ -516,6 +594,7 @@ class CacheAwareStreamingSession:
         delta = transcript_delta(self.emitted_text, stable_transcript)
         if delta and len(delta) >= self.runtime.settings.minimum_delta_characters:
             self.emitted_text = stable_transcript
+            _log_transcription('stable delta', delta)
             return [
                 {
                     'type': 'conversation.item.input_audio_transcription.delta',
@@ -525,6 +604,7 @@ class CacheAwareStreamingSession:
                 },
             ]
         if not final:
+            _log_transcription('partial', transcript)
             return [
                 {
                     'type': 'conversation.item.input_audio_transcription.partial',
@@ -536,6 +616,7 @@ class CacheAwareStreamingSession:
 
 
 SETTINGS = Settings()
+_configure_logging(SETTINGS.log_level)
 
 
 @asynccontextmanager
@@ -570,7 +651,7 @@ def _check_upload_size(total_bytes: int, maximum_bytes: int) -> None:
     if total_bytes > maximum_bytes:
         raise HTTPException(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            detail='audio upload exceeds ASR_MAX_UPLOAD_BYTES',
+            detail='audio upload exceeds STT_MAXIMUM_UPLOAD_BYTES',
         )
 
 
@@ -633,6 +714,7 @@ async def transcribe(
     path = await asyncio.to_thread(_save_upload, file, runtime.settings.maximum_upload_bytes)
     try:
         text = await asyncio.to_thread(runtime.transcribe_file, path)
+        _log_transcription('file', text)
     finally:
         await file.close()
         await asyncio.to_thread(path.unlink, missing_ok=True)
@@ -647,6 +729,7 @@ async def _send_error(websocket: WebSocket, message: str) -> None:
 async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912
     runtime = _runtime_from_websocket(websocket)
     await websocket.accept()
+    LOGGER.info('realtime transcription session started')
     sample_rate = runtime.settings.stream_sample_rate
     channels = 1
     stream: CacheAwareStreamingSession | None = None
@@ -700,11 +783,11 @@ async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912
             for message in await asyncio.to_thread(stream.finish):
                 await websocket.send_json(message)
             await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
+            LOGGER.info('realtime transcription session completed')
             return
-    except WebSocketDisconnect:
-        LOGGER.info('realtime client disconnected')
+    except WebSocketDisconnect as error:
+        LOGGER.info('realtime transcription client disconnected (code=%s)', error.code)
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
     uvicorn.run(app, host='0.0.0.0', port=SETTINGS.listen_port)  # noqa: S104

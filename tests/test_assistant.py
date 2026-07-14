@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import tempfile
 import unittest
@@ -9,10 +10,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import httpx
 from pydantic import ValidationError
 
 from assistant.src.config import Settings
-from assistant.src.main import RealtimeEvent, prometheus_metrics
+from assistant.src.main import (
+    AssistantRuntime,
+    RealtimeEvent,
+    SuccessfulHealthCheckFilter,
+    prometheus_metrics,
+)
 from assistant.src.pipeline import (
     AssistantUtterance,
     build_prompt,
@@ -21,7 +28,7 @@ from assistant.src.pipeline import (
 )
 from assistant.src.tooling import ToolRegistry, discover_local_tools
 from assistant.src.tools.time import rough_time
-from assistant.src.upstream import AudioFormat, SlotPool
+from assistant.src.upstream import AudioFormat, SlotPool, upstream_health
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -34,12 +41,14 @@ class SettingsTest(unittest.TestCase):
             'ASSISTANT_LLM_SLOTS': '[1,2]',
             'ASSISTANT_MCP__CALENDAR__HOST': 'calendar-mcp',
             'ASSISTANT_MCP__CALENDAR__TRIGGERS': '["calendar","meeting"]',
+            'LOG_LEVEL': 'DEBUG',
         }
         with patch.dict(os.environ, environment, clear=True):
             settings = Settings()
 
         self.assertEqual(settings.llm_slots, (1, 2))
         self.assertEqual(settings.listen_port, 9003)
+        self.assertEqual(settings.log_level, 'DEBUG')
         self.assertEqual(settings.mcp['calendar'].endpoint, 'http://calendar-mcp:8080/mcp')
         self.assertEqual(settings.mcp['calendar'].triggers, {'calendar', 'meeting'})
 
@@ -87,6 +96,64 @@ class RealtimeEventTest(unittest.TestCase):
             _ = RealtimeEvent.model_validate(
                 {'type': 'input_audio_buffer.commit', 'unexpected': True},
             )
+
+
+class AccessLogFilterTest(unittest.TestCase):
+    def test_successful_health_checks_are_suppressed_but_failures_are_retained(self) -> None:
+        access_filter = SuccessfulHealthCheckFilter()
+        successful_health = logging.LogRecord(
+            'uvicorn.access',
+            logging.INFO,
+            __file__,
+            1,
+            '%s - "%s %s HTTP/%s" %d',
+            ('client', 'GET', '/health/ready?probe=true', '1.1', 200),
+            None,
+        )
+        failed_health = logging.LogRecord(
+            'uvicorn.access',
+            logging.INFO,
+            __file__,
+            1,
+            '%s - "%s %s HTTP/%s" %d',
+            ('client', 'GET', '/health/ready', '1.1', 503),
+            None,
+        )
+        successful_request = logging.LogRecord(
+            'uvicorn.access',
+            logging.INFO,
+            __file__,
+            1,
+            '%s - "%s %s HTTP/%s" %d',
+            ('client', 'GET', '/v1/models', '1.1', 200),
+            None,
+        )
+
+        self.assertFalse(access_filter.filter(successful_health))
+        self.assertTrue(access_filter.filter(failed_health))
+        self.assertTrue(access_filter.filter(successful_request))
+
+
+class UpstreamHealthTest(unittest.IsolatedAsyncioTestCase):
+    def test_client_expires_connections_before_upstream_idle_timeout(self) -> None:
+        with patch('assistant.src.main.httpx.AsyncClient') as client_type:
+            _ = AssistantRuntime(Settings())
+
+        limits = client_type.call_args.kwargs['limits']
+        self.assertEqual(limits.keepalive_expiry, 4.0)
+
+    async def test_transport_failure_identifies_service_and_exception_type(self) -> None:
+        def fail(request: httpx.Request) -> httpx.Response:
+            message = 'timed out'
+            raise httpx.ReadTimeout(message, request=request)
+
+        transport = httpx.MockTransport(fail)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with self.assertLogs('assistant.upstream', level='WARNING') as captured:
+                result = await upstream_health(client, Settings())
+
+        self.assertEqual(result, {'llm': False, 'stt': False, 'tts': False})
+        self.assertTrue(any('service=llm, error=ReadTimeout' in line for line in captured.output))
 
 
 class TimeToolTest(unittest.TestCase):
@@ -208,9 +275,13 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
         async def send(event: dict[str, object]) -> None:
             events.append(event)
 
-        await self.utterance.generate('hello', [], send)
+        with self.assertLogs('assistant.pipeline', level='DEBUG') as captured:
+            await self.utterance.generate('hello', [], send)
 
         event_types = [str(event['type']) for event in events]
+        self.assertTrue(
+            any("assistant response: 'It is three.'" in line for line in captured.output)
+        )
         self.assertIn('response.text.delta', event_types)
         self.assertIn('response.audio.delta', event_types)
         self.assertEqual(event_types[-1], 'response.done')
