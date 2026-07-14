@@ -35,6 +35,7 @@ COPY tts/pyproject.toml tts/pyproject.toml
 RUN uv sync --frozen --no-dev --package ai-tts --no-install-local
 
 COPY --chown=app:app tts/src/ ./
+COPY --chown=app:app service_logging.py service_logging.py
 
 FROM runtime AS verification
 

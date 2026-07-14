@@ -140,6 +140,26 @@ class ToolRegistry:
             )
         for tool in selected:
             metrics.TOOLS_SELECTED.labels(source=tool.source).inc()
+        if selected:
+            LOGGER.info(
+                'Tools selected',
+                extra={
+                    'tool_count': len(selected),
+                    'tools': [tool.name for tool in selected],
+                    'sources': [tool.source for tool in selected],
+                },
+            )
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                LOGGER.debug(
+                    'Tool selection',
+                    extra={
+                        'transcript': prompt,
+                        'tools': [
+                            {'source': tool.source, **tool.prompt_description()}
+                            for tool in selected
+                        ],
+                    },
+                )
         return selected
 
     @staticmethod
@@ -153,23 +173,43 @@ class ToolRegistry:
     async def call(self, tool: ToolDefinition, arguments: dict[str, Any]) -> str:
         started = time.perf_counter()
         outcome = 'success'
+        LOGGER.info('Tool call started', extra={'tool': tool.name, 'source': tool.source})
+        LOGGER.debug(
+            'Tool call request',
+            extra={'tool': tool.name, 'source': tool.source, 'arguments': arguments},
+        )
         try:
             result = tool.executor(arguments, self.context)
             if inspect.isawaitable(result):
                 result = await result
-            text = self._result_text(result)
-            return text[: self.maximum_result_characters]
+            text = self._result_text(result)[: self.maximum_result_characters]
         except Exception:
             outcome = 'error'
             raise
+        else:
+            LOGGER.debug(
+                'Tool call response',
+                extra={'tool': tool.name, 'source': tool.source, 'result': text},
+            )
+            return text
         finally:
+            duration_seconds = time.perf_counter() - started
             metrics.TOOL_CALLS.labels(
                 source=tool.source,
                 tool=tool.name,
                 outcome=outcome,
             ).inc()
             metrics.TOOL_CALL_SECONDS.labels(source=tool.source, tool=tool.name).observe(
-                time.perf_counter() - started,
+                duration_seconds,
+            )
+            LOGGER.info(
+                'Tool call completed',
+                extra={
+                    'tool': tool.name,
+                    'source': tool.source,
+                    'outcome': outcome,
+                    'duration_seconds': duration_seconds,
+                },
             )
 
     @staticmethod
@@ -185,6 +225,15 @@ class ToolRegistry:
     ) -> list[ToolDefinition]:
         started = time.perf_counter()
         outcome = 'success'
+        tool_count = 0
+        LOGGER.info(
+            'MCP request started',
+            extra={
+                'server': server_name,
+                'operation': 'list_tools',
+                'endpoint': config.endpoint,
+            },
+        )
         try:
             remote_tools: list[Any] = []
             async with self._mcp_session(config) as session:
@@ -220,11 +269,25 @@ class ToolRegistry:
                         source=f'mcp:{server_name}',
                     ),
                 )
+            tool_count = len(definitions)
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                LOGGER.debug(
+                    'MCP tool discovery response',
+                    extra={
+                        'server': server_name,
+                        'endpoint': config.endpoint,
+                        'tools': [
+                            {'source': tool.source, **tool.prompt_description()}
+                            for tool in definitions
+                        ],
+                    },
+                )
             return definitions  # noqa: TRY300
         except Exception:
             outcome = 'error'
             raise
         finally:
+            duration_seconds = time.perf_counter() - started
             metrics.MCP_REQUESTS.labels(
                 server=server_name,
                 operation='list_tools',
@@ -233,7 +296,17 @@ class ToolRegistry:
             metrics.MCP_REQUEST_SECONDS.labels(
                 server=server_name,
                 operation='list_tools',
-            ).observe(time.perf_counter() - started)
+            ).observe(duration_seconds)
+            LOGGER.info(
+                'MCP request completed',
+                extra={
+                    'server': server_name,
+                    'operation': 'list_tools',
+                    'outcome': outcome,
+                    'duration_seconds': duration_seconds,
+                    'tool_count': tool_count,
+                },
+            )
 
     async def _call_mcp(
         self,
@@ -244,20 +317,41 @@ class ToolRegistry:
     ) -> object:
         started = time.perf_counter()
         outcome = 'success'
+        LOGGER.info(
+            'MCP request started',
+            extra={'server': server_name, 'operation': 'call_tool', 'tool': tool_name},
+        )
+        LOGGER.debug(
+            'MCP tool request',
+            extra={
+                'server': server_name,
+                'endpoint': config.endpoint,
+                'tool': tool_name,
+                'arguments': arguments,
+            },
+        )
         try:
             async with self._mcp_session(config) as session:
                 result = await session.call_tool(tool_name, arguments)
             if result.isError:
                 self._raise_mcp_error(tool_name)
             if result.structuredContent is not None:
-                return result.structuredContent
-            content = [item.model_dump(mode='json', by_alias=True) for item in result.content]
-            text_items = [item.get('text') for item in content if item.get('type') == 'text']
-            return '\n'.join(str(item) for item in text_items) if text_items else content
+                response: object = result.structuredContent
+            else:
+                content = [item.model_dump(mode='json', by_alias=True) for item in result.content]
+                text_items = [item.get('text') for item in content if item.get('type') == 'text']
+                response = '\n'.join(str(item) for item in text_items) if text_items else content
         except Exception:
             outcome = 'error'
             raise
+        else:
+            LOGGER.debug(
+                'MCP tool response',
+                extra={'server': server_name, 'tool': tool_name, 'result': response},
+            )
+            return response
         finally:
+            duration_seconds = time.perf_counter() - started
             metrics.MCP_REQUESTS.labels(
                 server=server_name,
                 operation='call_tool',
@@ -266,7 +360,17 @@ class ToolRegistry:
             metrics.MCP_REQUEST_SECONDS.labels(
                 server=server_name,
                 operation='call_tool',
-            ).observe(time.perf_counter() - started)
+            ).observe(duration_seconds)
+            LOGGER.info(
+                'MCP request completed',
+                extra={
+                    'server': server_name,
+                    'operation': 'call_tool',
+                    'tool': tool_name,
+                    'outcome': outcome,
+                    'duration_seconds': duration_seconds,
+                },
+            )
 
     @staticmethod
     def _raise_mcp_error(tool_name: str) -> None:

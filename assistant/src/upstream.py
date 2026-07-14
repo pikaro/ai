@@ -102,39 +102,87 @@ class LlmClient:
     ) -> str:
         started = time.perf_counter()
         outcome = 'success'
+        error_type: str | None = None
+        url = f'{self.settings.llm_base_url.rstrip("/")}/completion'
+        payload = self._payload(prompt, slot, maximum_tokens=maximum_tokens, stream=False)
+        LOGGER.info(
+            'LLM request started',
+            extra={
+                'operation': operation,
+                'slot': slot,
+                'stream': False,
+                'prompt_characters': len(prompt),
+                'maximum_tokens': maximum_tokens,
+            },
+        )
+        LOGGER.debug(
+            'LLM request',
+            extra={'operation': operation, 'url': url, 'payload': payload},
+        )
         try:
-            response = await self.client.post(
-                f'{self.settings.llm_base_url.rstrip("/")}/completion',
-                json=self._payload(prompt, slot, maximum_tokens=maximum_tokens, stream=False),
-            )
+            response = await self.client.post(url, json=payload)
             _ = response.raise_for_status()
             body = response.json()
             self._observe_timings(body)
+            LOGGER.debug(
+                'LLM response',
+                extra={'operation': operation, 'slot': slot, 'response': body},
+            )
             content = body.get('content', '')
             return content if isinstance(content, str) else ''
-        except Exception:
+        except Exception as error:
             outcome = 'error'
+            error_type = type(error).__name__
             raise
         finally:
+            duration_seconds = time.perf_counter() - started
             metrics.LLM_REQUESTS.labels(operation=operation, outcome=outcome).inc()
-            metrics.LLM_REQUEST_SECONDS.labels(operation=operation).observe(
-                time.perf_counter() - started,
+            metrics.LLM_REQUEST_SECONDS.labels(operation=operation).observe(duration_seconds)
+            LOGGER.info(
+                'LLM request completed',
+                extra={
+                    'operation': operation,
+                    'slot': slot,
+                    'stream': False,
+                    'outcome': outcome,
+                    'duration_seconds': duration_seconds,
+                    'error_type': error_type,
+                },
             )
 
-    async def stream(self, prompt: str, slot: int) -> AsyncGenerator[str]:
+    async def stream(self, prompt: str, slot: int) -> AsyncGenerator[str]:  # noqa: C901
         started = time.perf_counter()
         outcome = 'success'
+        error_type: str | None = None
         final_data: dict[str, Any] = {}
+        first_token = True
+        operation = 'generation'
+        url = f'{self.settings.llm_base_url.rstrip("/")}/completion'
+        payload = self._payload(
+            prompt,
+            slot,
+            maximum_tokens=self.settings.llm_max_tokens,
+            stream=True,
+        )
+        LOGGER.info(
+            'LLM request started',
+            extra={
+                'operation': operation,
+                'slot': slot,
+                'stream': True,
+                'prompt_characters': len(prompt),
+                'maximum_tokens': self.settings.llm_max_tokens,
+            },
+        )
+        LOGGER.debug(
+            'LLM request',
+            extra={'operation': operation, 'url': url, 'payload': payload},
+        )
         try:
             async with self.client.stream(
                 'POST',
-                f'{self.settings.llm_base_url.rstrip("/")}/completion',
-                json=self._payload(
-                    prompt,
-                    slot,
-                    maximum_tokens=self.settings.llm_max_tokens,
-                    stream=True,
-                ),
+                url,
+                json=payload,
             ) as response:
                 _ = response.raise_for_status()
                 async for line in response.aiter_lines():
@@ -144,15 +192,40 @@ class LlmClient:
                     final_data = data
                     content = data.get('content')
                     if isinstance(content, str) and content:
+                        if first_token:
+                            first_token = False
+                            LOGGER.info(
+                                'LLM first token received',
+                                extra={
+                                    'operation': operation,
+                                    'slot': slot,
+                                    'duration_seconds': time.perf_counter() - started,
+                                },
+                            )
                         yield content
-        except Exception:
+        except Exception as error:
             outcome = 'error'
+            error_type = type(error).__name__
             raise
         finally:
+            duration_seconds = time.perf_counter() - started
             self._observe_timings(final_data)
-            metrics.LLM_REQUESTS.labels(operation='generation', outcome=outcome).inc()
-            metrics.LLM_REQUEST_SECONDS.labels(operation='generation').observe(
-                time.perf_counter() - started,
+            LOGGER.debug(
+                'LLM response',
+                extra={'operation': operation, 'slot': slot, 'response': final_data},
+            )
+            metrics.LLM_REQUESTS.labels(operation=operation, outcome=outcome).inc()
+            metrics.LLM_REQUEST_SECONDS.labels(operation=operation).observe(duration_seconds)
+            LOGGER.info(
+                'LLM request completed',
+                extra={
+                    'operation': operation,
+                    'slot': slot,
+                    'stream': True,
+                    'outcome': outcome,
+                    'duration_seconds': duration_seconds,
+                    'error_type': error_type,
+                },
             )
 
     def _payload(
@@ -269,17 +342,18 @@ async def upstream_health(
             ready = response.status_code == 200  # noqa: PLR2004
             if not ready:
                 LOGGER.warning(
-                    'upstream health check returned HTTP %d (service=%s)',
-                    response.status_code,
-                    name,
+                    'Upstream health check failed',
+                    extra={'service': name, 'status_code': response.status_code},
                 )
         except httpx.HTTPError as error:
             ready = False
             LOGGER.warning(
-                'upstream health check failed (service=%s, error=%s: %s)',
-                name,
-                type(error).__name__,
-                error,
+                'Upstream health check failed',
+                extra={
+                    'service': name,
+                    'error_type': type(error).__name__,
+                    'error': str(error),
+                },
             )
         metrics.UPSTREAM_READY.labels(service=name).set(int(ready))
         return name, ready

@@ -58,6 +58,7 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 
 COPY --chown=app:app stt/src/ ./
+COPY --chown=app:app service_logging.py service_logging.py
 
 FROM runtime AS verification
 

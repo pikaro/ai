@@ -9,11 +9,11 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
+from service_logging import SuccessfulHealthCheckFilter
 from stt.src.main import (
     AsrRuntime,
     RealtimeEvent,
     Settings,
-    SuccessfulHealthCheckFilter,
     metrics,
     stable_word_prefix,
     transcript_delta,

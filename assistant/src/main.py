@@ -23,6 +23,7 @@ from assistant.src.config import Settings
 from assistant.src.pipeline import AssistantUtterance
 from assistant.src.tooling import ToolRegistry, discover_local_tools
 from assistant.src.upstream import LlmClient, SlotPool, TtsClient, upstream_health
+from service_logging import configure_logging
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -30,34 +31,7 @@ if TYPE_CHECKING:
     from assistant.src.tooling import ToolDefinition
 
 LOGGER = logging.getLogger('assistant')
-HEALTH_ENDPOINTS = frozenset({'/health', '/health/live', '/health/ready'})
 UPSTREAM_KEEPALIVE_EXPIRY_SECONDS: Final = 4.0
-
-
-class SuccessfulHealthCheckFilter(logging.Filter):
-    """Suppress successful health checks while retaining failures and other requests."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        arguments = record.args
-        if not isinstance(arguments, tuple) or len(arguments) < 5:  # noqa: PLR2004
-            return True
-        method, path, status_code = arguments[1], arguments[2], arguments[4]
-        request_path = path.partition('?')[0] if isinstance(path, str) else path
-        return not (
-            method == 'GET'
-            and request_path in HEALTH_ENDPOINTS
-            and status_code == status.HTTP_200_OK
-        )
-
-
-def _configure_logging(level: str) -> None:
-    LOGGER.setLevel(level)
-    if not LOGGER.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('%(levelname)s: %(name)s: %(message)s'))
-        LOGGER.addHandler(handler)
-    LOGGER.propagate = False
-    logging.getLogger('uvicorn.access').addFilter(SuccessfulHealthCheckFilter())
 
 
 class SessionOptions(BaseModel):
@@ -133,7 +107,10 @@ class AssistantRuntime:
         upstream = await upstream_health(self.http, self.settings)
         unhealthy = [name for name, healthy in upstream.items() if not healthy]
         if unhealthy:
-            LOGGER.warning('upstream services unhealthy: %s', ', '.join(unhealthy))
+            LOGGER.warning(
+                'Upstream services unhealthy',
+                extra={'unhealthy_services': unhealthy, 'upstream': upstream},
+            )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={'status': 'unavailable', 'upstream': upstream, 'unhealthy': unhealthy},
@@ -168,7 +145,7 @@ class EventSink:
 
 
 SETTINGS = Settings()
-_configure_logging(SETTINGS.log_level)
+configure_logging(SETTINGS.log_level, 'assistant')
 
 
 @asynccontextmanager
@@ -278,16 +255,28 @@ async def _consume_transcription(  # noqa: C901, PLR0912
                 if isinstance(delta, str):
                     transcript = f'{transcript} {delta}'.strip()
             if transcript:
-                LOGGER.info('STT transcription update received (%d characters)', len(transcript))
-                LOGGER.debug('STT transcription update: %r', transcript)
+                LOGGER.info(
+                    'STT transcription received',
+                    extra={'stage': 'update', 'characters': len(transcript)},
+                )
+                LOGGER.debug(
+                    'STT transcription',
+                    extra={'stage': 'update', 'transcript': transcript},
+                )
                 selected_tools = await utterance.select_and_warm(transcript, reason='delta')
         elif message_type.endswith('transcription.completed'):
             completed = message.get('transcript')
             if isinstance(completed, str) and completed.strip():
                 transcript = completed.strip()
             if transcript:
-                LOGGER.info('STT transcription completed (%d characters)', len(transcript))
-                LOGGER.debug('STT transcription completed: %r', transcript)
+                LOGGER.info(
+                    'STT transcription received',
+                    extra={'stage': 'completed', 'characters': len(transcript)},
+                )
+                LOGGER.debug(
+                    'STT transcription',
+                    extra={'stage': 'completed', 'transcript': transcript},
+                )
             break
     if not transcript:
         message = 'STT produced an empty transcript'
@@ -347,13 +336,12 @@ async def realtime(websocket: WebSocket) -> None:
         LOGGER.info('realtime assistant session completed')
     except WebSocketDisconnect as error:
         outcome = 'disconnected'
-        LOGGER.info('realtime assistant client disconnected (code=%s)', error.code)
+        LOGGER.info('Realtime assistant client disconnected', extra={'code': error.code})
     except ConnectionClosed as error:
         outcome = 'upstream_disconnected'
         LOGGER.warning(
-            'realtime STT connection closed (code=%s, reason=%s)',
-            error.code,
-            error.reason or 'none',
+            'Realtime STT connection closed',
+            extra={'code': error.code, 'reason': error.reason or None},
         )
     except Exception:
         outcome = 'error'
@@ -368,4 +356,9 @@ async def realtime(websocket: WebSocket) -> None:
 
 
 if __name__ == '__main__':
-    uvicorn.run(app, host='0.0.0.0', port=SETTINGS.listen_port)  # noqa: S104
+    uvicorn.run(
+        app,
+        host='0.0.0.0',  # noqa: S104
+        port=SETTINGS.listen_port,
+        log_config=None,
+    )

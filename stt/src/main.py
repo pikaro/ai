@@ -32,6 +32,8 @@ from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from service_logging import configure_logging
+
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
@@ -43,38 +45,14 @@ SUPPORTED_UPLOAD_SUFFIXES: Final = frozenset(
 )
 MODEL_READY = Gauge('stt_model_ready', 'Whether the STT model is loaded and ready')
 MODEL_LOAD_SECONDS = Gauge('stt_model_load_seconds', 'Time spent loading the STT model')
-HEALTH_ENDPOINTS = frozenset({'/health', '/health/live', '/health/ready'})
-
-
-class SuccessfulHealthCheckFilter(logging.Filter):
-    """Suppress successful health checks while retaining failures and other requests."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        arguments = record.args
-        if not isinstance(arguments, tuple) or len(arguments) < 5:  # noqa: PLR2004
-            return True
-        method, path, status_code = arguments[1], arguments[2], arguments[4]
-        request_path = path.partition('?')[0] if isinstance(path, str) else path
-        return not (
-            method == 'GET'
-            and request_path in HEALTH_ENDPOINTS
-            and status_code == status.HTTP_200_OK
-        )
-
-
-def _configure_logging(level: str) -> None:
-    LOGGER.setLevel(level)
-    if not LOGGER.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('%(levelname)s: %(name)s: %(message)s'))
-        LOGGER.addHandler(handler)
-    LOGGER.propagate = False
-    logging.getLogger('uvicorn.access').addFilter(SuccessfulHealthCheckFilter())
 
 
 def _log_transcription(stage: str, text: str) -> None:
-    LOGGER.info('%s transcription produced (%d characters)', stage, len(text))
-    LOGGER.debug('%s transcription: %r', stage, text)
+    LOGGER.info(
+        'Transcription produced',
+        extra={'stage': stage, 'characters': len(text)},
+    )
+    LOGGER.debug('Transcription', extra={'stage': stage, 'transcript': text})
 
 
 class Settings(BaseSettings):
@@ -267,7 +245,7 @@ class AsrRuntime:
 
     def load(self) -> None:
         started = time.perf_counter()
-        LOGGER.info('loading ASR model %s', self.settings.model_id)
+        LOGGER.info('Loading ASR model', extra={'model': self.settings.model_id})
         self.numpy = importlib.import_module('numpy')
         self.torch = importlib.import_module('torch')
         nemo_asr = importlib.import_module('nemo.collections.asr')
@@ -284,7 +262,7 @@ class AsrRuntime:
         self.load_seconds = time.perf_counter() - started
         MODEL_LOAD_SECONDS.set(self.load_seconds)
         MODEL_READY.set(1)
-        LOGGER.info('ASR model ready in %.3f seconds', self.load_seconds)
+        LOGGER.info('ASR model ready', extra={'duration_seconds': self.load_seconds})
 
     def close(self) -> None:
         MODEL_READY.set(0)
@@ -351,14 +329,19 @@ class AsrRuntime:
             if temporary_path is not None:
                 with suppress(OSError):
                     temporary_path.unlink(missing_ok=True)
-            LOGGER.exception('failed to save latest input recording to %s', destination)
+            LOGGER.exception(
+                'Failed to save latest input recording',
+                extra={'path': str(destination)},
+            )
             return
         LOGGER.info(
-            'saved latest input recording (%d PCM bytes, %d Hz, %d channels) to %s',
-            len(pcm),
-            sample_rate,
-            channels,
-            destination,
+            'Saved latest input recording',
+            extra={
+                'pcm_bytes': len(pcm),
+                'sample_rate': sample_rate,
+                'channels': channels,
+                'path': str(destination),
+            },
         )
 
     def pcm16_to_float32(self, pcm: bytes, channels: int) -> Any:  # noqa: ANN401
@@ -616,7 +599,7 @@ class CacheAwareStreamingSession:
 
 
 SETTINGS = Settings()
-_configure_logging(SETTINGS.log_level)
+configure_logging(SETTINGS.log_level, 'stt')
 
 
 @asynccontextmanager
@@ -786,8 +769,13 @@ async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912
             LOGGER.info('realtime transcription session completed')
             return
     except WebSocketDisconnect as error:
-        LOGGER.info('realtime transcription client disconnected (code=%s)', error.code)
+        LOGGER.info('Realtime transcription client disconnected', extra={'code': error.code})
 
 
 if __name__ == '__main__':
-    uvicorn.run(app, host='0.0.0.0', port=SETTINGS.listen_port)  # noqa: S104
+    uvicorn.run(
+        app,
+        host='0.0.0.0',  # noqa: S104
+        port=SETTINGS.listen_port,
+        log_config=None,
+    )

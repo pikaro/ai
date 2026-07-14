@@ -10,12 +10,23 @@ service-link variables.
 
 ## Logging
 
-All services log operational activity at `INFO` without request payloads. Set
-the unprefixed `LOG_LEVEL=DEBUG` environment variable to also log transcripts,
-generated responses, and text sent to speech synthesis. Successful `200`
-responses from `/health`, `/health/live`, and `/health/ready` are omitted from
-Uvicorn access logs; failed health checks and all other access logs remain
-visible.
+Every application, dependency, and Uvicorn logging record is emitted as one
+JSON object. Common fields are `timestamp`, `level`, `logger`, and the minimal
+`message`; event data remains structured in additional fields. Uvicorn access
+records expose `client_address`, `method`, `path`, `http_version`, and
+`status_code`.
+
+All services log operational activity and stage durations at `INFO` without
+request payloads. Set the unprefixed `LOG_LEVEL=DEBUG` environment variable to
+also log transcripts, generated responses, text sent to speech synthesis, LLM
+request payloads, tool schemas/arguments/results, and MCP request data. LLM
+request payloads contain the exact submitted prompt, including tool definitions
+and prior tool results, so DEBUG logs can contain sensitive user or MCP data.
+Authentication headers are not logged.
+
+Successful `200` responses from `/health`, `/health/live`, and `/health/ready`
+are omitted from Uvicorn access logs; failed health checks and all other access
+logs remain visible.
 
 ## Assistant
 
@@ -70,6 +81,13 @@ and may opt into legacy SSE. Server-level triggers expose that server's tools;
 of the server. An enabled MCP server with no triggers is never presented to the
 model. MCP discovery is lazy, so an unavailable optional server does not make
 assistant readiness fail.
+
+Tool requests use one or more non-streaming `tool_decision` LLM operations. If
+the configured tool-iteration limit is exhausted, a final `tool_answer`
+operation forces a spoken answer. INFO records include the duration of each LLM,
+local tool, and MCP operation. DEBUG records include the corresponding request
+and response data, making it possible to distinguish model-generation latency
+from tool execution latency.
 
 Set `ASSISTANT_CONFIG_FILE=/config/assistant.yaml` (or `.yml` / `.json`) to load
 a mounted configuration file. Initialization arguments and `ASSISTANT_`

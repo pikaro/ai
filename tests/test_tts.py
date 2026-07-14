@@ -10,11 +10,11 @@ from unittest.mock import MagicMock, patch
 import httpx
 from fastapi import HTTPException, UploadFile
 
+from service_logging import SuccessfulHealthCheckFilter
 from tts.src.main import (
     MODEL_ID,
     Settings,
     SpeechRequest,
-    SuccessfulHealthCheckFilter,
     TtsRuntime,
     app,
     metrics,

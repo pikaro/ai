@@ -28,8 +28,8 @@ EventSender = Callable[[dict[str, object]], Awaitable[None]]
 
 
 def _log_generated_response(response_text: str) -> None:
-    LOGGER.info('assistant response generated (%d characters)', len(response_text))
-    LOGGER.debug('assistant response: %r', response_text)
+    LOGGER.info('Assistant response generated', extra={'characters': len(response_text)})
+    LOGGER.debug('Assistant response', extra={'response': response_text})
 
 
 class LlmProtocol(Protocol):
@@ -170,9 +170,18 @@ class AssistantUtterance:
             outcome = 'error'
             raise
         finally:
+            duration_seconds = time.perf_counter() - started
             metrics.CACHE_WARMS.labels(reason=reason, outcome=outcome).inc()
-            metrics.CACHE_WARM_SECONDS.labels(reason=reason).observe(
-                time.perf_counter() - started,
+            metrics.CACHE_WARM_SECONDS.labels(reason=reason).observe(duration_seconds)
+            LOGGER.info(
+                'LLM cache warm completed',
+                extra={
+                    'reason': reason,
+                    'slot': slot,
+                    'outcome': outcome,
+                    'duration_seconds': duration_seconds,
+                    'prompt_characters': len(prompt),
+                },
             )
 
     async def generate(
@@ -219,7 +228,11 @@ class AssistantUtterance:
         slot = await self._ensure_slot()
         tools_by_name = {tool.name: tool for tool in selected_tools}
         history: list[tuple[str, str]] = []
-        for _ in range(self.settings.maximum_tool_iterations):
+        LOGGER.info(
+            'Tool resolution started',
+            extra={'slot': slot, 'tools': sorted(tools_by_name)},
+        )
+        for iteration in range(1, self.settings.maximum_tool_iterations + 1):
             prompt = build_prompt(transcript, selected_tools, history)
             raw_response = await self.llm.complete(
                 prompt,
@@ -228,6 +241,15 @@ class AssistantUtterance:
                 maximum_tokens=self.settings.llm_tool_tokens,
             )
             decision = parse_tool_response(raw_response)
+            LOGGER.debug(
+                'Tool decision',
+                extra={
+                    'iteration': iteration,
+                    'slot': slot,
+                    'decision': decision,
+                    'raw_response': raw_response,
+                },
+            )
             if decision is None:
                 return clean_response(raw_response)
             answer = decision.get('answer')
@@ -243,7 +265,10 @@ class AssistantUtterance:
             try:
                 result = await self.tools.call(tool, arguments)
             except Exception:
-                LOGGER.exception('assistant tool call failed', extra={'tool': tool.name})
+                LOGGER.exception(
+                    'Assistant tool call failed',
+                    extra={'tool': tool.name, 'source': tool.source, 'arguments': arguments},
+                )
                 result = json.dumps({'error': 'tool execution failed'})
             history.extend(
                 (
@@ -348,8 +373,8 @@ class AssistantUtterance:
         expected_format: AudioFormat | None = None
         first_audio = True
         while (text := await queue.get()) is not None:
-            LOGGER.info('TTS segment requested (%d characters)', len(text))
-            LOGGER.debug('TTS segment: %r', text)
+            LOGGER.info('TTS segment requested', extra={'characters': len(text)})
+            LOGGER.debug('TTS segment', extra={'text': text})
             async for chunk, audio_format in self.tts.stream(text):
                 if expected_format is None:
                     expected_format = audio_format

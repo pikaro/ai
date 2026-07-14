@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -17,7 +18,6 @@ from assistant.src.config import Settings
 from assistant.src.main import (
     AssistantRuntime,
     RealtimeEvent,
-    SuccessfulHealthCheckFilter,
     prometheus_metrics,
 )
 from assistant.src.pipeline import (
@@ -26,9 +26,10 @@ from assistant.src.pipeline import (
     completed_sentences,
     parse_tool_response,
 )
-from assistant.src.tooling import ToolRegistry, discover_local_tools
+from assistant.src.tooling import ToolDefinition, ToolRegistry, discover_local_tools
 from assistant.src.tools.time import rough_time
-from assistant.src.upstream import AudioFormat, SlotPool, upstream_health
+from assistant.src.upstream import AudioFormat, LlmClient, SlotPool, upstream_health
+from service_logging import SuccessfulHealthCheckFilter
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -153,7 +154,51 @@ class UpstreamHealthTest(unittest.IsolatedAsyncioTestCase):
                 result = await upstream_health(client, Settings())
 
         self.assertEqual(result, {'llm': False, 'stt': False, 'tts': False})
-        self.assertTrue(any('service=llm, error=ReadTimeout' in line for line in captured.output))
+        llm_record = next(
+            record for record in captured.records if getattr(record, 'service', None) == 'llm'
+        )
+        self.assertEqual(llm_record.__dict__['error_type'], 'ReadTimeout')
+
+
+class LlmLoggingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_request_log_contains_exact_prompt_and_tool_data(self) -> None:
+        submitted_payloads: list[dict[str, object]] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            submitted_payloads.append(json.loads(request.content))
+            return httpx.Response(200, json={'content': '{"answer":"three o clock"}'})
+
+        mcp_tool = ToolDefinition(
+            name='clock__time',
+            description='Return the time from the clock MCP server.',
+            input_schema={
+                'type': 'object',
+                'properties': {'timezone': {'type': 'string'}},
+            },
+            triggers=frozenset({'time'}),
+            executor=lambda _arguments, _context: '',
+            source='mcp:clock',
+        )
+        prompt = build_prompt('what is the time', [mcp_tool])
+        settings = Settings(llm_base_url='http://llm.test')
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            llm = LlmClient(client, settings)
+            with self.assertLogs('assistant.upstream', level='DEBUG') as captured:
+                _ = await llm.complete(
+                    prompt,
+                    7,
+                    operation='tool_decision',
+                    maximum_tokens=32,
+                )
+
+        request_record = next(
+            record for record in captured.records if record.getMessage() == 'LLM request'
+        )
+        logged_payload = request_record.__dict__['payload']
+        self.assertEqual(logged_payload, submitted_payloads[0])
+        self.assertEqual(logged_payload['prompt'], prompt)
+        self.assertIn('"name":"clock__time"', logged_payload['prompt'])
+        self.assertIn('Return the time from the clock MCP server.', logged_payload['prompt'])
 
 
 class TimeToolTest(unittest.TestCase):
@@ -279,9 +324,10 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
             await self.utterance.generate('hello', [], send)
 
         event_types = [str(event['type']) for event in events]
-        self.assertTrue(
-            any("assistant response: 'It is three.'" in line for line in captured.output)
+        response_record = next(
+            record for record in captured.records if record.getMessage() == 'Assistant response'
         )
+        self.assertEqual(response_record.__dict__['response'], 'It is three.')
         self.assertIn('response.text.delta', event_types)
         self.assertIn('response.audio.delta', event_types)
         self.assertEqual(event_types[-1], 'response.done')
