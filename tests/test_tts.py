@@ -4,6 +4,7 @@ import logging
 import os
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -28,8 +29,10 @@ class SettingsTest(unittest.TestCase):
             'LOG_LEVEL': 'DEBUG',
             'TTS_DATA_DIRECTORY': '/voices',
             'TTS_LANGUAGE': 'german',
+            'TTS_LATEST_WAV_PATH': '/recordings/latest.wav',
             'TTS_MAXIMUM_INPUT_CHARACTERS': '120',
             'TTS_MAXIMUM_VOICE_UPLOAD_BYTES': '2048',
+            'TTS_SAVE_LATEST_WAV': 'true',
             'TTS_VOICE': 'juergen',
         }
         with patch.dict(os.environ, environment, clear=True):
@@ -38,8 +41,10 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.language, 'german')
         self.assertEqual(settings.listen_port, 9002)
         self.assertEqual(settings.log_level, 'DEBUG')
+        self.assertEqual(settings.latest_wav_path, Path('/recordings/latest.wav'))
         self.assertEqual(settings.maximum_input_characters, 120)
         self.assertEqual(settings.maximum_voice_upload_bytes, 2048)
+        self.assertTrue(settings.save_latest_wav)
         self.assertEqual(settings.voice, 'juergen')
         self.assertEqual(settings.data_directory, Path('/voices'))
 
@@ -144,6 +149,59 @@ class RequestValidationTest(unittest.TestCase):
         request = SpeechRequest(model=MODEL_ID, input='a' * 11)
         with self.assertRaises(HTTPException):
             _ = self.runtime.validate_request(request)
+
+
+class LatestWavTest(unittest.TestCase):
+    def test_wav_response_is_saved_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'latest.wav'
+            runtime = TtsRuntime(Settings(save_latest_wav=True, latest_wav_path=destination))
+            runtime.model = MagicMock(sample_rate=24_000)
+            runtime.voice_state = object()
+            response_body = b'exact WAV response bytes'
+
+            with patch.object(runtime, '_wav_bytes', return_value=response_body):
+                generated = runtime.generate_wav('hello')
+
+            self.assertEqual(generated, response_body)
+            self.assertEqual(destination.read_bytes(), generated)
+
+    def test_streamed_pcm_is_saved_from_the_exact_emitted_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'latest.wav'
+            runtime = TtsRuntime(Settings(save_latest_wav=True, latest_wav_path=destination))
+            runtime.model = MagicMock(sample_rate=24_000)
+            runtime.voice_state = object()
+            pcm_chunks = [b'\x01\x02', b'\x03\x04\x05\x06']
+            runtime.model.generate_audio_stream.return_value = iter(pcm_chunks)
+
+            with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+                emitted = list(runtime.stream_pcm('hello'))
+
+            self.assertEqual(emitted, pcm_chunks)
+            with wave.open(str(destination), 'rb') as wav_file:
+                self.assertEqual(wav_file.getframerate(), 24_000)
+                self.assertEqual(wav_file.getnchannels(), 1)
+                self.assertEqual(wav_file.getsampwidth(), 2)
+                saved_pcm = wav_file.readframes(wav_file.getnframes())
+            self.assertEqual(saved_pcm, b''.join(emitted))
+
+    def test_interrupted_stream_does_not_replace_previous_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'latest.wav'
+            previous_recording = b'previous recording'
+            _ = destination.write_bytes(previous_recording)
+            runtime = TtsRuntime(Settings(save_latest_wav=True, latest_wav_path=destination))
+            runtime.model = MagicMock(sample_rate=24_000)
+            runtime.voice_state = object()
+            runtime.model.generate_audio_stream.return_value = iter([b'\x01\x02', b'\x03\x04'])
+
+            with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+                stream = runtime.stream_pcm('hello')
+                self.assertEqual(next(stream), b'\x01\x02')
+                stream.close()
+
+            self.assertEqual(destination.read_bytes(), previous_recording)
 
 
 class AccessLogFilterTest(unittest.TestCase):

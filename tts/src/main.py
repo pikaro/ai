@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 import wave
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, cast
 
@@ -24,7 +24,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from service_logging import configure_logging
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Iterator
+    from collections.abc import AsyncGenerator, Generator
 
 LOGGER = logging.getLogger('tts')
 MODEL_ID: Final = 'kyutai/pocket-tts'
@@ -33,6 +33,75 @@ VOICE_NAME_PATTERN: Final = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
 MODEL_READY = Gauge('tts_model_ready', 'Whether the TTS model and voice are loaded and ready')
 MODEL_LOAD_SECONDS = Gauge('tts_model_load_seconds', 'Time spent loading the TTS model')
 VOICE_LOAD_SECONDS = Gauge('tts_voice_load_seconds', 'Time spent loading the TTS voice')
+
+
+class _AtomicWavWriter:
+    """Build a WAV incrementally and publish it only after successful completion."""
+
+    def __init__(self, destination: Path, sample_rate: int) -> None:
+        self.destination = destination
+        self._temporary_path: Path | None = None
+        self._temporary: Any | None = None
+        self._wav_file: wave.Wave_write | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = tempfile.NamedTemporaryFile(  # noqa: SIM115
+                dir=destination.parent,
+                prefix=f'.{destination.name}.',
+                suffix='.tmp',
+                delete=False,
+            )
+            self._temporary = temporary
+            self._temporary_path = Path(temporary.name)
+            self._wav_file = wave.open(temporary, 'wb')  # noqa: SIM115
+            self._wav_file.setnchannels(1)
+            self._wav_file.setsampwidth(2)
+            self._wav_file.setframerate(sample_rate)
+        except (OSError, wave.Error):
+            self.abort()
+            raise
+
+    def write(self, pcm: bytes) -> None:
+        if self._wav_file is None:
+            message = 'WAV capture is not open'
+            raise RuntimeError(message)
+        self._wav_file.writeframesraw(pcm)
+
+    def commit(self) -> None:
+        temporary = self._temporary
+        temporary_path = self._temporary_path
+        wav_file = self._wav_file
+        if temporary is None or temporary_path is None or wav_file is None:
+            message = 'WAV capture is not open'
+            raise RuntimeError(message)
+
+        wav_file.close()
+        self._wav_file = None
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        temporary.close()
+        self._temporary = None
+        _ = temporary_path.replace(self.destination)
+        self._temporary_path = None
+
+    def abort(self) -> None:
+        wav_file = self._wav_file
+        self._wav_file = None
+        if wav_file is not None:
+            with suppress(OSError, wave.Error):
+                wav_file.close()
+
+        temporary = self._temporary
+        self._temporary = None
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.close()
+
+        temporary_path = self._temporary_path
+        self._temporary_path = None
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink(missing_ok=True)
 
 
 class Settings(BaseSettings):
@@ -55,6 +124,8 @@ class Settings(BaseSettings):
     torch_threads: int = Field(default=2, ge=1)
     maximum_input_characters: int = Field(default=4_000, ge=1)
     maximum_voice_upload_bytes: int = Field(default=100 * 1024**2, ge=1)
+    save_latest_wav: bool = False
+    latest_wav_path: Path = Path(tempfile.gettempdir()) / 'latest.wav'
     listen_port: int = Field(
         default=8080,
         ge=1,
@@ -220,23 +291,138 @@ class TtsRuntime:
         model, voice_state = self._loaded_model()
         with self.lock:
             audio = model.generate_audio(voice_state, text)
-        return self._wav_bytes(int(model.sample_rate), audio)
+        wav = self._wav_bytes(int(model.sample_rate), audio)
+        if self.settings.save_latest_wav:
+            self._save_latest_wav_response(wav)
+        return wav
 
-    def stream_pcm(self, text: str) -> Iterator[bytes]:
+    def stream_pcm(self, text: str) -> Generator[bytes, None, None]:
         model, voice_state = self._loaded_model()
         output_bytes = 0
+        capture: _AtomicWavWriter | None = None
+        completed = False
         with self.lock:
-            for audio_chunk in model.generate_audio_stream(voice_state, text):
-                chunk = self._pcm16_bytes(audio_chunk)
-                if chunk:
-                    output_bytes += len(chunk)
-                    yield chunk
+            if self.settings.save_latest_wav:
+                capture = self._open_latest_wav_capture(int(model.sample_rate))
+            try:
+                for audio_chunk in model.generate_audio_stream(voice_state, text):
+                    chunk = self._pcm16_bytes(audio_chunk)
+                    if chunk:
+                        output_bytes += len(chunk)
+                        yield chunk
+                        capture = self._write_latest_wav_chunk(capture, chunk)
+                completed = True
+            finally:
+                self._finish_latest_wav_capture(
+                    capture,
+                    completed=completed,
+                    pcm_bytes=output_bytes,
+                )
         LOGGER.info(
             'Speech synthesis completed',
             extra={
                 'event_id': 'ID_tts_synthesis_completed',
                 'response_format': 'pcm',
                 'audio_bytes': output_bytes,
+            },
+        )
+
+    def _save_latest_wav_response(self, wav: bytes) -> None:
+        """Atomically persist the exact WAV response body without regenerating audio."""
+        destination = self.settings.latest_wav_path
+        temporary_path: Path | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                dir=destination.parent,
+                prefix=f'.{destination.name}.',
+                suffix='.tmp',
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                _ = temporary.write(wav)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            _ = temporary_path.replace(destination)
+        except OSError:
+            if temporary_path is not None:
+                with suppress(OSError):
+                    temporary_path.unlink(missing_ok=True)
+            self._log_latest_wav_failure()
+            return
+        LOGGER.info(
+            'Saved latest synthesized recording',
+            extra={
+                'event_id': 'ID_tts_latest_recording_saved',
+                'response_format': 'wav',
+                'audio_bytes': len(wav),
+                'path': str(destination),
+            },
+        )
+
+    def _open_latest_wav_capture(self, sample_rate: int) -> _AtomicWavWriter | None:
+        try:
+            return _AtomicWavWriter(self.settings.latest_wav_path, sample_rate)
+        except (OSError, wave.Error):
+            self._log_latest_wav_failure()
+            return None
+
+    def _write_latest_wav_chunk(
+        self,
+        capture: _AtomicWavWriter | None,
+        chunk: bytes,
+    ) -> _AtomicWavWriter | None:
+        if capture is None:
+            return None
+        try:
+            capture.write(chunk)
+        except (OSError, wave.Error):
+            capture.abort()
+            self._log_latest_wav_failure()
+            return None
+        return capture
+
+    def _finish_latest_wav_capture(
+        self,
+        capture: _AtomicWavWriter | None,
+        *,
+        completed: bool,
+        pcm_bytes: int,
+    ) -> None:
+        if capture is None:
+            return
+        if not completed:
+            capture.abort()
+            return
+        self._commit_latest_wav_capture(capture, pcm_bytes)
+
+    def _commit_latest_wav_capture(
+        self,
+        capture: _AtomicWavWriter,
+        pcm_bytes: int,
+    ) -> None:
+        try:
+            capture.commit()
+        except (OSError, wave.Error):
+            capture.abort()
+            self._log_latest_wav_failure()
+            return
+        LOGGER.info(
+            'Saved latest synthesized recording',
+            extra={
+                'event_id': 'ID_tts_latest_recording_saved',
+                'response_format': 'pcm',
+                'pcm_bytes': pcm_bytes,
+                'path': str(self.settings.latest_wav_path),
+            },
+        )
+
+    def _log_latest_wav_failure(self) -> None:
+        LOGGER.exception(
+            'Failed to save latest synthesized recording',
+            extra={
+                'event_id': 'ID_tts_latest_recording_save_failed',
+                'path': str(self.settings.latest_wav_path),
             },
         )
 

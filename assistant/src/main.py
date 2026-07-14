@@ -10,7 +10,15 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    WebSocketException,
+    status,
+)
 from fastapi.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -32,6 +40,10 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger('assistant')
 UPSTREAM_KEEPALIVE_EXPIRY_SECONDS: Final = 4.0
+
+
+class SttEmptyTranscriptError(RuntimeError):
+    """Raised when the STT service produces an empty transcript."""
 
 
 class SessionOptions(BaseModel):
@@ -299,8 +311,7 @@ async def _consume_transcription(  # noqa: C901, PLR0912
                 )
             break
     if not transcript:
-        message = 'STT produced an empty transcript'
-        raise RuntimeError(message)
+        raise SttEmptyTranscriptError
     selected_tools = await utterance.select_and_warm(transcript, reason='final')
     return transcript, selected_tools
 
@@ -329,6 +340,11 @@ async def _run_realtime_session(
         transcription_task = asyncio.create_task(_consume_transcription(stt, utterance, send))
         try:
             _ = await asyncio.gather(forward_task, transcription_task)
+        except SttEmptyTranscriptError as e:
+            await send({'type': 'error', 'message': 'STT produced empty transcript'})
+            raise WebSocketException(
+                code=status.WS_1008_POLICY_VIOLATION, reason='STT produced empty transcript'
+            ) from e
         except BaseException:
             _ = forward_task.cancel()
             _ = transcription_task.cancel()

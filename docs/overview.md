@@ -170,6 +170,15 @@ PCM16 and includes format headers. Pocket TTS is not thread-safe, so generation
 is serialized within the single worker. Relevant settings use the `TTS_` prefix;
 defaults are declared in `tts/src/main.py`.
 
+Set `TTS_SAVE_LATEST_WAV=true` to atomically overwrite the most recently
+completed synthesized recording. `TTS_LATEST_WAV_PATH` defaults to
+`/tmp/latest.wav`; point it at mounted storage when the recording must be read
+after a pod replacement. A WAV response is saved verbatim. For a PCM response,
+the saved WAV frame data is the exact concatenation of the PCM chunks emitted to
+the client; synthesis is not repeated. An interrupted stream does not replace
+the previous recording, and capture failures are logged without failing the
+speech request.
+
 Upload a Pocket TTS voice-state file as multipart form data. The endpoint does
 not require authentication:
 
