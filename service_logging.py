@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import UTC, datetime
 from typing import Final
+from urllib.parse import urlsplit
 
 HEALTH_ENDPOINTS: Final = frozenset({'/health', '/health/live', '/health/ready'})
 _LOG_RECORD_FIELDS: Final = frozenset(logging.makeLogRecord({}).__dict__) | {
@@ -20,8 +21,13 @@ class SuccessfulHealthCheckFilter(logging.Filter):
         arguments = record.args
         if not isinstance(arguments, tuple) or len(arguments) < 5:  # noqa: PLR2004
             return True
-        method, path, status_code = arguments[1], arguments[2], arguments[4]
-        request_path = path.partition('?')[0] if isinstance(path, str) else path
+        if record.name == 'uvicorn.access':
+            method, target, status_code = arguments[1], arguments[2], arguments[4]
+        elif record.name == 'httpx':
+            method, target, status_code = arguments[0], arguments[1], arguments[3]
+        else:
+            return True
+        request_path = urlsplit(str(target)).path
         return not (
             method == 'GET' and request_path in HEALTH_ENDPOINTS and status_code == 200  # noqa: PLR2004
         )
@@ -119,6 +125,7 @@ def configure_logging(level: str, application_logger: str) -> None:
     logger.propagate = True
     logger.disabled = False
 
-    access_logger = logging.getLogger('uvicorn.access')
-    if not any(isinstance(item, SuccessfulHealthCheckFilter) for item in access_logger.filters):
-        access_logger.addFilter(SuccessfulHealthCheckFilter())
+    for logger_name in ('uvicorn.access', 'httpx'):
+        logger = logging.getLogger(logger_name)
+        if not any(isinstance(item, SuccessfulHealthCheckFilter) for item in logger.filters):
+            logger.addFilter(SuccessfulHealthCheckFilter())

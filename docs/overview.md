@@ -25,8 +25,8 @@ and prior tool results, so DEBUG logs can contain sensitive user or MCP data.
 Authentication headers are not logged.
 
 Successful `200` responses from `/health`, `/health/live`, and `/health/ready`
-are omitted from Uvicorn access logs; failed health checks and all other access
-logs remain visible.
+are omitted from Uvicorn access logs and the assistant's HTTPX upstream request
+logs; failed health checks and all other requests remain visible.
 
 ## Assistant
 

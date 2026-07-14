@@ -4,7 +4,7 @@ import json
 import logging
 import unittest
 
-from service_logging import JsonFormatter
+from service_logging import JsonFormatter, SuccessfulHealthCheckFilter
 
 
 class JsonFormatterTest(unittest.TestCase):
@@ -71,3 +71,49 @@ class JsonFormatterTest(unittest.TestCase):
         self.assertEqual(output['status_code'], 200)
         self.assertEqual(output['reason_phrase'], 'OK')
         self.assertNotIn('arguments', output)
+
+
+class SuccessfulHealthCheckFilterTest(unittest.TestCase):
+    @staticmethod
+    def _httpx_record(method: str, url: str, status_code: int) -> logging.LogRecord:
+        return logging.LogRecord(
+            'httpx',
+            logging.INFO,
+            __file__,
+            1,
+            'HTTP Request: %s %s "%s %d %s"',
+            (method, url, 'HTTP/1.1', status_code, 'status'),
+            None,
+        )
+
+    def test_successful_upstream_health_requests_are_suppressed(self) -> None:
+        health_filter = SuccessfulHealthCheckFilter()
+
+        self.assertFalse(
+            health_filter.filter(
+                self._httpx_record(
+                    'GET',
+                    'http://llama-server.llama-server/health?probe=ready',
+                    200,
+                ),
+            ),
+        )
+        self.assertFalse(
+            health_filter.filter(
+                self._httpx_record('GET', 'http://nemo-asr.nemo-asr/health/ready', 200),
+            ),
+        )
+
+    def test_failed_health_and_successful_application_requests_are_retained(self) -> None:
+        health_filter = SuccessfulHealthCheckFilter()
+
+        self.assertTrue(
+            health_filter.filter(
+                self._httpx_record('GET', 'http://llama-server.llama-server/health', 503),
+            ),
+        )
+        self.assertTrue(
+            health_filter.filter(
+                self._httpx_record('POST', 'http://llama-server.llama-server/completion', 200),
+            ),
+        )
