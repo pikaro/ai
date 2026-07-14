@@ -5,7 +5,9 @@ import base64
 import json
 import logging
 import re
+import sys
 import time
+from array import array
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -28,8 +30,14 @@ EventSender = Callable[[dict[str, object]], Awaitable[None]]
 
 
 def _log_generated_response(response_text: str) -> None:
-    LOGGER.info('Assistant response generated', extra={'characters': len(response_text)})
-    LOGGER.debug('Assistant response', extra={'response': response_text})
+    LOGGER.info(
+        'Assistant response generated',
+        extra={'event_id': 'ID_assistant_response_generated', 'characters': len(response_text)},
+    )
+    LOGGER.debug(
+        'Assistant response',
+        extra={'event_id': 'ID_assistant_response', 'response': response_text},
+    )
 
 
 class LlmProtocol(Protocol):
@@ -99,6 +107,115 @@ def completed_sentences(text: str) -> tuple[list[str], str]:
             sentences.append(sentence)
         start = match.end()
     return sentences, text[start:].lstrip()
+
+
+def _audio_frame_width(audio_format: AudioFormat) -> int:
+    if audio_format.sample_width < 1 or audio_format.channels < 1:
+        message = 'TTS returned an invalid audio format'
+        raise RuntimeError(message)
+    return audio_format.sample_width * audio_format.channels
+
+
+def _duration_frames(duration_seconds: float, sample_rate: int) -> int:
+    return int(duration_seconds * sample_rate + 0.5)
+
+
+def _linear_fade_pcm16(  # noqa: C901
+    pcm: bytes,
+    audio_format: AudioFormat,
+    *,
+    start_frame: int,
+    fade_frames: int,
+    fade_in: bool,
+) -> bytes:
+    if not pcm or fade_frames <= 1 or start_frame >= fade_frames:
+        return pcm
+    if audio_format.sample_width != 2:  # noqa: PLR2004
+        message = 'TTS sentence crossfade requires 16-bit PCM'
+        raise RuntimeError(message)
+
+    frame_width = _audio_frame_width(audio_format)
+    if len(pcm) % frame_width:
+        message = 'TTS returned a partial PCM frame'
+        raise RuntimeError(message)
+
+    samples = array('h')
+    samples.frombytes(pcm)
+    if sys.byteorder == 'big':
+        samples.byteswap()
+    frames_to_fade = min(len(pcm) // frame_width, fade_frames - start_frame)
+    denominator = fade_frames - 1
+    for frame_offset in range(frames_to_fade):
+        fade_frame = start_frame + frame_offset
+        numerator = fade_frame if fade_in else denominator - fade_frame
+        sample_offset = frame_offset * audio_format.channels
+        for channel in range(audio_format.channels):
+            index = sample_offset + channel
+            samples[index] = round(samples[index] * numerator / denominator)
+    if sys.byteorder == 'big':
+        samples.byteswap()
+    return samples.tobytes()
+
+
+class _SentencePcmBuffer:
+    """Stream a sentence while retaining only the tail needed for its boundary fade."""
+
+    def __init__(
+        self,
+        audio_format: AudioFormat,
+        crossfade_seconds: float,
+        *,
+        fade_in: bool,
+    ) -> None:
+        self.audio_format = audio_format
+        self.frame_width = _audio_frame_width(audio_format)
+        self.crossfade_frames = _duration_frames(
+            crossfade_seconds,
+            audio_format.sample_rate,
+        )
+        self.fade_in = fade_in
+        self.frames_emitted = 0
+        self.buffer = bytearray()
+
+    def append(self, pcm: bytes) -> bytes:
+        self.buffer.extend(pcm)
+        held_bytes = self.crossfade_frames * self.frame_width
+        emit_bytes = max(0, len(self.buffer) - held_bytes)
+        emit_bytes -= emit_bytes % self.frame_width
+        if not emit_bytes:
+            return b''
+        output = bytes(self.buffer[:emit_bytes])
+        del self.buffer[:emit_bytes]
+        return self._apply_fade_in(output)
+
+    def finish(self, *, fade_out: bool) -> bytes:
+        if len(self.buffer) % self.frame_width:
+            message = 'TTS returned a partial PCM frame'
+            raise RuntimeError(message)
+        output = self._apply_fade_in(bytes(self.buffer))
+        self.buffer.clear()
+        if not fade_out:
+            return output
+        return _linear_fade_pcm16(
+            output,
+            self.audio_format,
+            start_frame=0,
+            fade_frames=len(output) // self.frame_width,
+            fade_in=False,
+        )
+
+    def _apply_fade_in(self, pcm: bytes) -> bytes:
+        output = pcm
+        if self.fade_in:
+            output = _linear_fade_pcm16(
+                pcm,
+                self.audio_format,
+                start_frame=self.frames_emitted,
+                fade_frames=self.crossfade_frames,
+                fade_in=True,
+            )
+        self.frames_emitted += len(pcm) // self.frame_width
+        return output
 
 
 def parse_tool_response(text: str) -> dict[str, Any] | None:
@@ -176,6 +293,7 @@ class AssistantUtterance:
             LOGGER.info(
                 'LLM cache warm completed',
                 extra={
+                    'event_id': 'ID_assistant_llm_cache_warm_completed',
                     'reason': reason,
                     'slot': slot,
                     'outcome': outcome,
@@ -230,7 +348,11 @@ class AssistantUtterance:
         history: list[tuple[str, str]] = []
         LOGGER.info(
             'Tool resolution started',
-            extra={'slot': slot, 'tools': sorted(tools_by_name)},
+            extra={
+                'event_id': 'ID_assistant_tool_resolution_started',
+                'slot': slot,
+                'tools': sorted(tools_by_name),
+            },
         )
         for iteration in range(1, self.settings.maximum_tool_iterations + 1):
             prompt = build_prompt(transcript, selected_tools, history)
@@ -244,6 +366,7 @@ class AssistantUtterance:
             LOGGER.debug(
                 'Tool decision',
                 extra={
+                    'event_id': 'ID_assistant_tool_decision',
                     'iteration': iteration,
                     'slot': slot,
                     'decision': decision,
@@ -267,7 +390,12 @@ class AssistantUtterance:
             except Exception:
                 LOGGER.exception(
                     'Assistant tool call failed',
-                    extra={'tool': tool.name, 'source': tool.source, 'arguments': arguments},
+                    extra={
+                        'event_id': 'ID_assistant_tool_call_failed',
+                        'tool': tool.name,
+                        'source': tool.source,
+                        'arguments': arguments,
+                    },
                 )
                 result = json.dumps({'error': 'tool execution failed'})
             history.extend(
@@ -372,15 +500,26 @@ class AssistantUtterance:
     ) -> None:
         expected_format: AudioFormat | None = None
         first_audio = True
-        while (text := await queue.get()) is not None:
-            LOGGER.info('TTS segment requested', extra={'characters': len(text)})
-            LOGGER.debug('TTS segment', extra={'text': text})
+        previous_segment_had_audio = False
+        text = await queue.get()
+        while text is not None:
+            LOGGER.info(
+                'TTS segment requested',
+                extra={'event_id': 'ID_assistant_tts_segment_requested', 'characters': len(text)},
+            )
+            LOGGER.debug(
+                'TTS segment',
+                extra={'event_id': 'ID_assistant_tts_segment', 'text': text},
+            )
+            segment: _SentencePcmBuffer | None = None
             async for chunk, audio_format in self.tts.stream(text):
                 if expected_format is None:
                     expected_format = audio_format
                 elif audio_format != expected_format:
                     message = 'TTS audio format changed during the response'
                     raise RuntimeError(message)
+                if not chunk:
+                    continue
                 if first_audio:
                     first_audio = False
                     metrics.TTS_TIME_TO_FIRST_AUDIO.observe(time.perf_counter() - final_at)
@@ -393,14 +532,44 @@ class AssistantUtterance:
                             'channels': audio_format.channels,
                         },
                     )
-                metrics.AUDIO_OUTPUT_BYTES.inc(len(chunk))
-                await send(
-                    {
-                        'type': 'response.audio.delta',
-                        'audio': base64.b64encode(chunk).decode('ascii'),
-                    },
+                if segment is None:
+                    segment = _SentencePcmBuffer(
+                        audio_format,
+                        self.settings.tts_sentence_crossfade_seconds,
+                        fade_in=previous_segment_had_audio,
+                    )
+                    if previous_segment_had_audio:
+                        pause_frames = _duration_frames(
+                            self.settings.tts_sentence_pause_seconds,
+                            audio_format.sample_rate,
+                        )
+                        await self._send_audio_delta(
+                            b'\0' * (pause_frames * segment.frame_width),
+                            send,
+                        )
+                await self._send_audio_delta(segment.append(chunk), send)
+
+            next_text = await queue.get()
+            if segment is not None:
+                await self._send_audio_delta(
+                    segment.finish(fade_out=next_text is not None),
+                    send,
                 )
+                previous_segment_had_audio = True
+            text = next_text
         await send({'type': 'response.audio.done'})
+
+    @staticmethod
+    async def _send_audio_delta(pcm: bytes, send: EventSender) -> None:
+        if not pcm:
+            return
+        metrics.AUDIO_OUTPUT_BYTES.inc(len(pcm))
+        await send(
+            {
+                'type': 'response.audio.delta',
+                'audio': base64.b64encode(pcm).decode('ascii'),
+            },
+        )
 
     @staticmethod
     def _raise_empty_response() -> None:

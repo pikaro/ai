@@ -119,7 +119,10 @@ class TtsRuntime:
         self.lock = threading.Lock()
 
     def load(self) -> None:
-        LOGGER.info('Loading TTS model', extra={'model': self.settings.model_id})
+        LOGGER.info(
+            'Loading TTS model',
+            extra={'event_id': 'ID_tts_model_loading', 'model': self.settings.model_id},
+        )
         self.settings.data_directory.mkdir(parents=True, exist_ok=True)
         self.torch = importlib.import_module('torch')
         pocket_tts = importlib.import_module('pocket_tts')
@@ -140,6 +143,7 @@ class TtsRuntime:
         LOGGER.info(
             'TTS model ready',
             extra={
+                'event_id': 'ID_tts_model_ready',
                 'duration_seconds': self.load_seconds,
                 'voice': voice_source,
                 'voice_load_seconds': self.voice_load_seconds,
@@ -168,7 +172,10 @@ class TtsRuntime:
         destination = self.settings.data_directory / f'{name}.safetensors'
         replaced = destination.exists()
         _save_upload_atomic(upload, destination, self.settings.maximum_voice_upload_bytes)
-        LOGGER.info('Stored TTS voice', extra={'voice': name, 'replaced': replaced})
+        LOGGER.info(
+            'Stored TTS voice',
+            extra={'event_id': 'ID_tts_voice_stored', 'voice': name, 'replaced': replaced},
+        )
         return VoiceUploadResponse(name=name, filename=destination.name, replaced=replaced)
 
     def close(self) -> None:
@@ -226,7 +233,11 @@ class TtsRuntime:
                     yield chunk
         LOGGER.info(
             'Speech synthesis completed',
-            extra={'response_format': 'pcm', 'audio_bytes': output_bytes},
+            extra={
+                'event_id': 'ID_tts_synthesis_completed',
+                'response_format': 'pcm',
+                'audio_bytes': output_bytes,
+            },
         )
 
     def pcm_headers(self) -> dict[str, str]:
@@ -291,9 +302,16 @@ def _speech_response(runtime: TtsRuntime, speech_request: SpeechRequest) -> Resp
     text = runtime.validate_request(speech_request)
     LOGGER.info(
         'Speech synthesis requested',
-        extra={'response_format': speech_request.response_format, 'characters': len(text)},
+        extra={
+            'event_id': 'ID_tts_synthesis_requested',
+            'response_format': speech_request.response_format,
+            'characters': len(text),
+        },
     )
-    LOGGER.debug('Speech synthesis input', extra={'text': text})
+    LOGGER.debug(
+        'Speech synthesis input',
+        extra={'event_id': 'ID_tts_synthesis_input', 'text': text},
+    )
     if speech_request.response_format == 'pcm':
         return StreamingResponse(
             runtime.stream_pcm(text),
@@ -303,7 +321,11 @@ def _speech_response(runtime: TtsRuntime, speech_request: SpeechRequest) -> Resp
     wav = runtime.generate_wav(text)
     LOGGER.info(
         'Speech synthesis completed',
-        extra={'response_format': 'wav', 'audio_bytes': len(wav)},
+        extra={
+            'event_id': 'ID_tts_synthesis_completed',
+            'response_format': 'wav',
+            'audio_bytes': len(wav),
+        },
     )
     return Response(wav, media_type='audio/wav')
 

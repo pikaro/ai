@@ -108,6 +108,7 @@ class LlmClient:
         LOGGER.info(
             'LLM request started',
             extra={
+                'event_id': 'ID_assistant_llm_request_started',
                 'operation': operation,
                 'slot': slot,
                 'stream': False,
@@ -117,7 +118,12 @@ class LlmClient:
         )
         LOGGER.debug(
             'LLM request',
-            extra={'operation': operation, 'url': url, 'payload': payload},
+            extra={
+                'event_id': 'ID_assistant_llm_request',
+                'operation': operation,
+                'url': url,
+                'payload': payload,
+            },
         )
         try:
             response = await self.client.post(url, json=payload)
@@ -126,7 +132,12 @@ class LlmClient:
             self._observe_timings(body)
             LOGGER.debug(
                 'LLM response',
-                extra={'operation': operation, 'slot': slot, 'response': body},
+                extra={
+                    'event_id': 'ID_assistant_llm_response',
+                    'operation': operation,
+                    'slot': slot,
+                    'response': body,
+                },
             )
             content = body.get('content', '')
             return content if isinstance(content, str) else ''
@@ -141,6 +152,7 @@ class LlmClient:
             LOGGER.info(
                 'LLM request completed',
                 extra={
+                    'event_id': 'ID_assistant_llm_request_completed',
                     'operation': operation,
                     'slot': slot,
                     'stream': False,
@@ -167,6 +179,7 @@ class LlmClient:
         LOGGER.info(
             'LLM request started',
             extra={
+                'event_id': 'ID_assistant_llm_request_started',
                 'operation': operation,
                 'slot': slot,
                 'stream': True,
@@ -176,7 +189,12 @@ class LlmClient:
         )
         LOGGER.debug(
             'LLM request',
-            extra={'operation': operation, 'url': url, 'payload': payload},
+            extra={
+                'event_id': 'ID_assistant_llm_request',
+                'operation': operation,
+                'url': url,
+                'payload': payload,
+            },
         )
         try:
             async with self.client.stream(
@@ -197,6 +215,7 @@ class LlmClient:
                             LOGGER.info(
                                 'LLM first token received',
                                 extra={
+                                    'event_id': 'ID_assistant_llm_first_token_received',
                                     'operation': operation,
                                     'slot': slot,
                                     'duration_seconds': time.perf_counter() - started,
@@ -212,13 +231,19 @@ class LlmClient:
             self._observe_timings(final_data)
             LOGGER.debug(
                 'LLM response',
-                extra={'operation': operation, 'slot': slot, 'response': final_data},
+                extra={
+                    'event_id': 'ID_assistant_llm_response',
+                    'operation': operation,
+                    'slot': slot,
+                    'response': final_data,
+                },
             )
             metrics.LLM_REQUESTS.labels(operation=operation, outcome=outcome).inc()
             metrics.LLM_REQUEST_SECONDS.labels(operation=operation).observe(duration_seconds)
             LOGGER.info(
                 'LLM request completed',
                 extra={
+                    'event_id': 'ID_assistant_llm_request_completed',
                     'operation': operation,
                     'slot': slot,
                     'stream': True,
@@ -343,13 +368,18 @@ async def upstream_health(
             if not ready:
                 LOGGER.warning(
                     'Upstream health check failed',
-                    extra={'service': name, 'status_code': response.status_code},
+                    extra={
+                        'event_id': 'ID_assistant_upstream_health_check_failed',
+                        'service': name,
+                        'status_code': response.status_code,
+                    },
                 )
         except httpx.HTTPError as error:
             ready = False
             LOGGER.warning(
                 'Upstream health check failed',
                 extra={
+                    'event_id': 'ID_assistant_upstream_health_check_failed',
                     'service': name,
                     'error_type': type(error).__name__,
                     'error': str(error),

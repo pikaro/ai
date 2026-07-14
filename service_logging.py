@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Final
 from urllib.parse import urlsplit
 
 HEALTH_ENDPOINTS: Final = frozenset({'/health', '/health/live', '/health/ready'})
+DEFAULT_EVENT_ID: Final = 'ID_dependency_log'
+HTTP_SERVER_REQUEST_EVENT_ID: Final = 'ID_http_server_request'
+HTTP_CLIENT_REQUEST_EVENT_ID: Final = 'ID_http_client_request'
+EVENT_ID_PATTERN: Final = re.compile(r'ID_[a-z][a-z_]*')
 _LOG_RECORD_FIELDS: Final = frozenset(logging.makeLogRecord({}).__dict__) | {
     'asctime',
     'color_message',
@@ -34,7 +39,7 @@ class SuccessfulHealthCheckFilter(logging.Filter):
 
 
 class JsonFormatter(logging.Formatter):
-    """Render standard logging records and their ``extra`` fields as one JSON object."""
+    """Render logging records with a regex-friendly event ID as one JSON object."""
 
     def format(self, record: logging.LogRecord) -> str:  # noqa: C901
         message = record.getMessage()
@@ -43,20 +48,26 @@ class JsonFormatter(logging.Formatter):
             for key, value in record.__dict__.items()
             if key not in _LOG_RECORD_FIELDS and not key.startswith('_')
         }
+        event_id = fields.pop('event_id', None)
         access_fields = self._uvicorn_access_fields(record)
         if access_fields is not None:
             message = 'HTTP request'
             fields.update(access_fields)
+            event_id = HTTP_SERVER_REQUEST_EVENT_ID
         elif (httpx_fields := self._httpx_fields(record)) is not None:
             message = 'HTTP request'
             fields.update(httpx_fields)
+            event_id = HTTP_CLIENT_REQUEST_EVENT_ID
         elif record.args:
             fields['arguments'] = record.args
+        if not isinstance(event_id, str) or EVENT_ID_PATTERN.fullmatch(event_id) is None:
+            event_id = DEFAULT_EVENT_ID
 
         payload: dict[str, object] = {
             'timestamp': datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             'level': record.levelname,
             'logger': record.name,
+            'event_id': event_id,
             'message': message,
             **fields,
         }

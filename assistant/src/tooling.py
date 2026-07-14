@@ -127,7 +127,13 @@ class ToolRegistry:
                 try:
                     tools = await self._discover_mcp_tools(server_name, config)
                 except Exception:
-                    LOGGER.exception('MCP tool discovery failed', extra={'server': server_name})
+                    LOGGER.exception(
+                        'MCP tool discovery failed',
+                        extra={
+                            'event_id': 'ID_assistant_mcp_tool_discovery_failed',
+                            'server': server_name,
+                        },
+                    )
                     self._mcp_retry_after[server_name] = time.monotonic() + config.retry_seconds
                     continue
                 self._mcp_tools[server_name] = tools
@@ -144,6 +150,7 @@ class ToolRegistry:
             LOGGER.info(
                 'Tools selected',
                 extra={
+                    'event_id': 'ID_assistant_tools_selected',
                     'tool_count': len(selected),
                     'tools': [tool.name for tool in selected],
                     'sources': [tool.source for tool in selected],
@@ -153,6 +160,7 @@ class ToolRegistry:
                 LOGGER.debug(
                     'Tool selection',
                     extra={
+                        'event_id': 'ID_assistant_tool_selection',
                         'transcript': prompt,
                         'tools': [
                             {'source': tool.source, **tool.prompt_description()}
@@ -173,10 +181,22 @@ class ToolRegistry:
     async def call(self, tool: ToolDefinition, arguments: dict[str, Any]) -> str:
         started = time.perf_counter()
         outcome = 'success'
-        LOGGER.info('Tool call started', extra={'tool': tool.name, 'source': tool.source})
+        LOGGER.info(
+            'Tool call started',
+            extra={
+                'event_id': 'ID_assistant_tool_call_started',
+                'tool': tool.name,
+                'source': tool.source,
+            },
+        )
         LOGGER.debug(
             'Tool call request',
-            extra={'tool': tool.name, 'source': tool.source, 'arguments': arguments},
+            extra={
+                'event_id': 'ID_assistant_tool_call_request',
+                'tool': tool.name,
+                'source': tool.source,
+                'arguments': arguments,
+            },
         )
         try:
             result = tool.executor(arguments, self.context)
@@ -189,7 +209,12 @@ class ToolRegistry:
         else:
             LOGGER.debug(
                 'Tool call response',
-                extra={'tool': tool.name, 'source': tool.source, 'result': text},
+                extra={
+                    'event_id': 'ID_assistant_tool_call_response',
+                    'tool': tool.name,
+                    'source': tool.source,
+                    'result': text,
+                },
             )
             return text
         finally:
@@ -205,6 +230,7 @@ class ToolRegistry:
             LOGGER.info(
                 'Tool call completed',
                 extra={
+                    'event_id': 'ID_assistant_tool_call_completed',
                     'tool': tool.name,
                     'source': tool.source,
                     'outcome': outcome,
@@ -229,6 +255,7 @@ class ToolRegistry:
         LOGGER.info(
             'MCP request started',
             extra={
+                'event_id': 'ID_assistant_mcp_request_started',
                 'server': server_name,
                 'operation': 'list_tools',
                 'endpoint': config.endpoint,
@@ -274,6 +301,7 @@ class ToolRegistry:
                 LOGGER.debug(
                     'MCP tool discovery response',
                     extra={
+                        'event_id': 'ID_assistant_mcp_tool_discovery_response',
                         'server': server_name,
                         'endpoint': config.endpoint,
                         'tools': [
@@ -300,6 +328,7 @@ class ToolRegistry:
             LOGGER.info(
                 'MCP request completed',
                 extra={
+                    'event_id': 'ID_assistant_mcp_request_completed',
                     'server': server_name,
                     'operation': 'list_tools',
                     'outcome': outcome,
@@ -319,11 +348,17 @@ class ToolRegistry:
         outcome = 'success'
         LOGGER.info(
             'MCP request started',
-            extra={'server': server_name, 'operation': 'call_tool', 'tool': tool_name},
+            extra={
+                'event_id': 'ID_assistant_mcp_request_started',
+                'server': server_name,
+                'operation': 'call_tool',
+                'tool': tool_name,
+            },
         )
         LOGGER.debug(
             'MCP tool request',
             extra={
+                'event_id': 'ID_assistant_mcp_tool_request',
                 'server': server_name,
                 'endpoint': config.endpoint,
                 'tool': tool_name,
@@ -347,7 +382,12 @@ class ToolRegistry:
         else:
             LOGGER.debug(
                 'MCP tool response',
-                extra={'server': server_name, 'tool': tool_name, 'result': response},
+                extra={
+                    'event_id': 'ID_assistant_mcp_tool_response',
+                    'server': server_name,
+                    'tool': tool_name,
+                    'result': response,
+                },
             )
             return response
         finally:
@@ -364,6 +404,7 @@ class ToolRegistry:
             LOGGER.info(
                 'MCP request completed',
                 extra={
+                    'event_id': 'ID_assistant_mcp_request_completed',
                     'server': server_name,
                     'operation': 'call_tool',
                     'tool': tool_name,

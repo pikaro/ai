@@ -50,9 +50,16 @@ MODEL_LOAD_SECONDS = Gauge('stt_model_load_seconds', 'Time spent loading the STT
 def _log_transcription(stage: str, text: str) -> None:
     LOGGER.info(
         'Transcription produced',
-        extra={'stage': stage, 'characters': len(text)},
+        extra={
+            'event_id': 'ID_stt_transcription_produced',
+            'stage': stage,
+            'characters': len(text),
+        },
     )
-    LOGGER.debug('Transcription', extra={'stage': stage, 'transcript': text})
+    LOGGER.debug(
+        'Transcription',
+        extra={'event_id': 'ID_stt_transcription', 'stage': stage, 'transcript': text},
+    )
 
 
 class Settings(BaseSettings):
@@ -245,7 +252,10 @@ class AsrRuntime:
 
     def load(self) -> None:
         started = time.perf_counter()
-        LOGGER.info('Loading ASR model', extra={'model': self.settings.model_id})
+        LOGGER.info(
+            'Loading ASR model',
+            extra={'event_id': 'ID_stt_model_loading', 'model': self.settings.model_id},
+        )
         self.numpy = importlib.import_module('numpy')
         self.torch = importlib.import_module('torch')
         nemo_asr = importlib.import_module('nemo.collections.asr')
@@ -262,7 +272,10 @@ class AsrRuntime:
         self.load_seconds = time.perf_counter() - started
         MODEL_LOAD_SECONDS.set(self.load_seconds)
         MODEL_READY.set(1)
-        LOGGER.info('ASR model ready', extra={'duration_seconds': self.load_seconds})
+        LOGGER.info(
+            'ASR model ready',
+            extra={'event_id': 'ID_stt_model_ready', 'duration_seconds': self.load_seconds},
+        )
 
     def close(self) -> None:
         MODEL_READY.set(0)
@@ -331,12 +344,13 @@ class AsrRuntime:
                     temporary_path.unlink(missing_ok=True)
             LOGGER.exception(
                 'Failed to save latest input recording',
-                extra={'path': str(destination)},
+                extra={'event_id': 'ID_stt_latest_recording_save_failed', 'path': str(destination)},
             )
             return
         LOGGER.info(
             'Saved latest input recording',
             extra={
+                'event_id': 'ID_stt_latest_recording_saved',
                 'pcm_bytes': len(pcm),
                 'sample_rate': sample_rate,
                 'channels': channels,
@@ -712,7 +726,10 @@ async def _send_error(websocket: WebSocket, message: str) -> None:
 async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912
     runtime = _runtime_from_websocket(websocket)
     await websocket.accept()
-    LOGGER.info('realtime transcription session started')
+    LOGGER.info(
+        'realtime transcription session started',
+        extra={'event_id': 'ID_stt_realtime_session_started'},
+    )
     sample_rate = runtime.settings.stream_sample_rate
     channels = 1
     stream: CacheAwareStreamingSession | None = None
@@ -766,10 +783,16 @@ async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912
             for message in await asyncio.to_thread(stream.finish):
                 await websocket.send_json(message)
             await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
-            LOGGER.info('realtime transcription session completed')
+            LOGGER.info(
+                'realtime transcription session completed',
+                extra={'event_id': 'ID_stt_realtime_session_completed'},
+            )
             return
     except WebSocketDisconnect as error:
-        LOGGER.info('Realtime transcription client disconnected', extra={'code': error.code})
+        LOGGER.info(
+            'Realtime transcription client disconnected',
+            extra={'event_id': 'ID_stt_realtime_client_disconnected', 'code': error.code},
+        )
 
 
 if __name__ == '__main__':

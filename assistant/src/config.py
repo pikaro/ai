@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     stt_base_url: str = 'http://nemo-asr.nemo-asr'
     tts_base_url: str = 'http://pockettts.pockettts'
     tts_model: str = 'kyutai/pocket-tts'
+    tts_sentence_pause_seconds: float = Field(default=0.12, ge=0, le=2)
+    tts_sentence_crossfade_seconds: float = Field(default=0.01, ge=0, le=0.25)
     llm_slots: tuple[int, ...] = (0,)
     llm_max_tokens: int = Field(default=128, ge=1)
     llm_tool_tokens: int = Field(default=128, ge=1)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
+import struct
 import tempfile
 import unittest
 from datetime import UTC, datetime
@@ -42,6 +44,8 @@ class SettingsTest(unittest.TestCase):
             'ASSISTANT_LLM_SLOTS': '[1,2]',
             'ASSISTANT_MCP__CALENDAR__HOST': 'calendar-mcp',
             'ASSISTANT_MCP__CALENDAR__TRIGGERS': '["calendar","meeting"]',
+            'ASSISTANT_TTS_SENTENCE_PAUSE_SECONDS': '0.2',
+            'ASSISTANT_TTS_SENTENCE_CROSSFADE_SECONDS': '0.02',
             'LOG_LEVEL': 'DEBUG',
         }
         with patch.dict(os.environ, environment, clear=True):
@@ -50,6 +54,8 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.llm_slots, (1, 2))
         self.assertEqual(settings.listen_port, 9003)
         self.assertEqual(settings.log_level, 'DEBUG')
+        self.assertEqual(settings.tts_sentence_pause_seconds, 0.2)
+        self.assertEqual(settings.tts_sentence_crossfade_seconds, 0.02)
         self.assertEqual(settings.mcp['calendar'].endpoint, 'http://calendar-mcp:8080/mcp')
         self.assertEqual(settings.mcp['calendar'].triggers, {'calendar', 'meeting'})
 
@@ -224,6 +230,12 @@ class PromptTest(unittest.TestCase):
         self.assertEqual(sentences, ['First sentence.'])
         self.assertEqual(remainder, 'Incomplete tail')
 
+    def test_sentence_split_returns_every_completed_sentence(self) -> None:
+        sentences, remainder = completed_sentences('First sentence. Second! Third?')
+
+        self.assertEqual(sentences, ['First sentence.', 'Second!', 'Third?'])
+        self.assertEqual(remainder, '')
+
     def test_tool_json_is_extracted_from_model_response(self) -> None:
         response = parse_tool_response('{"tool":"time","arguments":{"mode":"rough"}}')
 
@@ -252,6 +264,7 @@ class ToolSelectionTest(unittest.IsolatedAsyncioTestCase):
 class FakeLlm:
     def __init__(self) -> None:
         self.warms: list[tuple[str, int]] = []
+        self.response = 'It is three.'
 
     async def warm_cache(self, prompt: str, slot: int) -> None:
         self.warms.append((prompt, slot))
@@ -265,30 +278,46 @@ class FakeLlm:
         maximum_tokens: int,
     ) -> str:
         del prompt, slot, operation, maximum_tokens
-        return 'It is three.'
+        return self.response
 
     async def stream(self, prompt: str, slot: int) -> AsyncIterator[str]:
         del prompt, slot
-        yield 'It is three.'
+        yield self.response
 
 
 class FakeTts:
+    def __init__(self) -> None:
+        self.requests: list[str] = []
+
     async def stream(self, text: str) -> AsyncIterator[tuple[bytes, AudioFormat]]:
-        del text
-        yield b'\x01\x02', AudioFormat(sample_rate=24_000, sample_width=2, channels=1)
+        self.requests.append(text)
+        yield (
+            struct.pack('<hhhh', 1_000, 1_000, 1_000, 1_000),
+            AudioFormat(
+                sample_rate=24_000,
+                sample_width=2,
+                channels=1,
+            ),
+        )
 
 
 class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
     settings: Settings
     slots: SlotPool
     llm: FakeLlm
+    tts: FakeTts
     registry: ToolRegistry
     utterance: AssistantUtterance
 
     async def asyncSetUp(self) -> None:
-        self.settings = Settings(llm_slots=(7,))
+        self.settings = Settings(
+            llm_slots=(7,),
+            tts_sentence_pause_seconds=2 / 24_000,
+            tts_sentence_crossfade_seconds=2 / 24_000,
+        )
         self.slots = SlotPool(self.settings.llm_slots)
         self.llm = FakeLlm()
+        self.tts = FakeTts()
         self.registry = ToolRegistry(
             discover_local_tools(),
             {},
@@ -299,7 +328,7 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
             self.settings,
             self.slots,
             self.llm,
-            FakeTts(),
+            self.tts,
             self.registry,
         )
 
@@ -331,6 +360,44 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('response.text.delta', event_types)
         self.assertIn('response.audio.delta', event_types)
         self.assertEqual(event_types[-1], 'response.done')
+
+    async def test_generation_splits_and_stitches_every_sentence(self) -> None:
+        self.llm.response = 'First sentence. Second! Third?'
+        events: list[dict[str, object]] = []
+
+        async def send(event: dict[str, object]) -> None:
+            events.append(event)
+
+        await self.utterance.generate('hello', [], send)
+
+        self.assertEqual(self.tts.requests, ['First sentence.', 'Second!', 'Third?'])
+        pcm = b''.join(
+            base64.b64decode(str(event['audio']))
+            for event in events
+            if event['type'] == 'response.audio.delta'
+        )
+        samples = struct.unpack(f'<{len(pcm) // 2}h', pcm)
+        self.assertEqual(
+            samples,
+            (
+                1_000,
+                1_000,
+                1_000,
+                0,
+                0,
+                0,
+                0,
+                1_000,
+                1_000,
+                0,
+                0,
+                0,
+                0,
+                1_000,
+                1_000,
+                1_000,
+            ),
+        )
 
 
 class MetricsTest(unittest.TestCase):

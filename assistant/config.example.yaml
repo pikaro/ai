@@ -4,6 +4,8 @@ listen_port: 8080
 llm_base_url: http://llama-server.llama-server
 stt_base_url: http://nemo-asr.nemo-asr
 tts_base_url: http://pockettts.pockettts
+tts_sentence_pause_seconds: 0.12
+tts_sentence_crossfade_seconds: 0.01
 llm_slots: [0]
 default_timezone: Europe/Berlin
 

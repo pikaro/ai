@@ -11,8 +11,12 @@ service-link variables.
 ## Logging
 
 Every application, dependency, and Uvicorn logging record is emitted as one
-JSON object. Common fields are `timestamp`, `level`, `logger`, and the minimal
-`message`; event data remains structured in additional fields. Uvicorn access
+JSON object. Common fields are `timestamp`, `level`, `logger`, `event_id`, and
+the minimal `message`; event data remains structured in additional fields.
+Project event IDs use stable, descriptive `ID_snake_case` names and can be
+found in raw logs with `\bID_[a-z_]+\b`. Uvicorn access and HTTPX
+request records use `ID_http_server_request` and `ID_http_client_request`;
+uncatalogued dependency records use `ID_dependency_log`. Uvicorn access
 records expose `client_address`, `method`, `path`, `http_version`, and
 `status_code`.
 
@@ -60,7 +64,11 @@ those slot IDs.
 
 LLM output is streamed immediately. Complete sentences are sent to TTS while
 the LLM continues decoding, and PCM is streamed to the caller without storing a
-WAV file.
+WAV file. Every completed sentence is synthesized separately. The assistant
+stitches the resulting PCM streams with a short silence and linear fades at
+sentence boundaries; configure these with `tts_sentence_pause_seconds` and
+`tts_sentence_crossfade_seconds`, or the corresponding `ASSISTANT_` environment
+variables. Set either duration to zero to disable that part of the transition.
 
 The assistant retires idle pooled upstream HTTP connections after four seconds,
 before the five-second idle timeout used by Uvicorn and llama.cpp. This avoids

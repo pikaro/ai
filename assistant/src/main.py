@@ -109,7 +109,11 @@ class AssistantRuntime:
         if unhealthy:
             LOGGER.warning(
                 'Upstream services unhealthy',
-                extra={'unhealthy_services': unhealthy, 'upstream': upstream},
+                extra={
+                    'event_id': 'ID_assistant_upstreams_unhealthy',
+                    'unhealthy_services': unhealthy,
+                    'upstream': upstream,
+                },
             )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -257,11 +261,19 @@ async def _consume_transcription(  # noqa: C901, PLR0912
             if transcript:
                 LOGGER.info(
                     'STT transcription received',
-                    extra={'stage': 'update', 'characters': len(transcript)},
+                    extra={
+                        'event_id': 'ID_assistant_stt_transcription_received',
+                        'stage': 'update',
+                        'characters': len(transcript),
+                    },
                 )
                 LOGGER.debug(
                     'STT transcription',
-                    extra={'stage': 'update', 'transcript': transcript},
+                    extra={
+                        'event_id': 'ID_assistant_stt_transcription',
+                        'stage': 'update',
+                        'transcript': transcript,
+                    },
                 )
                 selected_tools = await utterance.select_and_warm(transcript, reason='delta')
         elif message_type.endswith('transcription.completed'):
@@ -271,11 +283,19 @@ async def _consume_transcription(  # noqa: C901, PLR0912
             if transcript:
                 LOGGER.info(
                     'STT transcription received',
-                    extra={'stage': 'completed', 'characters': len(transcript)},
+                    extra={
+                        'event_id': 'ID_assistant_stt_transcription_received',
+                        'stage': 'completed',
+                        'characters': len(transcript),
+                    },
                 )
                 LOGGER.debug(
                     'STT transcription',
-                    extra={'stage': 'completed', 'transcript': transcript},
+                    extra={
+                        'event_id': 'ID_assistant_stt_transcription',
+                        'stage': 'completed',
+                        'transcript': transcript,
+                    },
                 )
             break
     if not transcript:
@@ -328,24 +348,40 @@ async def realtime(websocket: WebSocket) -> None:
     utterance = runtime.utterance()
     outcome = 'success'
     await websocket.accept()
-    LOGGER.info('realtime assistant session started')
+    LOGGER.info(
+        'realtime assistant session started',
+        extra={'event_id': 'ID_assistant_realtime_session_started'},
+    )
     metrics.ACTIVE_SESSIONS.inc()
     try:
         await _run_realtime_session(websocket, runtime, utterance)
         await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
-        LOGGER.info('realtime assistant session completed')
+        LOGGER.info(
+            'realtime assistant session completed',
+            extra={'event_id': 'ID_assistant_realtime_session_completed'},
+        )
     except WebSocketDisconnect as error:
         outcome = 'disconnected'
-        LOGGER.info('Realtime assistant client disconnected', extra={'code': error.code})
+        LOGGER.info(
+            'Realtime assistant client disconnected',
+            extra={'event_id': 'ID_assistant_realtime_client_disconnected', 'code': error.code},
+        )
     except ConnectionClosed as error:
         outcome = 'upstream_disconnected'
         LOGGER.warning(
             'Realtime STT connection closed',
-            extra={'code': error.code, 'reason': error.reason or None},
+            extra={
+                'event_id': 'ID_assistant_stt_connection_closed',
+                'code': error.code,
+                'reason': error.reason or None,
+            },
         )
     except Exception:
         outcome = 'error'
-        LOGGER.exception('realtime assistant session failed')
+        LOGGER.exception(
+            'realtime assistant session failed',
+            extra={'event_id': 'ID_assistant_realtime_session_failed'},
+        )
         if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.send_json({'type': 'error', 'message': 'assistant request failed'})
             await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
