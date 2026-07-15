@@ -12,19 +12,27 @@ import time
 import wave
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol, cast
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
-from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from runtime_config import (
+    ConfigurationUpdateResponse,
+    ExclusiveOperationGate,
+    reject_if_busy,
+    validated_settings_patch,
+)
 from service_logging import configure_logging
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Generator
+
+    from starlette.types import Receive, Scope, Send
 
 LOGGER = logging.getLogger('tts')
 MODEL_ID: Final = 'kyutai/pocket-tts'
@@ -33,6 +41,34 @@ VOICE_NAME_PATTERN: Final = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
 MODEL_READY = Gauge('tts_model_ready', 'Whether the TTS model and voice are loaded and ready')
 MODEL_LOAD_SECONDS = Gauge('tts_model_load_seconds', 'Time spent loading the TTS model')
 VOICE_LOAD_SECONDS = Gauge('tts_voice_load_seconds', 'Time spent loading the TTS voice')
+ACTIVE_REQUESTS = Gauge('tts_active_requests', 'Active TTS inference requests')
+BUSY_REJECTIONS = Counter(
+    'tts_busy_rejections_total',
+    'TTS inference and configuration requests rejected instead of queued',
+)
+CONFIGURATION_UPDATES = Counter(
+    'tts_configuration_updates_total',
+    'Successful ephemeral TTS configuration updates',
+)
+REQUESTS = Counter('tts_requests_total', 'Completed TTS requests', ['format', 'outcome'])
+REQUEST_SECONDS = Histogram('tts_request_duration_seconds', 'TTS request latency', ['format'])
+TIME_TO_FIRST_AUDIO = Histogram(
+    'tts_time_to_first_audio_seconds',
+    'Time from a PCM synthesis request to its first audio bytes',
+)
+AUDIO_SECONDS = Histogram('tts_output_audio_seconds', 'Audio duration produced by TTS')
+REALTIME_FACTOR = Histogram(
+    'tts_realtime_factor',
+    'TTS generation wall time divided by output audio duration',
+    buckets=(0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1, 1.5, 2, 5),
+)
+RESTART_REQUIRED_SETTINGS: Final = frozenset({'model_id', 'language', 'listen_port'})
+
+
+class _TorchModule(Protocol):
+    int16: object
+
+    def set_num_threads(self, threads: int, /) -> None: ...
 
 
 class _AtomicWavWriter:
@@ -102,6 +138,26 @@ class _AtomicWavWriter:
         if temporary_path is not None:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """Close a synchronous body iterator promptly when its client disconnects."""
+
+    def __init__(
+        self,
+        content: Generator[bytes, None, None],
+        *,
+        media_type: str,
+        headers: dict[str, str],
+    ) -> None:
+        self._content = content
+        super().__init__(content, media_type=media_type, headers=headers)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await asyncio.to_thread(self._content.close)
 
 
 class Settings(BaseSettings):
@@ -182,12 +238,66 @@ class VoiceUploadResponse(BaseModel):
 class TtsRuntime:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.operations = ExclusiveOperationGate()
         self.model: Any | None = None
         self.voice_state: Any | None = None
-        self.torch: Any | None = None
+        self.torch: _TorchModule | None = None
         self.load_seconds = 0.0
         self.voice_load_seconds = 0.0
         self.lock = threading.Lock()
+
+    @staticmethod
+    def _apply_torch_threads(
+        torch_module: _TorchModule | None,
+        previous_threads: int,
+        new_threads: int,
+    ) -> None:
+        if torch_module is not None and new_threads != previous_threads:
+            torch_module.set_num_threads(new_threads)
+
+    def _replacement_voice(
+        self,
+        settings: Settings,
+        *,
+        voice_changed: bool,
+    ) -> tuple[Any | None, float]:
+        if not voice_changed or self.model is None:
+            return self.voice_state, self.voice_load_seconds
+
+        started = time.perf_counter()
+        voice_state = self.model.get_state_for_audio_prompt(self.voice_source(settings))
+        return voice_state, time.perf_counter() - started
+
+    def apply_settings(self, settings: Settings) -> None:
+        """Apply settings and load a replacement voice before publishing it."""
+        previous = self.settings
+        voice_changed = (
+            settings.voice != previous.voice or settings.data_directory != previous.data_directory
+        )
+        with self.lock:
+            torch_module = self.torch
+            try:
+                self._apply_torch_threads(
+                    torch_module,
+                    previous.torch_threads,
+                    settings.torch_threads,
+                )
+                replacement_voice, replacement_voice_load_seconds = self._replacement_voice(
+                    settings,
+                    voice_changed=voice_changed,
+                )
+            except BaseException:
+                self._apply_torch_threads(
+                    torch_module,
+                    settings.torch_threads,
+                    previous.torch_threads,
+                )
+                raise
+            self.settings = settings
+            self.voice_state = replacement_voice
+            self.voice_load_seconds = replacement_voice_load_seconds
+            if voice_changed:
+                VOICE_LOAD_SECONDS.set(self.voice_load_seconds)
 
     def load(self) -> None:
         LOGGER.info(
@@ -195,7 +305,7 @@ class TtsRuntime:
             extra={'event_id': 'ID_tts_model_loading', 'model': self.settings.model_id},
         )
         self.settings.data_directory.mkdir(parents=True, exist_ok=True)
-        self.torch = importlib.import_module('torch')
+        self.torch = cast('_TorchModule', importlib.import_module('torch'))
         pocket_tts = importlib.import_module('pocket_tts')
         self.torch.set_num_threads(self.settings.torch_threads)
 
@@ -221,12 +331,13 @@ class TtsRuntime:
             },
         )
 
-    def voice_source(self) -> str:
-        if VOICE_NAME_PATTERN.fullmatch(self.settings.voice):
-            voice_path = self.settings.data_directory / f'{self.settings.voice}.safetensors'
+    def voice_source(self, settings: Settings | None = None) -> str:
+        selected = settings or self.settings
+        if VOICE_NAME_PATTERN.fullmatch(selected.voice):
+            voice_path = selected.data_directory / f'{selected.voice}.safetensors'
             if voice_path.is_file():
                 return str(voice_path)
-        return self.settings.voice
+        return selected.voice
 
     def save_voice(self, name: str, upload: UploadFile) -> VoiceUploadResponse:
         if VOICE_NAME_PATTERN.fullmatch(name) is None:
@@ -435,6 +546,10 @@ class TtsRuntime:
             'X-Audio-Channels': '1',
         }
 
+    def sample_rate(self) -> int:
+        model, _ = self._loaded_model()
+        return int(model.sample_rate)
+
     def _loaded_model(self) -> tuple[Any, Any]:
         if self.model is None or self.voice_state is None:
             message = 'TTS model is not loaded'
@@ -484,36 +599,108 @@ def _runtime(request: Request) -> TtsRuntime:
     return cast('TtsRuntime', request.app.state.runtime)
 
 
-def _speech_response(runtime: TtsRuntime, speech_request: SpeechRequest) -> Response:
-    text = runtime.validate_request(speech_request)
-    LOGGER.info(
-        'Speech synthesis requested',
-        extra={
-            'event_id': 'ID_tts_synthesis_requested',
-            'response_format': speech_request.response_format,
-            'characters': len(text),
-        },
-    )
-    LOGGER.debug(
-        'Speech synthesis input',
-        extra={'event_id': 'ID_tts_synthesis_input', 'text': text},
-    )
-    if speech_request.response_format == 'pcm':
-        return StreamingResponse(
-            runtime.stream_pcm(text),
-            media_type='application/octet-stream',
-            headers=runtime.pcm_headers(),
+def _observe_request(
+    response_format: str,
+    outcome: str,
+    started: float,
+    audio_bytes: int,
+    sample_rate: int,
+) -> None:
+    wall_seconds = time.perf_counter() - started
+    audio_seconds = audio_bytes / (sample_rate * 2) if sample_rate > 0 else 0
+    REQUESTS.labels(format=response_format, outcome=outcome).inc()
+    REQUEST_SECONDS.labels(format=response_format).observe(wall_seconds)
+    if audio_seconds > 0:
+        AUDIO_SECONDS.observe(audio_seconds)
+        REALTIME_FACTOR.observe(wall_seconds / audio_seconds)
+
+
+def _stream_speech(runtime: TtsRuntime, text: str, started: float) -> Generator[bytes, None, None]:
+    outcome = 'success'
+    output_bytes = 0
+    first_audio = True
+    sample_rate = 0
+    try:
+        sample_rate = runtime.sample_rate()
+        for chunk in runtime.stream_pcm(text):
+            if first_audio:
+                first_audio = False
+                TIME_TO_FIRST_AUDIO.observe(time.perf_counter() - started)
+            output_bytes += len(chunk)
+            yield chunk
+    except GeneratorExit:
+        outcome = 'cancelled'
+        raise
+    except Exception:
+        outcome = 'error'
+        raise
+    finally:
+        runtime.operations.release()
+        ACTIVE_REQUESTS.dec()
+        _observe_request('pcm', outcome, started, output_bytes, sample_rate)
+
+
+def _speech_response(  # noqa: C901
+    runtime: TtsRuntime,
+    speech_request: SpeechRequest,
+) -> Response:
+    try:
+        reject_if_busy(runtime.operations, 'TTS')
+    except HTTPException:
+        BUSY_REJECTIONS.inc()
+        raise
+    started = time.perf_counter()
+    ACTIVE_REQUESTS.inc()
+    stream_response = False
+    request_observed = False
+    outcome = 'success'
+    try:
+        text = runtime.validate_request(speech_request)
+        LOGGER.info(
+            'Speech synthesis requested',
+            extra={
+                'event_id': 'ID_tts_synthesis_requested',
+                'response_format': speech_request.response_format,
+                'characters': len(text),
+            },
         )
-    wav = runtime.generate_wav(text)
-    LOGGER.info(
-        'Speech synthesis completed',
-        extra={
-            'event_id': 'ID_tts_synthesis_completed',
-            'response_format': 'wav',
-            'audio_bytes': len(wav),
-        },
-    )
-    return Response(wav, media_type='audio/wav')
+        LOGGER.debug(
+            'Speech synthesis input',
+            extra={'event_id': 'ID_tts_synthesis_input', 'text': text},
+        )
+        if speech_request.response_format == 'pcm':
+            response = _ClosingStreamingResponse(
+                _stream_speech(runtime, text, started),
+                media_type='application/octet-stream',
+                headers=runtime.pcm_headers(),
+            )
+            stream_response = True
+            return response
+        wav = runtime.generate_wav(text)
+        LOGGER.info(
+            'Speech synthesis completed',
+            extra={
+                'event_id': 'ID_tts_synthesis_completed',
+                'response_format': 'wav',
+                'audio_bytes': len(wav),
+            },
+        )
+        with wave.open(io.BytesIO(wav), 'rb') as wav_file:
+            sample_rate = wav_file.getframerate()
+            pcm_bytes = wav_file.getnframes() * wav_file.getnchannels() * wav_file.getsampwidth()
+        response = Response(wav, media_type='audio/wav')
+        _observe_request('wav', outcome, started, pcm_bytes, sample_rate)
+        request_observed = True
+        return response  # noqa: TRY300
+    except Exception:
+        outcome = 'error'
+        raise
+    finally:
+        if not stream_response:
+            runtime.operations.release()
+            ACTIVE_REQUESTS.dec()
+            if not request_observed:
+                _observe_request(speech_request.response_format, outcome, started, 0, 1)
 
 
 def _save_upload_atomic(upload: UploadFile, destination: Path, maximum_bytes: int) -> None:
@@ -580,6 +767,45 @@ async def models(request: Request) -> ModelList:
     return ModelList(data=[ModelDescription(id=runtime.settings.model_id)])
 
 
+@app.get('/config', response_model=Settings, response_model_by_alias=False)
+async def configuration(request: Request) -> Settings:
+    return _runtime(request).settings
+
+
+@app.patch('/config', response_model=ConfigurationUpdateResponse)
+async def update_configuration(
+    request: Request,
+    patch: dict[str, object],
+) -> ConfigurationUpdateResponse:
+    runtime = _runtime(request)
+    try:
+        reject_if_busy(runtime.operations, 'TTS')
+    except HTTPException:
+        BUSY_REJECTIONS.inc()
+        raise
+    try:
+        settings, changed = validated_settings_patch(
+            runtime.settings,
+            patch,
+            restart_required=RESTART_REQUIRED_SETTINGS,
+        )
+        if changed:
+            await asyncio.to_thread(runtime.apply_settings, settings)
+            configure_logging(settings.log_level, 'tts')
+            CONFIGURATION_UPDATES.inc()
+            LOGGER.info(
+                'TTS configuration updated',
+                extra={
+                    'event_id': 'ID_tts_configuration_updated',
+                    'changed_fields': changed,
+                    'ephemeral': True,
+                },
+            )
+        return ConfigurationUpdateResponse(changed=changed)
+    finally:
+        runtime.operations.release()
+
+
 @app.post('/v1/audio/speech')
 def speech(request: Request, speech_request: SpeechRequest) -> Response:
     return _speech_response(_runtime(request), speech_request)
@@ -591,10 +817,18 @@ async def upload_voice(
     name: Annotated[str, Form()],
     file: Annotated[UploadFile, File()],
 ) -> VoiceUploadResponse:
+    runtime = _runtime(request)
     try:
-        return await asyncio.to_thread(_runtime(request).save_voice, name, file)
+        reject_if_busy(runtime.operations, 'TTS')
+    except HTTPException:
+        BUSY_REJECTIONS.inc()
+        await file.close()
+        raise
+    try:
+        return await asyncio.to_thread(runtime.save_voice, name, file)
     finally:
         await file.close()
+        runtime.operations.release()
 
 
 @app.post('/synthesize')

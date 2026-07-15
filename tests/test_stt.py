@@ -7,6 +7,7 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 from pydantic import ValidationError
 
 from service_logging import SuccessfulHealthCheckFilter
@@ -14,6 +15,7 @@ from stt.src.main import (
     AsrRuntime,
     RealtimeEvent,
     Settings,
+    app,
     metrics,
     stable_word_prefix,
     transcript_delta,
@@ -62,6 +64,48 @@ class RealtimeEventTest(unittest.TestCase):
             _ = RealtimeEvent.model_validate(
                 {'type': 'input_audio_buffer.commit', 'unexpected': True},
             )
+
+
+class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
+    async def test_patch_updates_stream_tunables_in_memory(self) -> None:
+        runtime = AsrRuntime(Settings())
+        app.state.runtime = runtime
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            response = await client.patch(
+                '/config',
+                json={
+                    'input_audio_seconds': 0.15,
+                    'attention_context_size': [70, 0],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(runtime.settings.input_audio_seconds, 0.15)
+        self.assertEqual(runtime.settings.attention_context_size, (70, 0))
+
+    async def test_patch_is_rejected_while_inference_is_active(self) -> None:
+        runtime = AsrRuntime(Settings())
+        app.state.runtime = runtime
+        self.assertTrue(runtime.operations.try_acquire())
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+                response = await client.patch('/config', json={'input_audio_seconds': 0.2})
+
+            self.assertEqual(response.status_code, 409)
+        finally:
+            runtime.operations.release()
+
+    async def test_invalid_patch_is_rejected_without_changing_settings(self) -> None:
+        runtime = AsrRuntime(Settings())
+        app.state.runtime = runtime
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            response = await client.patch('/config', json={'input_audio_seconds': 0})
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(runtime.settings.input_audio_seconds, 0.25)
 
 
 class AccessLogFilterTest(unittest.TestCase):
@@ -113,4 +157,6 @@ class MetricsTest(unittest.TestCase):
         response = asyncio.run(metrics())
 
         self.assertIn(b'stt_model_ready', response.body)
+        self.assertIn(b'stt_request_duration_seconds', response.body)
+        self.assertIn(b'stt_stream_time_to_first_delta_seconds', response.body)
         self.assertTrue(response.headers['content-type'].startswith('text/plain;'))

@@ -31,15 +31,24 @@ from assistant.src.config import Settings
 from assistant.src.pipeline import AssistantUtterance
 from assistant.src.tooling import ToolRegistry, discover_local_tools
 from assistant.src.upstream import LlmClient, SlotPool, TtsClient, upstream_health
+from runtime_config import (
+    ConfigurationUpdateResponse,
+    ExclusiveOperationGate,
+    reject_if_busy,
+    validated_settings_patch,
+)
 from service_logging import configure_logging
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from starlette.datastructures import Headers
+
     from assistant.src.tooling import ToolDefinition
 
 LOGGER = logging.getLogger('assistant')
 UPSTREAM_KEEPALIVE_EXPIRY_SECONDS: Final = 4.0
+RESTART_REQUIRED_SETTINGS: Final = frozenset({'listen_port'})
 
 
 class SttEmptyTranscriptError(RuntimeError):
@@ -88,8 +97,13 @@ class ModelList(BaseModel):
 
 
 class AssistantRuntime:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        operations: ExclusiveOperationGate | None = None,
+    ) -> None:
         self.settings = settings
+        self.operations = operations or ExclusiveOperationGate()
         timeout = httpx.Timeout(
             settings.request_timeout_seconds,
             connect=settings.connect_timeout_seconds,
@@ -171,7 +185,7 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     try:
         yield
     finally:
-        await runtime.close()
+        await cast('AssistantRuntime', application.state.runtime).close()
 
 
 app = FastAPI(title='Assistant', version='1.0.0', lifespan=lifespan)
@@ -183,6 +197,22 @@ def _runtime_from_request(request: Request) -> AssistantRuntime:
 
 def _runtime_from_websocket(websocket: WebSocket) -> AssistantRuntime:
     return cast('AssistantRuntime', websocket.app.state.runtime)
+
+
+def log_request_correlation(headers: Headers) -> None:
+    """Log optional client correlation headers before starting request work."""
+    request_id = headers.get('x-request-id')
+    request_timestamp = headers.get('x-request-timestamp')
+    if request_id is None and request_timestamp is None:
+        return
+    LOGGER.info(
+        'Assistant request correlation received',
+        extra={
+            'event_id': 'ID_assistant_request_correlation_received',
+            'request_id': request_id,
+            'request_timestamp': request_timestamp,
+        },
+    )
 
 
 @app.get('/health/live')
@@ -205,6 +235,44 @@ async def ready(request: Request) -> HealthResponse:
 async def models(request: Request) -> ModelList:
     runtime = _runtime_from_request(request)
     return ModelList(data=[ModelDescription(id=runtime.settings.model_id)])
+
+
+@app.get('/config', response_model=Settings, response_model_by_alias=False)
+async def configuration(request: Request) -> Settings:
+    return _runtime_from_request(request).settings
+
+
+@app.patch('/config', response_model=ConfigurationUpdateResponse)
+async def update_configuration(
+    request: Request,
+    patch: dict[str, object],
+) -> ConfigurationUpdateResponse:
+    runtime = _runtime_from_request(request)
+    reject_if_busy(runtime.operations, 'assistant')
+    changed: tuple[str, ...] = ()
+    try:
+        settings, changed = validated_settings_patch(
+            runtime.settings,
+            patch,
+            restart_required=RESTART_REQUIRED_SETTINGS,
+        )
+        if changed:
+            replacement = AssistantRuntime(settings, runtime.operations)
+            configure_logging(settings.log_level, 'assistant')
+            request.app.state.runtime = replacement
+            metrics.CONFIGURATION_UPDATES.inc()
+            LOGGER.info(
+                'Assistant configuration updated',
+                extra={
+                    'event_id': 'ID_assistant_configuration_updated',
+                    'changed_fields': changed,
+                    'ephemeral': True,
+                },
+            )
+            await runtime.close()
+        return ConfigurationUpdateResponse(changed=changed)
+    finally:
+        runtime.operations.release()
 
 
 async def _forward_client_audio(  # noqa: C901
@@ -250,13 +318,16 @@ async def _consume_transcription(  # noqa: C901, PLR0912
             continue
         if not isinstance(message, dict):
             continue
-        await send(message)
+        received_at = time.perf_counter()
         message_type = str(message.get('type', ''))
+        if message_type.endswith('transcription.completed'):
+            utterance.note_final_transcript(received_at)
+        await send(message)
         if message_type == 'error':
             raise RuntimeError(str(message.get('message', 'STT request failed')))
         if message_type.endswith('transcription.delta'):
             metrics.TRANSCRIPTION_DELTAS.inc()
-            now = time.perf_counter()
+            now = received_at
             if utterance.first_delta_at is None:
                 utterance.first_delta_at = now
                 if utterance.first_audio_at is not None:
@@ -287,7 +358,7 @@ async def _consume_transcription(  # noqa: C901, PLR0912
                         'transcript': transcript,
                     },
                 )
-                selected_tools = await utterance.select_and_warm(transcript, reason='delta')
+                utterance.schedule_cache_warm(transcript)
         elif message_type.endswith('transcription.completed'):
             completed = message.get('transcript')
             if isinstance(completed, str) and completed.strip():
@@ -312,7 +383,8 @@ async def _consume_transcription(  # noqa: C901, PLR0912
             break
     if not transcript:
         raise SttEmptyTranscriptError
-    selected_tools = await utterance.select_and_warm(transcript, reason='final')
+    utterance.note_final_transcript()
+    selected_tools = await utterance.finalize_cache_warming(transcript)
     return transcript, selected_tools
 
 
@@ -341,7 +413,6 @@ async def _run_realtime_session(
         try:
             _ = await asyncio.gather(forward_task, transcription_task)
         except SttEmptyTranscriptError as e:
-            await send({'type': 'error', 'message': 'STT produced empty transcript'})
             raise WebSocketException(
                 code=status.WS_1008_POLICY_VIOLATION, reason='STT produced empty transcript'
             ) from e
@@ -359,17 +430,32 @@ async def _run_realtime_session(
 
 
 @app.websocket('/v1/realtime')
-async def realtime(websocket: WebSocket) -> None:
+async def realtime(websocket: WebSocket) -> None:  # noqa: C901
+    log_request_correlation(websocket.headers)
     runtime = _runtime_from_websocket(websocket)
-    utterance = runtime.utterance()
-    outcome = 'success'
-    await websocket.accept()
-    LOGGER.info(
-        'realtime assistant session started',
-        extra={'event_id': 'ID_assistant_realtime_session_started'},
-    )
-    metrics.ACTIVE_SESSIONS.inc()
+    if not runtime.operations.try_acquire():
+        metrics.SESSION_REJECTIONS.inc()
+        await websocket.accept()
+        await websocket.send_json(
+            {'type': 'error', 'message': 'another assistant session is already active'},
+        )
+        await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+        return
     try:
+        utterance = runtime.utterance()
+    except BaseException:
+        runtime.operations.release()
+        raise
+    outcome = 'success'
+    session_started = False
+    try:
+        await websocket.accept()
+        LOGGER.info(
+            'realtime assistant session started',
+            extra={'event_id': 'ID_assistant_realtime_session_started'},
+        )
+        metrics.ACTIVE_SESSIONS.inc()
+        session_started = True
         await _run_realtime_session(websocket, runtime, utterance)
         await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
         LOGGER.info(
@@ -392,6 +478,18 @@ async def realtime(websocket: WebSocket) -> None:
                 'reason': error.reason or None,
             },
         )
+    except WebSocketException as error:
+        outcome = 'rejected'
+        LOGGER.info(
+            'Realtime assistant session rejected',
+            extra={
+                'event_id': 'ID_assistant_realtime_session_rejected',
+                'code': error.code,
+                'reason': error.reason or None,
+            },
+        )
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close(code=error.code, reason=error.reason)
     except Exception:
         outcome = 'error'
         LOGGER.exception(
@@ -402,9 +500,13 @@ async def realtime(websocket: WebSocket) -> None:
             await websocket.send_json({'type': 'error', 'message': 'assistant request failed'})
             await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
     finally:
-        await utterance.close()
-        metrics.ACTIVE_SESSIONS.dec()
-        metrics.SESSIONS.labels(outcome=outcome).inc()
+        try:
+            await utterance.close()
+        finally:
+            runtime.operations.release()
+            if session_started:
+                metrics.ACTIVE_SESSIONS.dec()
+                metrics.SESSIONS.labels(outcome=outcome).inc()
 
 
 if __name__ == '__main__':

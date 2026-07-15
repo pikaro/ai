@@ -7,6 +7,9 @@ tts_base_url: http://pockettts.pockettts
 tts_sentence_pause_seconds: 0.12
 tts_sentence_crossfade_seconds: 0.01
 llm_slots: [0]
+llm_cache_warm_enabled: true
+llm_cache_warm_min_interval_seconds: 0.5
+llm_cache_warm_min_new_characters: 1
 default_timezone: Europe/Berlin
 
 mcp:

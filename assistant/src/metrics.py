@@ -6,6 +6,14 @@ SESSIONS = Counter(
     ['outcome'],
 )
 ACTIVE_SESSIONS = Gauge('assistant_active_sessions', 'Active assistant WebSocket sessions')
+SESSION_REJECTIONS = Counter(
+    'assistant_session_rejections_total',
+    'Assistant sessions rejected instead of queued behind an active session',
+)
+CONFIGURATION_UPDATES = Counter(
+    'assistant_configuration_updates_total',
+    'Successful ephemeral assistant configuration updates',
+)
 SLOT_WAITERS = Gauge('assistant_llm_slot_waiters', 'Sessions waiting for a llama.cpp slot')
 SLOTS_IN_USE = Gauge('assistant_llm_slots_in_use', 'Leased llama.cpp slots')
 SLOT_WAIT_SECONDS = Histogram(
@@ -49,6 +57,15 @@ CACHE_TOOLSET_CHANGES = Counter(
     'assistant_llm_cache_toolset_changes_total',
     'Cache prompt revisions caused by newly triggered tools',
 )
+CACHE_WARM_UPDATES = Counter(
+    'assistant_llm_cache_warm_updates_total',
+    'Stable transcript updates considered by the cache warm scheduler',
+    ['disposition'],
+)
+CACHE_WARM_FINAL_WAIT_SECONDS = Histogram(
+    'assistant_llm_cache_warm_final_wait_duration_seconds',
+    'Time the final transcript waits for the one active incremental cache warm',
+)
 
 LLM_REQUESTS = Counter(
     'assistant_llm_requests_total',
@@ -59,6 +76,11 @@ LLM_REQUEST_SECONDS = Histogram(
     'assistant_llm_request_duration_seconds',
     'llama.cpp request latency',
     ['operation'],
+)
+LLM_SERVER_SECONDS = Histogram(
+    'assistant_llm_server_phase_duration_seconds',
+    'llama.cpp reported prompt and decode duration',
+    ['phase'],
 )
 LLM_TIME_TO_FIRST_TOKEN = Histogram(
     'assistant_llm_time_to_first_token_seconds',

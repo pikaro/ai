@@ -1,6 +1,7 @@
 *
 !pyproject.toml
 !uv.lock
+!runtime_config.py
 !service_logging.py
 !assistant/
 !assistant/Dockerfile

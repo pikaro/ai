@@ -10,17 +10,23 @@ import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import httpx
+from fastapi import WebSocket, WebSocketException, status
 from pydantic import ValidationError
+from starlette.datastructures import Headers
+from starlette.websockets import WebSocketState
 
 from assistant.src.config import Settings
 from assistant.src.main import (
     AssistantRuntime,
     RealtimeEvent,
+    app as assistant_app,
+    log_request_correlation,
     prometheus_metrics,
+    realtime,
 )
 from assistant.src.pipeline import (
     AssistantUtterance,
@@ -103,6 +109,183 @@ class RealtimeEventTest(unittest.TestCase):
             _ = RealtimeEvent.model_validate(
                 {'type': 'input_audio_buffer.commit', 'unexpected': True},
             )
+
+
+class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
+    async def test_patch_rebuilds_runtime_with_ephemeral_validated_settings(self) -> None:
+        original = AssistantRuntime(Settings())
+        assistant_app.state.runtime = original
+        transport = httpx.ASGITransport(app=assistant_app)
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            response = await client.patch(
+                '/config',
+                json={
+                    'llm_cache_warm_min_interval_seconds': 0.75,
+                    'llm_cache_warm_min_new_characters': 5,
+                },
+            )
+
+        replacement = cast('AssistantRuntime', assistant_app.state.runtime)
+        try:
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json()['ephemeral'])
+            self.assertEqual(
+                replacement.settings.llm_cache_warm_min_interval_seconds,
+                0.75,
+            )
+            self.assertEqual(replacement.settings.llm_cache_warm_min_new_characters, 5)
+        finally:
+            await replacement.close()
+
+    async def test_restart_only_setting_is_rejected_without_replacing_runtime(self) -> None:
+        runtime = AssistantRuntime(Settings())
+        assistant_app.state.runtime = runtime
+        transport = httpx.ASGITransport(app=assistant_app)
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+                response = await client.patch('/config', json={'listen_port': 9000})
+
+            self.assertEqual(response.status_code, 409)
+            self.assertIs(assistant_app.state.runtime, runtime)
+        finally:
+            await runtime.close()
+
+
+class RealtimeWebSocketTest(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_transcript_closes_with_policy_violation(self) -> None:  # noqa: C901
+        class FakeUtterance:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class FakeOperations:
+            def __init__(self) -> None:
+                self.released = False
+
+            def try_acquire(self) -> bool:
+                return True
+
+            def release(self) -> None:
+                self.released = True
+
+        class FakeRuntime:
+            def __init__(self, utterance: FakeUtterance) -> None:
+                self._utterance = utterance
+                self.operations = FakeOperations()
+
+            def utterance(self) -> FakeUtterance:
+                return self._utterance
+
+        class FakeWebSocket:
+            headers = Headers()
+            client_state = WebSocketState.CONNECTED
+
+            def __init__(self) -> None:
+                self.accepted = False
+                self.messages: list[dict[str, object]] = []
+                self.close_code: int | None = None
+                self.close_reason: str | None = None
+
+            async def accept(self) -> None:
+                self.accepted = True
+
+            async def send_json(self, payload: dict[str, object]) -> None:
+                self.messages.append(payload)
+
+            async def close(self, code: int = 1000, reason: str | None = None) -> None:
+                self.close_code = code
+                self.close_reason = reason
+
+        reason = 'STT produced empty transcript'
+        utterance = FakeUtterance()
+        runtime = FakeRuntime(utterance)
+        websocket = FakeWebSocket()
+        with (
+            patch(
+                'assistant.src.main._runtime_from_websocket',
+                return_value=runtime,
+            ),
+            patch(
+                'assistant.src.main._run_realtime_session',
+                side_effect=WebSocketException(
+                    code=status.WS_1008_POLICY_VIOLATION,
+                    reason=reason,
+                ),
+            ),
+        ):
+            await realtime(cast('WebSocket', websocket))
+
+        self.assertTrue(websocket.accepted)
+        self.assertEqual(websocket.messages, [])
+        self.assertEqual(websocket.close_code, status.WS_1008_POLICY_VIOLATION)
+        self.assertEqual(websocket.close_reason, reason)
+        self.assertTrue(utterance.closed)
+        self.assertTrue(runtime.operations.released)
+
+    async def test_second_session_is_closed_without_queueing(self) -> None:  # noqa: C901
+        class BusyOperations:
+            @staticmethod
+            def try_acquire() -> bool:
+                return False
+
+        class BusyRuntime:
+            operations = BusyOperations()
+
+            @staticmethod
+            def utterance() -> None:
+                self.fail('a rejected session must not create an utterance')
+
+        class FakeWebSocket:
+            headers = Headers()
+
+            def __init__(self) -> None:
+                self.messages: list[dict[str, object]] = []
+                self.close_code: int | None = None
+
+            async def accept(self) -> None:
+                return None
+
+            async def send_json(self, payload: dict[str, object]) -> None:
+                self.messages.append(payload)
+
+            async def close(self, code: int = 1000) -> None:
+                self.close_code = code
+
+        websocket = FakeWebSocket()
+        with patch('assistant.src.main._runtime_from_websocket', return_value=BusyRuntime()):
+            await realtime(cast('WebSocket', websocket))
+
+        self.assertEqual(websocket.close_code, status.WS_1013_TRY_AGAIN_LATER)
+        self.assertEqual(
+            websocket.messages,
+            [{'type': 'error', 'message': 'another assistant session is already active'}],
+        )
+
+
+class RequestCorrelationLoggingTest(unittest.TestCase):
+    def test_present_headers_are_logged_verbatim(self) -> None:
+        headers = Headers(
+            {
+                'X-Request-Id': 'wake-42',
+                'X-Request-Timestamp': '1784060717068',
+            },
+        )
+
+        with self.assertLogs('assistant', level='INFO') as captured:
+            log_request_correlation(headers)
+
+        record = captured.records[0]
+        self.assertEqual(record.__dict__['event_id'], 'ID_assistant_request_correlation_received')
+        self.assertEqual(record.__dict__['request_id'], 'wake-42')
+        self.assertEqual(record.__dict__['request_timestamp'], '1784060717068')
+
+    def test_absent_headers_do_not_add_a_log_record(self) -> None:
+        with patch('assistant.src.main.LOGGER.info') as info:
+            log_request_correlation(Headers())
+
+        info.assert_not_called()
 
 
 class AccessLogFilterTest(unittest.TestCase):
@@ -205,6 +388,31 @@ class LlmLoggingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(logged_payload['prompt'], prompt)
         self.assertIn('"name":"clock__time"', logged_payload['prompt'])
         self.assertIn('Return the time from the clock MCP server.', logged_payload['prompt'])
+
+    async def test_llama_cache_ratio_uses_cached_plus_evaluated_prompt_tokens(self) -> None:
+        def respond(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    'content': '',
+                    'timings': {
+                        'cache_n': 75,
+                        'prompt_n': 25,
+                        'prompt_ms': 50,
+                        'predicted_n': 0,
+                    },
+                },
+            )
+
+        settings = Settings(llm_base_url='http://llm.test')
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            llm = LlmClient(client, settings)
+            with patch(
+                'assistant.src.upstream.metrics.LLM_CACHE_REUSE_RATIO.observe',
+            ) as observe_reuse:
+                _ = await llm.complete('prompt', 0, operation='test', maximum_tokens=0)
+
+        observe_reuse.assert_called_once_with(0.75)
 
 
 class TimeToolTest(unittest.TestCase):
@@ -335,13 +543,54 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.utterance.close()
 
-    async def test_stable_word_updates_warm_the_same_slot(self) -> None:
-        _ = await self.utterance.select_and_warm('what is the', reason='delta')
-        _ = await self.utterance.select_and_warm('what is the time', reason='delta')
-        _ = await self.utterance.select_and_warm('what is the time', reason='final')
+    async def test_final_during_interval_drops_the_pending_warm(self) -> None:
+        self.utterance.schedule_cache_warm('what is the')
+        await asyncio.sleep(0)
+        self.utterance.schedule_cache_warm('what is the time')
+        await asyncio.sleep(0)
+        _ = await self.utterance.finalize_cache_warming('what is the time')
 
-        self.assertEqual(len(self.llm.warms), 2)
-        self.assertEqual([slot for _, slot in self.llm.warms], [7, 7])
+        self.assertEqual(len(self.llm.warms), 1)
+        self.assertEqual(self.llm.warms[0][1], 7)
+
+    async def test_final_transcript_drops_pending_warms_and_drains_only_active_work(self) -> None:
+        class BlockingLlm(FakeLlm):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def warm_cache(self, prompt: str, slot: int) -> None:
+                self.warms.append((prompt, slot))
+                _ = self.started.set()
+                _ = await self.release.wait()
+
+        llm = BlockingLlm()
+        utterance = AssistantUtterance(
+            self.settings,
+            self.slots,
+            llm,
+            self.tts,
+            self.registry,
+        )
+        try:
+            utterance.schedule_cache_warm('first stable words')
+            _ = await llm.started.wait()
+            utterance.schedule_cache_warm('first stable words plus more')
+            utterance.schedule_cache_warm('first stable words plus newest')
+            finalizing = asyncio.create_task(
+                utterance.finalize_cache_warming('final corrected transcript'),
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(finalizing.done())
+
+            _ = llm.release.set()
+            _ = await finalizing
+
+            self.assertEqual(len(llm.warms), 1)
+            self.assertIn('first stable words', llm.warms[0][0])
+        finally:
+            await utterance.close()
 
     async def test_generation_streams_text_and_pcm_events(self) -> None:
         events: list[dict[str, object]] = []
@@ -360,6 +609,7 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('response.text.delta', event_types)
         self.assertIn('response.audio.delta', event_types)
         self.assertEqual(event_types[-1], 'response.done')
+        self.assertEqual(self.llm.warms, [])
 
     async def test_generation_splits_and_stitches_every_sentence(self) -> None:
         self.llm.response = 'First sentence. Second! Third?'
@@ -405,5 +655,7 @@ class MetricsTest(unittest.TestCase):
         response = asyncio.run(prometheus_metrics())
 
         self.assertIn(b'assistant_llm_cache_warm_duration_seconds', response.body)
+        self.assertIn(b'assistant_llm_cache_warm_final_wait_duration_seconds', response.body)
+        self.assertIn(b'assistant_llm_server_phase_duration_seconds', response.body)
         self.assertIn(b'assistant_pipeline_stage_duration_seconds', response.body)
         self.assertTrue(response.headers['content-type'].startswith('text/plain;'))

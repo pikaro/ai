@@ -279,10 +279,26 @@ class LlmClient:
         timings = data.get('timings')
         if not isinstance(timings, dict):
             timings = {}
+        evaluated_tokens = timings.get('prompt_n')
+        if not isinstance(evaluated_tokens, (int, float)):
+            evaluated_tokens = data.get('tokens_evaluated')
+        cached_tokens = timings.get('cache_n')
+        if not isinstance(cached_tokens, (int, float)):
+            cached_tokens = data.get('tokens_cached')
+        generated_tokens = timings.get('predicted_n')
+        if not isinstance(generated_tokens, (int, float)):
+            generated_tokens = data.get('tokens_predicted')
+        prompt_tokens = evaluated_tokens
+        if isinstance(evaluated_tokens, (int, float)) and isinstance(
+            cached_tokens,
+            (int, float),
+        ):
+            prompt_tokens = evaluated_tokens + cached_tokens
         values = {
-            'prompt': timings.get('prompt_n') or data.get('tokens_evaluated'),
-            'cached': data.get('tokens_cached'),
-            'generated': timings.get('predicted_n') or data.get('tokens_predicted'),
+            'prompt': prompt_tokens,
+            'evaluated': evaluated_tokens,
+            'cached': cached_tokens,
+            'generated': generated_tokens,
         }
         for kind, value in values.items():
             if isinstance(value, (int, float)) and value >= 0:
@@ -291,12 +307,15 @@ class LlmClient:
             value = timings.get(key)
             if isinstance(value, (int, float)) and value >= 0:
                 metrics.LLM_TOKENS_PER_SECOND.labels(phase=phase).observe(value)
-        prompt_tokens = values['prompt']
-        cached_tokens = values['cached']
+        for phase, key in (('prompt', 'prompt_ms'), ('decode', 'predicted_ms')):
+            value = timings.get(key)
+            if isinstance(value, (int, float)) and value >= 0:
+                metrics.LLM_SERVER_SECONDS.labels(phase=phase).observe(value / 1_000)
         if (
             isinstance(prompt_tokens, (int, float))
             and prompt_tokens > 0
             and isinstance(cached_tokens, (int, float))
+            and cached_tokens >= 0
         ):
             metrics.LLM_CACHE_REUSE_RATIO.observe(min(1.0, cached_tokens / prompt_tokens))
 

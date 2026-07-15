@@ -151,6 +151,72 @@ class RequestValidationTest(unittest.TestCase):
             _ = self.runtime.validate_request(request)
 
 
+class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
+    async def test_patch_updates_limits_and_reloads_selected_voice(self) -> None:
+        runtime = TtsRuntime(Settings(voice='alba'))
+        runtime.model = MagicMock()
+        replacement_voice = object()
+        runtime.model.get_state_for_audio_prompt.return_value = replacement_voice
+        runtime.voice_state = object()
+        app.state.runtime = runtime
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            response = await client.patch(
+                '/config',
+                json={'maximum_input_characters': 200, 'voice': 'attenborough'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(runtime.settings.maximum_input_characters, 200)
+        self.assertEqual(runtime.settings.voice, 'attenborough')
+        self.assertIs(runtime.voice_state, replacement_voice)
+        runtime.model.get_state_for_audio_prompt.assert_called_once_with('attenborough')
+
+    async def test_language_change_reports_restart_required(self) -> None:
+        runtime = TtsRuntime(Settings())
+        app.state.runtime = runtime
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            response = await client.patch('/config', json={'language': 'german'})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(runtime.settings.language, 'english')
+
+    async def test_concurrent_synthesis_is_rejected_without_waiting(self) -> None:
+        runtime = TtsRuntime(Settings())
+        app.state.runtime = runtime
+        self.assertTrue(runtime.operations.try_acquire())
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+                response = await client.post(
+                    '/v1/audio/speech',
+                    json={'model': MODEL_ID, 'input': 'hello', 'response_format': 'pcm'},
+                )
+
+            self.assertEqual(response.status_code, 409)
+        finally:
+            runtime.operations.release()
+
+    async def test_completed_pcm_stream_releases_exclusive_operation(self) -> None:
+        runtime = TtsRuntime(Settings())
+        runtime.model = MagicMock(sample_rate=24_000)
+        runtime.model.generate_audio_stream.return_value = iter([b'\x01\x02'])
+        runtime.voice_state = object()
+        app.state.runtime = runtime
+        transport = httpx.ASGITransport(app=app)
+        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+                response = await client.post(
+                    '/v1/audio/speech',
+                    json={'model': MODEL_ID, 'input': 'hello', 'response_format': 'pcm'},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b'\x01\x02')
+        self.assertFalse(runtime.operations.active)
+
+
 class LatestWavTest(unittest.TestCase):
     def test_wav_response_is_saved_verbatim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -235,4 +301,6 @@ class MetricsTest(unittest.TestCase):
         response = asyncio.run(metrics())
 
         self.assertIn(b'tts_model_ready', response.body)
+        self.assertIn(b'tts_request_duration_seconds', response.body)
+        self.assertIn(b'tts_time_to_first_audio_seconds', response.body)
         self.assertTrue(response.headers['content-type'].startswith('text/plain;'))

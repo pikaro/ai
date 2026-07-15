@@ -28,10 +28,16 @@ from fastapi import (
     status,
 )
 from fastapi.responses import Response
-from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from runtime_config import (
+    ConfigurationUpdateResponse,
+    ExclusiveOperationGate,
+    reject_if_busy,
+    validated_settings_patch,
+)
 from service_logging import configure_logging
 
 if TYPE_CHECKING:
@@ -45,6 +51,34 @@ SUPPORTED_UPLOAD_SUFFIXES: Final = frozenset(
 )
 MODEL_READY = Gauge('stt_model_ready', 'Whether the STT model is loaded and ready')
 MODEL_LOAD_SECONDS = Gauge('stt_model_load_seconds', 'Time spent loading the STT model')
+ACTIVE_REQUESTS = Gauge('stt_active_requests', 'Active STT inference requests')
+BUSY_REJECTIONS = Counter(
+    'stt_busy_rejections_total',
+    'STT inference and configuration requests rejected instead of queued',
+)
+CONFIGURATION_UPDATES = Counter(
+    'stt_configuration_updates_total',
+    'Successful ephemeral STT configuration updates',
+)
+REQUESTS = Counter('stt_requests_total', 'Completed STT requests', ['mode', 'outcome'])
+REQUEST_SECONDS = Histogram('stt_request_duration_seconds', 'STT request latency', ['mode'])
+STREAM_CHUNK_SECONDS = Histogram(
+    'stt_stream_chunk_processing_duration_seconds',
+    'Model processing latency for one realtime audio update',
+)
+STREAM_COMMIT_SECONDS = Histogram(
+    'stt_stream_commit_duration_seconds',
+    'Model processing latency after realtime audio commit',
+)
+STREAM_TIME_TO_FIRST_DELTA = Histogram(
+    'stt_stream_time_to_first_delta_seconds',
+    'Time from first realtime audio bytes to first stable transcript delta',
+)
+STREAM_AUDIO_SECONDS = Histogram(
+    'stt_stream_input_audio_seconds',
+    'Client audio duration submitted to a realtime STT session',
+)
+RESTART_REQUIRED_SETTINGS: Final = frozenset({'model_id', 'device', 'listen_port'})
 
 
 def _log_transcription(stage: str, text: str) -> None:
@@ -243,12 +277,52 @@ def stable_word_prefix(previous: str, current: str) -> str:
 class AsrRuntime:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.operations = ExclusiveOperationGate()
         self.model: Any | None = None
         self.torch: Any | None = None
         self.numpy: Any | None = None
         self.streaming_buffer_type: Any | None = None
         self.load_seconds = 0.0
         self.lock = threading.Lock()
+
+    def apply_settings(self, settings: Settings) -> None:  # noqa: C901
+        """Apply settings that are safe between exclusive STT sessions."""
+        previous = self.settings
+        if (
+            settings.attention_context_size is None
+            and settings.attention_context_size != previous.attention_context_size
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    'message': 'clearing attention_context_size requires a service restart',
+                    'fields': ['attention_context_size'],
+                },
+            )
+        with self.lock:
+            try:
+                self.settings = settings
+                if self.torch is not None and settings.torch_threads != previous.torch_threads:
+                    self.torch.set_num_threads(settings.torch_threads)
+                if self.model is not None and settings.decoder_type != previous.decoder_type:
+                    self._configure_decoder(self.model)
+                if (
+                    self.model is not None
+                    and settings.attention_context_size != previous.attention_context_size
+                ):
+                    self._configure_encoder(self.model)
+            except BaseException:
+                self.settings = previous
+                if self.torch is not None and settings.torch_threads != previous.torch_threads:
+                    self.torch.set_num_threads(previous.torch_threads)
+                if self.model is not None and settings.decoder_type != previous.decoder_type:
+                    self._configure_decoder(self.model)
+                if (
+                    self.model is not None
+                    and settings.attention_context_size != previous.attention_context_size
+                ):
+                    self._configure_encoder(self.model)
+                raise
 
     def load(self) -> None:
         started = time.perf_counter()
@@ -700,6 +774,45 @@ async def models(request: Request) -> ModelList:
     return ModelList(data=[ModelDescription(id=runtime.settings.model_id)])
 
 
+@app.get('/config', response_model=Settings, response_model_by_alias=False)
+async def configuration(request: Request) -> Settings:
+    return _runtime_from_request(request).settings
+
+
+@app.patch('/config', response_model=ConfigurationUpdateResponse)
+async def update_configuration(
+    request: Request,
+    patch: dict[str, object],
+) -> ConfigurationUpdateResponse:
+    runtime = _runtime_from_request(request)
+    try:
+        reject_if_busy(runtime.operations, 'STT')
+    except HTTPException:
+        BUSY_REJECTIONS.inc()
+        raise
+    try:
+        settings, changed = validated_settings_patch(
+            runtime.settings,
+            patch,
+            restart_required=RESTART_REQUIRED_SETTINGS,
+        )
+        if changed:
+            await asyncio.to_thread(runtime.apply_settings, settings)
+            configure_logging(settings.log_level, 'stt')
+            CONFIGURATION_UPDATES.inc()
+            LOGGER.info(
+                'STT configuration updated',
+                extra={
+                    'event_id': 'ID_stt_configuration_updated',
+                    'changed_fields': changed,
+                    'ephemeral': True,
+                },
+            )
+        return ConfigurationUpdateResponse(changed=changed)
+    finally:
+        runtime.operations.release()
+
+
 @app.post('/v1/audio/transcriptions', response_model=TranscriptionResponse)
 async def transcribe(
     request: Request,
@@ -707,15 +820,32 @@ async def transcribe(
     model: Annotated[str, Form()] = '',
 ) -> TranscriptionResponse:
     runtime = _runtime_from_request(request)
-    _validate_model(model, runtime.settings)
-    path = await asyncio.to_thread(_save_upload, file, runtime.settings.maximum_upload_bytes)
     try:
-        text = await asyncio.to_thread(runtime.transcribe_file, path)
-        _log_transcription('file', text)
+        reject_if_busy(runtime.operations, 'STT')
+    except HTTPException:
+        BUSY_REJECTIONS.inc()
+        raise
+    started = time.perf_counter()
+    outcome = 'success'
+    ACTIVE_REQUESTS.inc()
+    try:
+        _validate_model(model, runtime.settings)
+        path = await asyncio.to_thread(_save_upload, file, runtime.settings.maximum_upload_bytes)
+        try:
+            text = await asyncio.to_thread(runtime.transcribe_file, path)
+            _log_transcription('file', text)
+        finally:
+            await asyncio.to_thread(path.unlink, missing_ok=True)
+        return TranscriptionResponse(text=text)
+    except Exception:
+        outcome = 'error'
+        raise
     finally:
         await file.close()
-        await asyncio.to_thread(path.unlink, missing_ok=True)
-    return TranscriptionResponse(text=text)
+        runtime.operations.release()
+        ACTIVE_REQUESTS.dec()
+        REQUESTS.labels(mode='file', outcome=outcome).inc()
+        REQUEST_SECONDS.labels(mode='file').observe(time.perf_counter() - started)
 
 
 async def _send_error(websocket: WebSocket, message: str) -> None:
@@ -723,20 +853,35 @@ async def _send_error(websocket: WebSocket, message: str) -> None:
 
 
 @app.websocket('/v1/realtime')
-async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912
+async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912, PLR0915
     runtime = _runtime_from_websocket(websocket)
-    await websocket.accept()
-    LOGGER.info(
-        'realtime transcription session started',
-        extra={'event_id': 'ID_stt_realtime_session_started'},
-    )
+    if not runtime.operations.try_acquire():
+        BUSY_REJECTIONS.inc()
+        await websocket.accept()
+        await _send_error(websocket, 'another STT session is already active')
+        await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+        return
+    started = time.perf_counter()
+    outcome = 'success'
+    request_started = False
+    first_audio_at: float | None = None
+    first_delta_observed = False
+    input_pcm_bytes = 0
     sample_rate = runtime.settings.stream_sample_rate
     channels = 1
     stream: CacheAwareStreamingSession | None = None
     try:
+        await websocket.accept()
+        ACTIVE_REQUESTS.inc()
+        request_started = True
+        LOGGER.info(
+            'realtime transcription session started',
+            extra={'event_id': 'ID_stt_realtime_session_started'},
+        )
         while True:
             raw = await websocket.receive_text()
             if len(raw.encode()) > runtime.settings.maximum_websocket_message_bytes:
+                outcome = 'rejected'
                 await websocket.close(code=status.WS_1009_MESSAGE_TOO_BIG)
                 return
             try:
@@ -766,21 +911,45 @@ async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912
                 except (binascii.Error, ValueError):
                     await _send_error(websocket, 'audio must be valid base64')
                     continue
+                if first_audio_at is None:
+                    first_audio_at = time.perf_counter()
+                input_pcm_bytes += len(pcm)
                 stream = stream or runtime.create_stream(sample_rate, channels)
+                chunk_started = time.perf_counter()
                 try:
                     messages = await asyncio.to_thread(stream.append_pcm, pcm)
                 except OverflowError as error:
+                    outcome = 'rejected'
                     await _send_error(websocket, str(error))
                     await websocket.close(code=status.WS_1009_MESSAGE_TOO_BIG)
                     return
+                finally:
+                    STREAM_CHUNK_SECONDS.observe(time.perf_counter() - chunk_started)
                 for message in messages:
+                    if not first_delta_observed and str(message.get('type', '')).endswith(
+                        'transcription.delta'
+                    ):
+                        first_delta_observed = True
+                        STREAM_TIME_TO_FIRST_DELTA.observe(time.perf_counter() - first_audio_at)
                     await websocket.send_json(message)
                 continue
 
             if stream is None:
                 await _send_error(websocket, 'cannot commit an empty audio buffer')
                 continue
-            for message in await asyncio.to_thread(stream.finish):
+            commit_started = time.perf_counter()
+            try:
+                messages = await asyncio.to_thread(stream.finish)
+            finally:
+                STREAM_COMMIT_SECONDS.observe(time.perf_counter() - commit_started)
+            for message in messages:
+                if (
+                    not first_delta_observed
+                    and str(message.get('type', '')).endswith('transcription.delta')
+                    and first_audio_at is not None
+                ):
+                    first_delta_observed = True
+                    STREAM_TIME_TO_FIRST_DELTA.observe(time.perf_counter() - first_audio_at)
                 await websocket.send_json(message)
             await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
             LOGGER.info(
@@ -789,10 +958,23 @@ async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912
             )
             return
     except WebSocketDisconnect as error:
+        outcome = 'disconnected'
         LOGGER.info(
             'Realtime transcription client disconnected',
             extra={'event_id': 'ID_stt_realtime_client_disconnected', 'code': error.code},
         )
+    except BaseException:
+        outcome = 'error'
+        raise
+    finally:
+        runtime.operations.release()
+        if request_started:
+            ACTIVE_REQUESTS.dec()
+            REQUESTS.labels(mode='realtime', outcome=outcome).inc()
+            REQUEST_SECONDS.labels(mode='realtime').observe(time.perf_counter() - started)
+            bytes_per_second = sample_rate * channels * 2
+            if bytes_per_second > 0:
+                STREAM_AUDIO_SECONDS.observe(input_pcm_bytes / bytes_per_second)
 
 
 if __name__ == '__main__':

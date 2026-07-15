@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     llm_tool_tokens: int = Field(default=128, ge=1)
     llm_cache_warm_tokens: int = Field(default=0, ge=0, le=1)
     llm_cache_warm_fallback_tokens: int = Field(default=1, ge=1, le=2)
+    llm_cache_warm_enabled: bool = True
+    llm_cache_warm_min_interval_seconds: float = Field(default=0.5, ge=0)
+    llm_cache_warm_min_new_characters: int = Field(default=1, ge=1)
     llm_temperature: float = Field(default=0.0, ge=0)
     request_timeout_seconds: float = Field(default=120.0, gt=0)
     connect_timeout_seconds: float = Field(default=10.0, gt=0)

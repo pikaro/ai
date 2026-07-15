@@ -8,6 +8,33 @@ with the unprefixed `LISTEN_PORT` environment variable; service-specific
 `*_PORT` names are intentionally avoided because Kubernetes reserves those for
 service-link variables.
 
+All three services expose `GET /config` and `PATCH /config`. `PATCH /config`
+accepts a JSON object containing a top-level subset of the service's settings,
+validates the complete resulting configuration, and applies it only in memory.
+It returns the changed field names and `ephemeral: true`; restart or pod
+replacement restores the file and environment configuration. Nested values such
+as the assistant's `mcp` map are replaced as a unit rather than recursively
+merged.
+
+Configuration updates and inference are mutually exclusive and are never
+queued. A patch or HTTP inference request received while that service is busy
+returns `409 Conflict`; a concurrent realtime WebSocket is closed with code
+`1013`. Listener and loaded-model identity settings cannot be safely replaced
+in place and return a `409` response listing the fields that require restart.
+These are `listen_port` for the assistant; `model_id`, `device`, and
+`listen_port` for STT; and `model_id`, `language`, and `listen_port` for TTS.
+Clearing a live STT `attention_context_size` also requires restart, while
+changing one explicit context pair to another is reloadable.
+
+For example, the following temporary update changes cache-warm cadence without
+modifying the mounted configuration:
+
+```sh
+curl -X PATCH http://assistant/config \
+  -H 'Content-Type: application/json' \
+  -d '{"llm_cache_warm_min_interval_seconds":0.75,"llm_cache_warm_min_new_characters":5}'
+```
+
 ## Logging
 
 Every application, dependency, and Uvicorn logging record is emitted as one
@@ -28,6 +55,12 @@ request payloads contain the exact submitted prompt, including tool definitions
 and prior tool results, so DEBUG logs can contain sensitive user or MCP data.
 Authentication headers are not logged.
 
+The assistant's `WS /v1/realtime` endpoint accepts optional `X-Request-Id` and
+`X-Request-Timestamp` headers. When either is present, the assistant logs an
+`ID_assistant_request_correlation_received` record immediately on receipt with
+the verbatim values in `request_id` and `request_timestamp`. The values are for
+log correlation only; they are not validated or forwarded to upstream services.
+
 Successful `200` responses from `/health`, `/health/live`, and `/health/ready`
 are omitted from Uvicorn access logs and the assistant's HTTPX upstream request
 logs; failed health checks and all other requests remain visible.
@@ -38,6 +71,7 @@ logs; failed health checks and all other requests remain visible.
 
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics`
+- `GET /config` and `PATCH /config`
 - `GET /v1/models`
 - `WS /v1/realtime`
 
@@ -51,16 +85,26 @@ forwards STT transcription events and then emits:
 - `response.done`
 
 Audio deltas are base64-encoded PCM16. `response.audio.started` declares the
-sample rate, sample width, and channel count.
+sample rate, sample width, and channel count. If STT produces an empty
+transcript, the assistant emits no response event and closes with WebSocket code
+1008 so clients can treat the empty utterance as an expected outcome.
 
-Every stable STT word delta builds a complete prompt and warms llama.cpp with
-`cache_prompt=true`. An utterance leases one configured llama.cpp slot from its
-first stable delta through final text generation, so another assistant session
-cannot replace that cache. The final request uses the same prompt and slot. A
-final corrective warm is sent only when STT's completed transcript or selected
-tool set differs from the last warm. Configure every llama.cpp slot dedicated
-to this assistant in `llm_slots`; other clients must not concurrently address
-those slot IDs.
+Stable STT word deltas feed a latest-wins llama.cpp cache warmer using
+`cache_prompt=true`. At most one warm is active and only one pending transcript
+is retained; a newer partial replaces that pending value. The STT receive loop
+never waits for a partial warm. On final transcription the pending partial is
+dropped, the one active warm is allowed to finish, and the generation request
+itself evaluates any remaining prompt suffix. No speculative LLM requests run
+concurrently and no partially cancelled cache state is assumed to be reusable.
+
+Set `llm_cache_warm_enabled` to disable incremental warming,
+`llm_cache_warm_min_interval_seconds` to limit warm start frequency, and
+`llm_cache_warm_min_new_characters` to ignore very small append-only updates.
+An utterance leases one configured llama.cpp slot from its first actual warm
+through final text generation. The assistant admits one WebSocket session at a
+time and closes a concurrent session with code `1013`, so additional configured
+slots cannot introduce concurrent LLM inference. Other clients must not
+concurrently address the assistant's llama.cpp slot.
 
 LLM output is streamed immediately. Complete sentences are sent to TTS while
 the LLM continues decoding, and PCM is streamed to the caller without storing a
@@ -113,13 +157,16 @@ mounted file.
 
 ### Assistant metrics
 
-Prometheus metrics cover active/completed sessions, slot use and wait time,
-stable STT deltas, first-delta/final-transcript latency, cache-warm counts and
-latency, cache prompt sizes and tool-set changes, llama.cpp request latency,
-TTFT, prompt/cached/generated tokens, cache reuse, prompt/decode throughput,
-tool and MCP outcomes/latency, TTS first-audio latency and real-time factor,
-audio bytes, per-stage end-to-end latency, and upstream readiness. Labels are
-limited to configured services, operations, tools, stages, and outcomes.
+Prometheus metrics cover active/completed/rejected sessions, slot use and wait
+time, stable STT deltas, first-delta/final-transcript latency, cache scheduler
+dispositions and final-wait time, cache-warm counts and latency, cache prompt
+sizes and tool-set changes, llama.cpp request and server-reported phase latency,
+TTFT, total/evaluated/cached/generated tokens, correctly denominatored cache
+reuse, prompt/decode throughput, tool and MCP outcomes/latency, TTS first-audio
+latency and real-time factor, audio bytes, configuration updates, and
+end-to-end stages from final transcript through LLM request, first token, first
+sentence, TTS request, first audio, and completion. Labels are limited to
+configured services, operations, tools, stages, dispositions, and outcomes.
 
 ## STT
 
@@ -127,6 +174,7 @@ limited to configured services, operations, tools, stages, and outcomes.
 
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics`
+- `GET /config` and `PATCH /config`
 - `GET /v1/models`
 - `POST /v1/audio/transcriptions`
 - `WS /v1/realtime`
@@ -135,8 +183,9 @@ The realtime endpoint accepts `session.update`, `input_audio_buffer.append`, and
 `input_audio_buffer.commit` events. Appended audio is base64-encoded PCM16. It
 emits partial, stable delta, and completed transcription events.
 
-The model is single-worker and internally serialized. Relevant settings use the
-`STT_` prefix; defaults are declared in `stt/src/main.py`.
+The model is single-worker. Concurrent HTTP or WebSocket inference is rejected
+instead of waiting behind the active session. Relevant settings use the `STT_`
+prefix; defaults are declared in `stt/src/main.py`.
 
 Set `STT_SAVE_LATEST_WAV=true` to atomically overwrite the most recently
 committed realtime input recording. `STT_LATEST_WAV_PATH` defaults to
@@ -160,15 +209,17 @@ libraries.
 
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics`
+- `GET /config` and `PATCH /config`
 - `GET /v1/models`
 - `POST /v1/voices`
 - `POST /v1/audio/speech`
 - compatibility endpoints `POST /synthesize` and `POST /synthesize_stream`
 
 `response_format=wav` returns a complete WAV file. `response_format=pcm` streams
-PCM16 and includes format headers. Pocket TTS is not thread-safe, so generation
-is serialized within the single worker. Relevant settings use the `TTS_` prefix;
-defaults are declared in `tts/src/main.py`.
+PCM16 and includes format headers. Pocket TTS is not thread-safe, so only one
+generation is admitted and concurrent requests receive `409 Conflict` instead
+of waiting on its model lock. Relevant settings use the `TTS_` prefix; defaults
+are declared in `tts/src/main.py`.
 
 Set `TTS_SAVE_LATEST_WAV=true` to atomically overwrite the most recently
 completed synthesized recording. `TTS_LATEST_WAV_PATH` defaults to
@@ -195,8 +246,11 @@ the data directory on persistent storage when uploads must survive container
 replacement.
 
 The STT and TTS `/metrics` endpoints use Prometheus' text exposition format.
-They include the Python process collectors and service gauges for model
-readiness and load duration; TTS also reports voice load duration. Metrics stay
+They include Python process collectors, model readiness/load gauges, request
+counts and latency, active requests, busy rejections, and configuration updates.
+STT additionally reports audio duration, chunk and commit processing latency,
+and time to first stable delta. TTS additionally reports voice load duration,
+time to first PCM audio, output duration, and real-time factor. Metrics stay
 local until a Prometheus server is configured to scrape them.
 
 ## Dependencies

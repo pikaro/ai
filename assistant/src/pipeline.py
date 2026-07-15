@@ -247,30 +247,124 @@ class AssistantUtterance:
         self.started_at = time.perf_counter()
         self.first_audio_at: float | None = None
         self.first_delta_at: float | None = None
+        self.final_transcript_at: float | None = None
         self.slot: int | None = None
         self.last_warmed_prompt: str | None = None
         self.last_tool_names: tuple[str, ...] = ()
         self.cache_warm_count = 0
+        self._pending_warm_transcript: str | None = None
+        self._last_scheduled_transcript = ''
+        self._last_warm_started_at: float | None = None
+        self._warm_worker: asyncio.Task[None] | None = None
+        self._warm_worker_state = 'idle'
+        self._cache_finalizing = False
 
     def note_audio(self, byte_count: int) -> None:
         if self.first_audio_at is None:
             self.first_audio_at = time.perf_counter()
         metrics.AUDIO_INPUT_BYTES.inc(byte_count)
 
-    async def select_and_warm(
-        self,
-        transcript: str,
-        *,
-        reason: str,
-    ) -> list[ToolDefinition]:
+    def note_final_transcript(self, received_at: float | None = None) -> None:
+        if self.final_transcript_at is not None:
+            return
+        self.final_transcript_at = received_at if received_at is not None else time.perf_counter()
+        if self.first_audio_at is not None:
+            metrics.PIPELINE_SECONDS.labels(stage='stt_final').observe(
+                self.final_transcript_at - self.first_audio_at,
+            )
+
+    def schedule_cache_warm(self, transcript: str) -> None:
+        """Schedule a stable transcript without queueing every intermediate revision."""
+        if not self.settings.llm_cache_warm_enabled:
+            metrics.CACHE_WARM_UPDATES.labels(disposition='disabled').inc()
+            return
+        if self._cache_finalizing:
+            metrics.CACHE_WARM_UPDATES.labels(disposition='finalizing').inc()
+            return
+        if (
+            self._last_scheduled_transcript
+            and transcript.startswith(self._last_scheduled_transcript)
+            and len(transcript) - len(self._last_scheduled_transcript)
+            < self.settings.llm_cache_warm_min_new_characters
+        ):
+            metrics.CACHE_WARM_UPDATES.labels(disposition='too_small').inc()
+            return
+
+        disposition = 'coalesced' if self._pending_warm_transcript is not None else 'scheduled'
+        self._pending_warm_transcript = transcript
+        self._last_scheduled_transcript = transcript
+        metrics.CACHE_WARM_UPDATES.labels(disposition=disposition).inc()
+        if self._warm_worker is None:
+            self._warm_worker = asyncio.create_task(self._run_cache_warms())
+
+    async def finalize_cache_warming(self, transcript: str) -> list[ToolDefinition]:
+        """Discard pending revisions, drain one active warm, and select final tools."""
+        started = time.perf_counter()
+        waited_for_active_warm = self._warm_worker_state == 'active'
+        await self._stop_cache_warming()
+        duration_seconds = time.perf_counter() - started
+        metrics.CACHE_WARM_FINAL_WAIT_SECONDS.observe(duration_seconds)
+        LOGGER.info(
+            'Final transcript cache barrier completed',
+            extra={
+                'event_id': 'ID_assistant_llm_cache_final_barrier_completed',
+                'duration_seconds': duration_seconds,
+                'waited_for_active_warm': waited_for_active_warm,
+            },
+        )
         selected_tools = await self.tools.select(transcript)
+        self._note_toolset(selected_tools)
+        return selected_tools
+
+    async def _run_cache_warms(self) -> None:  # noqa: C901
+        try:
+            while not self._cache_finalizing:
+                transcript = self._pending_warm_transcript
+                self._pending_warm_transcript = None
+                if transcript is None:
+                    return
+
+                if self._last_warm_started_at is not None:
+                    wait_seconds = (
+                        self._last_warm_started_at
+                        + self.settings.llm_cache_warm_min_interval_seconds
+                        - time.perf_counter()
+                    )
+                    if wait_seconds > 0:
+                        self._warm_worker_state = 'waiting'
+                        await asyncio.sleep(wait_seconds)
+                        if self._cache_finalizing:
+                            return
+                        if self._pending_warm_transcript is not None:
+                            transcript = self._pending_warm_transcript
+                            self._pending_warm_transcript = None
+
+                self._warm_worker_state = 'active'
+                self._last_warm_started_at = time.perf_counter()
+                try:
+                    await self._select_and_warm(transcript)
+                except Exception:
+                    LOGGER.exception(
+                        'Incremental LLM cache warm failed',
+                        extra={'event_id': 'ID_assistant_llm_cache_warm_failed'},
+                    )
+                finally:
+                    self._warm_worker_state = 'idle'
+        finally:
+            self._warm_worker_state = 'idle'
+            self._warm_worker = None
+
+    async def _select_and_warm(self, transcript: str) -> None:
+        selected_tools = await self.tools.select(transcript)
+        self._note_toolset(selected_tools)
+        prompt = build_prompt(transcript, selected_tools)
+        await self._warm(prompt, reason='delta')
+
+    def _note_toolset(self, selected_tools: list[ToolDefinition]) -> None:
         tool_names = tuple(sorted(tool.name for tool in selected_tools))
         if self.last_warmed_prompt is not None and tool_names != self.last_tool_names:
             metrics.CACHE_TOOLSET_CHANGES.inc()
         self.last_tool_names = tool_names
-        prompt = build_prompt(transcript, selected_tools)
-        await self._warm(prompt, reason=reason)
-        return selected_tools
 
     async def _warm(self, prompt: str, *, reason: str) -> None:
         if prompt == self.last_warmed_prompt:
@@ -308,19 +402,17 @@ class AssistantUtterance:
         selected_tools: list[ToolDefinition],
         send: EventSender,
     ) -> None:
-        final_at = time.perf_counter()
+        final_at = self.final_transcript_at or time.perf_counter()
         metrics.TRANSCRIPT_CHARACTERS.observe(len(transcript))
-        if self.first_audio_at is not None:
-            metrics.PIPELINE_SECONDS.labels(stage='stt_final').observe(
-                final_at - self.first_audio_at,
-            )
         prompt = build_prompt(transcript, selected_tools)
-        await self._warm(prompt, reason='final')
         await send(
             {
                 'type': 'response.created',
                 'response': {'model': self.settings.model_id, 'audio_format': 'pcm16'},
             },
+        )
+        metrics.PIPELINE_SECONDS.labels(stage='llm_request').observe(
+            time.perf_counter() - final_at,
         )
 
         if selected_tools:
@@ -433,23 +525,40 @@ class AssistantUtterance:
         parts: list[str] = []
         pending_text = ''
         first_token = True
+        first_sentence = True
         try:
             slot = await self._ensure_slot()
             async for token in self.llm.stream(prompt, slot):
                 if first_token:
-                    metrics.LLM_TIME_TO_FIRST_TOKEN.observe(time.perf_counter() - final_at)
+                    first_token_at = time.perf_counter()
+                    metrics.LLM_TIME_TO_FIRST_TOKEN.observe(first_token_at - final_at)
+                    metrics.PIPELINE_SECONDS.labels(stage='llm_first_token').observe(
+                        first_token_at - final_at,
+                    )
                     first_token = False
                 parts.append(token)
                 pending_text += token
                 await send({'type': 'response.text.delta', 'delta': token})
                 sentences, pending_text = completed_sentences(pending_text)
                 for sentence in sentences:
+                    if first_sentence:
+                        metrics.PIPELINE_SECONDS.labels(stage='llm_first_sentence').observe(
+                            time.perf_counter() - final_at,
+                        )
+                        first_sentence = False
                     await self._queue_or_raise(queue, sentence, tts_task)
             response_text = clean_response(''.join(parts))
+            metrics.PIPELINE_SECONDS.labels(stage='llm_complete').observe(
+                time.perf_counter() - final_at,
+            )
             if not response_text:
                 self._raise_empty_response()
             _log_generated_response(response_text)
             if pending_text.strip():
+                if first_sentence:
+                    metrics.PIPELINE_SECONDS.labels(stage='llm_first_sentence').observe(
+                        time.perf_counter() - final_at,
+                    )
                 await self._queue_or_raise(queue, pending_text.strip(), tts_task)
             await send({'type': 'response.text.done', 'text': response_text})
             metrics.LLM_OUTPUT_CHARACTERS.inc(len(response_text))
@@ -500,9 +609,15 @@ class AssistantUtterance:
     ) -> None:
         expected_format: AudioFormat | None = None
         first_audio = True
+        first_request = True
         previous_segment_had_audio = False
         text = await queue.get()
         while text is not None:
+            if first_request:
+                metrics.PIPELINE_SECONDS.labels(stage='tts_first_request').observe(
+                    time.perf_counter() - final_at,
+                )
+                first_request = False
             LOGGER.info(
                 'TTS segment requested',
                 extra={'event_id': 'ID_assistant_tts_segment_requested', 'characters': len(text)},
@@ -522,7 +637,11 @@ class AssistantUtterance:
                     continue
                 if first_audio:
                     first_audio = False
-                    metrics.TTS_TIME_TO_FIRST_AUDIO.observe(time.perf_counter() - final_at)
+                    first_audio_at = time.perf_counter()
+                    metrics.TTS_TIME_TO_FIRST_AUDIO.observe(first_audio_at - final_at)
+                    metrics.PIPELINE_SECONDS.labels(stage='tts_first_audio').observe(
+                        first_audio_at - final_at,
+                    )
                     await send(
                         {
                             'type': 'response.audio.started',
@@ -557,6 +676,9 @@ class AssistantUtterance:
                 )
                 previous_segment_had_audio = True
             text = next_text
+        metrics.PIPELINE_SECONDS.labels(stage='tts_complete').observe(
+            time.perf_counter() - final_at,
+        )
         await send({'type': 'response.audio.done'})
 
     @staticmethod
@@ -604,6 +726,19 @@ class AssistantUtterance:
         self.slot = None
         await self.slots.release(slot)
 
+    async def _stop_cache_warming(self) -> None:
+        self._cache_finalizing = True
+        if self._pending_warm_transcript is not None:
+            self._pending_warm_transcript = None
+            metrics.CACHE_WARM_UPDATES.labels(disposition='dropped_on_final').inc()
+        worker = self._warm_worker
+        if worker is None:
+            return
+        if self._warm_worker_state == 'waiting':
+            _ = worker.cancel()
+        _ = await asyncio.gather(worker, return_exceptions=True)
+
     async def close(self) -> None:
+        await self._stop_cache_warming()
         metrics.CACHE_WARMS_PER_SESSION.observe(self.cache_warm_count)
         await self.release_slot()
