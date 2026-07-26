@@ -36,10 +36,12 @@ curl -X PATCH http://assistant/config \
 ```
 
 The assistant also exposes `GET /dashboard`, a small internal configuration
-page for all three services. It displays each current configuration and accepts
-a top-level JSON patch. Assistant changes use its local configuration endpoint;
-STT and TTS changes are proxied to their existing `/config` endpoints, so their
-normal validation, busy rejection, and restart restrictions still apply.
+page for all three services. Its highlighted JSON editors compare edits with
+the last loaded configuration and PATCH only the changed top-level fields.
+Assistant changes use its local configuration endpoint; STT and TTS changes are
+proxied to their existing `/config` endpoints, so their normal validation, busy
+rejection, and restart restrictions still apply. The dashboard also edits the
+assistant system prompt.
 
 ## Logging
 
@@ -79,6 +81,7 @@ logs; failed health checks and all other requests remain visible.
 - `GET /metrics`
 - `GET /dashboard`
 - `GET /config` and `PATCH /config`
+- `GET /system-prompt` and `PUT /system-prompt`
 - `GET /v1/models`
 - `WS /v1/realtime`
 
@@ -110,9 +113,11 @@ stable prefix, so ordinary command changes preserve the system and tool KV
 cache. On startup the assistant creates `/tmp/system-prompt` with the default
 prompt if the file is absent. It checks the configured `system_prompt_path`
 before each prompt build and reloads a stable file revision after an in-place
-edit or atomic replacement. Existing contents are never overwritten. `/tmp` is
-ephemeral across pod replacement; configure a mounted path when edits must
-persist.
+edit or atomic replacement. `GET /system-prompt` returns the active text and
+`PUT /system-prompt` atomically replaces it; updates are rejected while the
+assistant is busy. Existing contents are never overwritten during startup.
+`/tmp` is ephemeral across pod replacement; configure a mounted path when edits
+must persist.
 
 Set `llm_cache_warm_enabled` to disable incremental warming,
 `llm_cache_warm_min_interval_seconds` to limit warm start frequency, and

@@ -76,6 +76,31 @@ class SystemPromptFile:
             )
         return self._prompt
 
+    def write(self, prompt: str) -> str:
+        """Atomically replace the prompt file and load the resulting revision."""
+        temporary_path: Path | None = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                encoding='utf-8',
+                dir=self.path.parent,
+                prefix=f'.{self.path.name}.',
+                suffix='.tmp',
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                _ = temporary.write(f'{prompt.strip()}\n')
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            _ = temporary_path.replace(self.path)
+        except (OSError, UnicodeError):
+            if temporary_path is not None:
+                with suppress(OSError):
+                    temporary_path.unlink(missing_ok=True)
+            raise
+        return self.read()
+
     def _read_revision(
         self,
     ) -> tuple[str, tuple[int, int, int, int, int]] | None:

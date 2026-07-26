@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi import WebSocket, WebSocketException, status
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from starlette.datastructures import Headers
 from starlette.websockets import WebSocketState
 
@@ -182,10 +182,11 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.headers['content-type'].startswith('text/html'))
-        self.assertIn('data-service="assistant"', response.text)
-        self.assertIn('data-service="stt"', response.text)
-        self.assertIn('data-service="tts"', response.text)
+        self.assertIn("const configServices = ['assistant', 'stt', 'tts']", response.text)
         self.assertIn('/dashboard/config/${service}', response.text)
+        self.assertIn('class="json-highlight"', response.text)
+        self.assertIn('function buildPatch(card)', response.text)
+        self.assertIn("fetch('/system-prompt'", response.text)
 
     async def test_assistant_configuration_is_exposed_without_proxying(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -207,6 +208,42 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.json()['model_id'], 'dashboard-model')
             finally:
                 await runtime.close()
+
+    async def test_assistant_patch_preserves_unchanged_redacted_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                system_prompt_path=Path(directory) / 'system-prompt',
+                mcp={
+                    'calendar': MCPConfig(
+                        host='calendar.test',
+                        token=SecretStr('actual-secret'),
+                    ),
+                },
+            )
+            original = AssistantRuntime(settings)
+            assistant_app.state.runtime = original
+            transport = httpx.ASGITransport(app=assistant_app)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url='http://test',
+            ) as client:
+                current = (await client.get('/dashboard/config/assistant')).json()
+                current['mcp']['calendar']['enabled'] = False
+                del current['mcp']['calendar']['token']
+                response = await client.patch(
+                    '/dashboard/config/assistant',
+                    json={'mcp': current['mcp']},
+                )
+
+            replacement = cast('AssistantRuntime', assistant_app.state.runtime)
+            try:
+                self.assertEqual(response.status_code, 200)
+                calendar = replacement.settings.mcp['calendar']
+                self.assertFalse(calendar.enabled)
+                token = cast('SecretStr', calendar.token)
+                self.assertEqual(token.get_secret_value(), 'actual-secret')
+            finally:
+                await replacement.close()
 
     async def test_upstream_configuration_is_proxied(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -277,6 +314,61 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                     json=patch_body,
                 )
             finally:
+                await runtime.close()
+
+
+class SystemPromptEndpointTest(unittest.IsolatedAsyncioTestCase):
+    async def test_get_and_put_system_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            prompt_path = Path(directory) / 'system-prompt'
+            runtime = AssistantRuntime(Settings(system_prompt_path=prompt_path))
+            assistant_app.state.runtime = runtime
+            original_inode = prompt_path.stat().st_ino
+            transport = httpx.ASGITransport(app=assistant_app)
+            try:
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url='http://test',
+                ) as client:
+                    initial = await client.get('/system-prompt')
+                    updated = await client.put(
+                        '/system-prompt',
+                        content='  Updated system prompt.  \n',
+                        headers={'Content-Type': 'text/plain; charset=utf-8'},
+                    )
+                    reloaded = await client.get('/system-prompt')
+
+                self.assertEqual(initial.text, BASE_SYSTEM_PROMPT)
+                self.assertEqual(updated.status_code, 200)
+                self.assertEqual(updated.text, 'Updated system prompt.')
+                self.assertEqual(reloaded.text, updated.text)
+                self.assertEqual(
+                    prompt_path.read_text(encoding='utf-8'),
+                    'Updated system prompt.\n',
+                )
+                self.assertNotEqual(prompt_path.stat().st_ino, original_inode)
+                self.assertFalse(runtime.operations.active)
+            finally:
+                await runtime.close()
+
+    async def test_put_system_prompt_is_rejected_while_assistant_is_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            prompt_path = Path(directory) / 'system-prompt'
+            runtime = AssistantRuntime(Settings(system_prompt_path=prompt_path))
+            assistant_app.state.runtime = runtime
+            self.assertTrue(runtime.operations.try_acquire())
+            transport = httpx.ASGITransport(app=assistant_app)
+            try:
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url='http://test',
+                ) as client:
+                    response = await client.put('/system-prompt', content='Not applied')
+
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(runtime.system_prompt.read(), BASE_SYSTEM_PROMPT)
+            finally:
+                runtime.operations.release()
                 await runtime.close()
 
 

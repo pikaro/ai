@@ -20,9 +20,9 @@ from fastapi import (
     WebSocketException,
     status,
 )
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from starlette.websockets import WebSocketState
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
@@ -256,6 +256,30 @@ async def _proxy_configuration_request(
     )
 
 
+def _restore_dashboard_secrets(current: object, proposed: object) -> object:
+    if isinstance(current, SecretStr) and proposed == str(current):
+        return current
+    if isinstance(current, dict) and isinstance(proposed, dict):
+        restored = {
+            key: _restore_dashboard_secrets(current.get(key), value)
+            for key, value in proposed.items()
+        }
+        restored.update(
+            {
+                key: value
+                for key, value in current.items()
+                if key not in proposed and isinstance(value, SecretStr)
+            },
+        )
+        return restored
+    if isinstance(current, (list, tuple)) and isinstance(proposed, list):
+        return [
+            _restore_dashboard_secrets(current[index], value) if index < len(current) else value
+            for index, value in enumerate(proposed)
+        ]
+    return proposed
+
+
 def log_request_correlation(headers: Headers) -> None:
     """Log optional client correlation headers before starting request work."""
     request_id = headers.get('x-request-id')
@@ -337,6 +361,51 @@ async def update_configuration(
         runtime.operations.release()
 
 
+@app.get('/system-prompt', response_class=PlainTextResponse)
+async def system_prompt(request: Request) -> str:
+    return _runtime_from_request(request).system_prompt.read()
+
+
+@app.put('/system-prompt', response_class=PlainTextResponse)
+async def update_system_prompt(request: Request) -> str:
+    try:
+        prompt = (await request.body()).decode('utf-8')
+    except UnicodeDecodeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='system prompt must be UTF-8 text',
+        ) from error
+
+    runtime = _runtime_from_request(request)
+    reject_if_busy(runtime.operations, 'assistant')
+    try:
+        try:
+            updated_prompt = runtime.system_prompt.write(prompt)
+        except (OSError, UnicodeError) as error:
+            LOGGER.exception(
+                'System prompt update failed',
+                extra={
+                    'event_id': 'ID_assistant_system_prompt_update_failed',
+                    'path': str(runtime.settings.system_prompt_path),
+                },
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail='system prompt update failed',
+            ) from error
+        LOGGER.info(
+            'System prompt updated',
+            extra={
+                'event_id': 'ID_assistant_system_prompt_updated',
+                'path': str(runtime.settings.system_prompt_path),
+                'characters': len(updated_prompt),
+            },
+        )
+        return updated_prompt
+    finally:
+        runtime.operations.release()
+
+
 @app.get('/dashboard/config/{service}', include_in_schema=False)
 async def dashboard_configuration(
     request: Request,
@@ -355,7 +424,12 @@ async def update_dashboard_configuration(
     patch: dict[str, object],
 ) -> Response:
     if service == 'assistant':
-        result = await update_configuration(request, patch)
+        runtime = _runtime_from_request(request)
+        current = runtime.settings.model_dump(round_trip=True)
+        restored_patch = {
+            key: _restore_dashboard_secrets(current.get(key), value) for key, value in patch.items()
+        }
+        result = await update_configuration(request, restored_patch)
         return Response(result.model_dump_json(), media_type='application/json')
     runtime = _runtime_from_request(request)
     return await _proxy_configuration_request(runtime, service, 'PATCH', patch)

@@ -17,20 +17,34 @@
       padding: 24px;
     }
 
+    h1, h2 {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+    }
+
     h1 {
-      margin: 0 0 8px;
-      font: 600 24px system-ui, sans-serif;
+      margin-bottom: 8px;
+      font-size: 24px;
+    }
+
+    h2 {
+      font-size: 18px;
+    }
+
+    .hint, .status, .changes, .result, label, button {
+      font-family: system-ui, sans-serif;
+      font-size: 13px;
     }
 
     .hint {
       margin: 0 0 24px;
       color: #9ca3af;
-      font: 14px system-ui, sans-serif;
+      font-size: 14px;
     }
 
     .services {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
       gap: 16px;
     }
 
@@ -50,50 +64,96 @@
       margin-bottom: 12px;
     }
 
-    h2 {
-      margin: 0;
-      font: 600 18px system-ui, sans-serif;
-      text-transform: uppercase;
-    }
-
-    .status {
+    .status, .changes, .result {
       color: #9ca3af;
-      font: 13px system-ui, sans-serif;
-    }
-
-    pre,
-    textarea {
-      box-sizing: border-box;
-      width: 100%;
-      border: 1px solid #4b5563;
-      border-radius: 5px;
-      background: #111827;
-      color: #e5e7eb;
-      font: inherit;
-      line-height: 1.4;
-    }
-
-    pre {
-      min-height: 280px;
-      max-height: 55vh;
-      margin: 0 0 14px;
-      padding: 12px;
-      overflow: auto;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
     }
 
     label {
       display: block;
       margin-bottom: 6px;
       color: #d1d5db;
-      font: 600 13px system-ui, sans-serif;
+      font-weight: 600;
     }
 
-    textarea {
-      min-height: 110px;
-      padding: 10px;
+    .editor-shell, .prompt-editor {
+      box-sizing: border-box;
+      width: 100%;
+      border: 1px solid #4b5563;
+      border-radius: 5px;
+      background: #111827;
+    }
+
+    .editor-shell {
+      position: relative;
+      height: min(60vh, 720px);
+      min-height: 360px;
+      overflow: hidden;
+    }
+
+    .editor-shell:focus-within {
+      border-color: #60a5fa;
+    }
+
+    .editor-shell.invalid {
+      border-color: #f87171;
+    }
+
+    .json-highlight, .config-editor {
+      position: absolute;
+      inset: 0;
+      box-sizing: border-box;
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 12px;
+      border: 0;
+      outline: 0;
+      font: inherit;
+      line-height: 1.45;
+      tab-size: 2;
+      white-space: pre;
+    }
+
+    .json-highlight {
+      overflow: hidden;
+      pointer-events: none;
+      color: #d1d5db;
+    }
+
+    .config-editor {
+      overflow: auto;
+      resize: none;
+      background: transparent;
+      color: #e5e7eb;
+      caret-color: #f9fafb;
+    }
+
+    .editor-shell.highlighted .config-editor {
+      color: transparent;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .config-editor::selection {
+      background: rgb(37 99 235 / 55%);
+    }
+
+    .json-key { color: #93c5fd; }
+    .json-string { color: #86efac; }
+    .json-number { color: #fca5a5; }
+    .json-literal { color: #c4b5fd; }
+
+    .prompt-editor {
+      min-height: 360px;
+      padding: 12px;
       resize: vertical;
+      color: #e5e7eb;
+      font: inherit;
+      line-height: 1.45;
+    }
+
+    .changes {
+      min-height: 18px;
+      margin-top: 8px;
     }
 
     .actions {
@@ -109,7 +169,7 @@
       background: #374151;
       color: #f9fafb;
       cursor: pointer;
-      font: 600 13px system-ui, sans-serif;
+      font-weight: 600;
     }
 
     button.primary {
@@ -118,19 +178,17 @@
     }
 
     button:disabled {
-      cursor: wait;
-      opacity: 0.6;
+      cursor: not-allowed;
+      opacity: 0.5;
     }
 
     .result {
       min-height: 18px;
       margin-top: 10px;
-      color: #9ca3af;
-      font: 13px system-ui, sans-serif;
       white-space: pre-wrap;
     }
 
-    .result.error {
+    .error {
       color: #fca5a5;
     }
   </style>
@@ -138,42 +196,35 @@
 <body>
   <h1>AI service configuration</h1>
   <p class="hint">
-    Changes are validated by each service and remain in memory only. Enter a top-level JSON
-    object containing just the fields to change.
+    Edit the loaded JSON directly. Only changed top-level fields are sent, and all changes remain
+    in memory. The system prompt is stored at the assistant's configured prompt path.
   </p>
 
-  <main class="services">
-    <section class="service" data-service="assistant">
-      <header><h2>Assistant</h2><span class="status">Loading…</span></header>
-      <pre class="current">Loading…</pre>
-      <label for="assistant-patch">PATCH body</label>
-      <textarea id="assistant-patch" class="patch" spellcheck="false">{}</textarea>
+  <template id="config-template">
+    <section class="service">
+      <header><h2></h2><span class="status">Loading…</span></header>
+      <label>Configuration JSON</label>
+      <div class="editor-shell">
+        <pre class="json-highlight" aria-hidden="true"></pre>
+        <textarea class="config-editor" wrap="off" spellcheck="false"></textarea>
+      </div>
+      <div class="changes">No local changes</div>
       <div class="actions">
-        <button class="primary apply" type="button">Apply PATCH</button>
+        <button class="primary apply" type="button" disabled>Apply changes</button>
         <button class="reload" type="button">Reload</button>
       </div>
       <div class="result" role="status" aria-live="polite"></div>
     </section>
+  </template>
 
-    <section class="service" data-service="stt">
-      <header><h2>STT</h2><span class="status">Loading…</span></header>
-      <pre class="current">Loading…</pre>
-      <label for="stt-patch">PATCH body</label>
-      <textarea id="stt-patch" class="patch" spellcheck="false">{}</textarea>
+  <main class="services" id="services">
+    <section class="service" id="prompt-card">
+      <header><h2>System prompt</h2><span class="status">Loading…</span></header>
+      <label for="prompt-editor">Prompt text</label>
+      <textarea id="prompt-editor" class="prompt-editor" spellcheck="true"></textarea>
+      <div class="changes">No local changes</div>
       <div class="actions">
-        <button class="primary apply" type="button">Apply PATCH</button>
-        <button class="reload" type="button">Reload</button>
-      </div>
-      <div class="result" role="status" aria-live="polite"></div>
-    </section>
-
-    <section class="service" data-service="tts">
-      <header><h2>TTS</h2><span class="status">Loading…</span></header>
-      <pre class="current">Loading…</pre>
-      <label for="tts-patch">PATCH body</label>
-      <textarea id="tts-patch" class="patch" spellcheck="false">{}</textarea>
-      <div class="actions">
-        <button class="primary apply" type="button">Apply PATCH</button>
+        <button class="primary save" type="button" disabled>Save prompt</button>
         <button class="reload" type="button">Reload</button>
       </div>
       <div class="result" role="status" aria-live="polite"></div>
@@ -183,7 +234,119 @@
   <script>
     'use strict';
 
-    const endpoint = service => `/dashboard/config/${service}`;
+    const configServices = ['assistant', 'stt', 'tts'];
+    const configEndpoint = service => `/dashboard/config/${service}`;
+
+    function escapeHtml(text) {
+      return text.replace(/[&<>]/g, character => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+      })[character]);
+    }
+
+    function highlightedJson(text) {
+      const pattern =
+        /"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|\b(?:true|false|null)\b/g;
+      let output = '';
+      let position = 0;
+      for (const match of text.matchAll(pattern)) {
+        output += escapeHtml(text.slice(position, match.index));
+        const token = match[0];
+        const remainder = text.slice(match.index + token.length);
+        let tokenClass = 'json-number';
+        if (token.startsWith('"')) {
+          tokenClass = /^\s*:/.test(remainder) ? 'json-key' : 'json-string';
+        } else if (/^(true|false|null)$/.test(token)) {
+          tokenClass = 'json-literal';
+        }
+        output += `<span class="${tokenClass}">${escapeHtml(token)}</span>`;
+        position = match.index + token.length;
+      }
+      output += escapeHtml(text.slice(position));
+      return output + (text.endsWith('\n') ? ' ' : '');
+    }
+
+    function updateHighlight(editor) {
+      const shell = editor.closest('.editor-shell');
+      const highlight = shell.querySelector('.json-highlight');
+      highlight.innerHTML = highlightedJson(editor.value);
+      syncHighlightScroll(editor);
+      shell.classList.add('highlighted');
+    }
+
+    function syncHighlightScroll(editor) {
+      const highlight = editor.closest('.editor-shell').querySelector('.json-highlight');
+      highlight.scrollTop = editor.scrollTop;
+      highlight.scrollLeft = editor.scrollLeft;
+    }
+
+    function isObject(value) {
+      return value !== null && typeof value === 'object' && !Array.isArray(value);
+    }
+
+    function deepEqual(left, right) {
+      if (Object.is(left, right)) return true;
+      if (Array.isArray(left) && Array.isArray(right)) {
+        return left.length === right.length &&
+          left.every((value, index) => deepEqual(value, right[index]));
+      }
+      if (!isObject(left) || !isObject(right)) return false;
+      const leftKeys = Object.keys(left);
+      const rightKeys = Object.keys(right);
+      return leftKeys.length === rightKeys.length &&
+        leftKeys.every(key => Object.hasOwn(right, key) && deepEqual(left[key], right[key]));
+    }
+
+    function parseConfiguration(card) {
+      const configuration = JSON.parse(card.querySelector('.config-editor').value);
+      if (!isObject(configuration)) {
+        throw new Error('Configuration must be a JSON object');
+      }
+      return configuration;
+    }
+
+    function buildPatch(card) {
+      if (card.baseline === undefined) {
+        throw new Error('Configuration has not loaded');
+      }
+      const configuration = parseConfiguration(card);
+      const removed = Object.keys(card.baseline)
+        .filter(key => !Object.hasOwn(configuration, key));
+      if (removed.length) {
+        throw new Error(`Configuration fields cannot be removed: ${removed.join(', ')}`);
+      }
+      return Object.fromEntries(
+        Object.entries(configuration)
+          .filter(([key, value]) =>
+            !Object.hasOwn(card.baseline, key) || !deepEqual(value, card.baseline[key])),
+      );
+    }
+
+    function updateConfigChanges(card) {
+      const apply = card.querySelector('.apply');
+      const changes = card.querySelector('.changes');
+      const shell = card.querySelector('.editor-shell');
+      try {
+        const fields = Object.keys(buildPatch(card));
+        apply.disabled = fields.length === 0;
+        changes.textContent = fields.length
+          ? `Changed fields: ${fields.join(', ')}`
+          : 'No local changes';
+        changes.classList.remove('error');
+        shell.classList.remove('invalid');
+      } catch (error) {
+        apply.disabled = true;
+        changes.textContent = String(error);
+        changes.classList.add('error');
+        shell.classList.add('invalid');
+      }
+    }
+
+    function setConfigBusy(card, busy) {
+      card.querySelectorAll('button').forEach(button => { button.disabled = busy; });
+      if (!busy) updateConfigChanges(card);
+    }
 
     async function responseBody(response) {
       const text = await response.text();
@@ -195,73 +358,170 @@
       }
     }
 
-    async function loadConfiguration(card) {
+    async function loadConfiguration(card, clearResult = true) {
       const service = card.dataset.service;
       const status = card.querySelector('.status');
-      const current = card.querySelector('.current');
+      const result = card.querySelector('.result');
+      const editor = card.querySelector('.config-editor');
       status.textContent = 'Loading…';
+      setConfigBusy(card, true);
+      if (clearResult) {
+        result.textContent = '';
+        result.classList.remove('error');
+      }
       try {
-        const response = await fetch(endpoint(service), {
+        const response = await fetch(configEndpoint(service), {
           headers: {Accept: 'application/json'},
         });
         const body = await responseBody(response);
-        if (!response.ok) {
-          throw new Error(`${response.status} ${JSON.stringify(body)}`);
-        }
-        current.textContent = JSON.stringify(body, null, 2);
+        if (!response.ok) throw new Error(`${response.status} ${JSON.stringify(body)}`);
+        if (!isObject(body)) throw new Error('Service returned a non-object configuration');
+        card.baseline = body;
+        editor.value = JSON.stringify(body, null, 2);
+        updateHighlight(editor);
         status.textContent = 'Loaded';
       } catch (error) {
-        current.textContent = String(error);
         status.textContent = 'Unavailable';
+        result.textContent = String(error);
+        result.classList.add('error');
+      } finally {
+        setConfigBusy(card, false);
       }
     }
 
-    async function applyPatch(card) {
+    async function applyConfiguration(card) {
       const service = card.dataset.service;
-      const editor = card.querySelector('.patch');
       const result = card.querySelector('.result');
-      const buttons = card.querySelectorAll('button');
       result.classList.remove('error');
-
       let patch;
       try {
-        patch = JSON.parse(editor.value);
-        if (patch === null || Array.isArray(patch) || typeof patch !== 'object') {
-          throw new Error('PATCH body must be a JSON object');
-        }
+        patch = buildPatch(card);
+        if (!Object.keys(patch).length) return;
       } catch (error) {
-        result.textContent = String(error);
-        result.classList.add('error');
+        updateConfigChanges(card);
         return;
       }
 
-      buttons.forEach(button => { button.disabled = true; });
+      setConfigBusy(card, true);
       try {
-        const response = await fetch(endpoint(service), {
+        const response = await fetch(configEndpoint(service), {
           method: 'PATCH',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify(patch),
         });
         const body = await responseBody(response);
-        result.textContent = `${response.status} ${JSON.stringify(body, null, 2)}`;
+        result.textContent =
+          `PATCH fields: ${Object.keys(patch).join(', ')}\n${response.status} ` +
+          JSON.stringify(body, null, 2);
         result.classList.toggle('error', !response.ok);
-        if (response.ok) {
-          editor.value = '{}';
-          await loadConfiguration(card);
-        }
+        if (response.ok) await loadConfiguration(card, false);
       } catch (error) {
         result.textContent = String(error);
         result.classList.add('error');
       } finally {
-        buttons.forEach(button => { button.disabled = false; });
+        setConfigBusy(card, false);
       }
     }
 
-    document.querySelectorAll('.service').forEach(card => {
-      card.querySelector('.apply').addEventListener('click', () => applyPatch(card));
-      card.querySelector('.reload').addEventListener('click', () => loadConfiguration(card));
+    function createConfigurationCard(service) {
+      const template = document.querySelector('#config-template');
+      const card = template.content.firstElementChild.cloneNode(true);
+      card.dataset.service = service;
+      card.querySelector('h2').textContent = service.toUpperCase();
+      const editor = card.querySelector('.config-editor');
+      editor.id = `${service}-config-editor`;
+      card.querySelector('label').htmlFor = editor.id;
+      editor.setAttribute('aria-label', `${service} configuration JSON`);
+      editor.addEventListener('input', () => {
+        updateHighlight(editor);
+        updateConfigChanges(card);
+      });
+      editor.addEventListener('scroll', () => syncHighlightScroll(editor));
+      card.querySelector('.apply')
+        .addEventListener('click', () => applyConfiguration(card));
+      card.querySelector('.reload')
+        .addEventListener('click', () => loadConfiguration(card));
+      return card;
+    }
+
+    const services = document.querySelector('#services');
+    const promptCard = document.querySelector('#prompt-card');
+    const configCards = configServices.map(createConfigurationCard);
+    configCards.forEach(card => {
+      services.insertBefore(card, promptCard);
       loadConfiguration(card);
     });
+
+    let promptBaseline;
+    const promptEditor = promptCard.querySelector('.prompt-editor');
+
+    function updatePromptChanges() {
+      const changed = promptBaseline !== undefined && promptEditor.value !== promptBaseline;
+      promptCard.querySelector('.save').disabled = !changed;
+      promptCard.querySelector('.changes').textContent =
+        changed ? 'Prompt has local changes' : 'No local changes';
+    }
+
+    function setPromptBusy(busy) {
+      promptCard.querySelectorAll('button').forEach(button => { button.disabled = busy; });
+      if (!busy) updatePromptChanges();
+    }
+
+    async function loadPrompt(clearResult = true) {
+      const status = promptCard.querySelector('.status');
+      const result = promptCard.querySelector('.result');
+      status.textContent = 'Loading…';
+      setPromptBusy(true);
+      if (clearResult) {
+        result.textContent = '';
+        result.classList.remove('error');
+      }
+      try {
+        const response = await fetch('/system-prompt', {
+          headers: {Accept: 'text/plain'},
+        });
+        const text = await response.text();
+        if (!response.ok) throw new Error(`${response.status} ${text}`);
+        promptBaseline = text;
+        promptEditor.value = text;
+        status.textContent = 'Loaded';
+      } catch (error) {
+        status.textContent = 'Unavailable';
+        result.textContent = String(error);
+        result.classList.add('error');
+      } finally {
+        setPromptBusy(false);
+      }
+    }
+
+    async function savePrompt() {
+      const result = promptCard.querySelector('.result');
+      setPromptBusy(true);
+      try {
+        const response = await fetch('/system-prompt', {
+          method: 'PUT',
+          headers: {'Content-Type': 'text/plain; charset=utf-8'},
+          body: promptEditor.value,
+        });
+        const text = await response.text();
+        if (!response.ok) throw new Error(`${response.status} ${text}`);
+        promptBaseline = text;
+        promptEditor.value = text;
+        result.textContent = `${response.status} Prompt saved`;
+        result.classList.remove('error');
+        promptCard.querySelector('.status').textContent = 'Loaded';
+      } catch (error) {
+        result.textContent = String(error);
+        result.classList.add('error');
+      } finally {
+        setPromptBusy(false);
+      }
+    }
+
+    promptEditor.addEventListener('input', updatePromptChanges);
+    promptCard.querySelector('.save').addEventListener('click', savePrompt);
+    promptCard.querySelector('.reload').addEventListener('click', () => loadPrompt());
+    loadPrompt();
   </script>
 </body>
 </html>
