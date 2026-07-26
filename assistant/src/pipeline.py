@@ -4,11 +4,16 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import sys
+import tempfile
 import time
+import wave
 from array import array
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from assistant.src import metrics
@@ -114,6 +119,77 @@ def _audio_frame_width(audio_format: AudioFormat) -> int:
         message = 'TTS returned an invalid audio format'
         raise RuntimeError(message)
     return audio_format.sample_width * audio_format.channels
+
+
+class _AtomicWavWriter:
+    """Write emitted PCM incrementally and publish it only after stream completion."""
+
+    def __init__(self, destination: Path, audio_format: AudioFormat) -> None:
+        self.destination = destination
+        self.pcm_bytes = 0
+        self._temporary_path: Path | None = None
+        self._temporary: Any | None = None
+        self._wav_file: wave.Wave_write | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = tempfile.NamedTemporaryFile(  # noqa: SIM115
+                dir=destination.parent,
+                prefix=f'.{destination.name}.',
+                suffix='.tmp',
+                delete=False,
+            )
+            self._temporary = temporary
+            self._temporary_path = Path(temporary.name)
+            self._wav_file = wave.open(temporary, 'wb')  # noqa: SIM115
+            self._wav_file.setnchannels(audio_format.channels)
+            self._wav_file.setsampwidth(audio_format.sample_width)
+            self._wav_file.setframerate(audio_format.sample_rate)
+        except (OSError, wave.Error):
+            self.abort()
+            raise
+
+    def write(self, pcm: bytes) -> None:
+        if self._wav_file is None:
+            message = 'WAV capture is not open'
+            raise RuntimeError(message)
+        self._wav_file.writeframesraw(pcm)
+        self.pcm_bytes += len(pcm)
+
+    def commit(self) -> None:
+        temporary = self._temporary
+        temporary_path = self._temporary_path
+        wav_file = self._wav_file
+        if temporary is None or temporary_path is None or wav_file is None:
+            message = 'WAV capture is not open'
+            raise RuntimeError(message)
+
+        wav_file.close()
+        self._wav_file = None
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        temporary.close()
+        self._temporary = None
+        _ = temporary_path.replace(self.destination)
+        self._temporary_path = None
+
+    def abort(self) -> None:
+        wav_file = self._wav_file
+        self._wav_file = None
+        if wav_file is not None:
+            with suppress(OSError, wave.Error):
+                wav_file.close()
+
+        temporary = self._temporary
+        self._temporary = None
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.close()
+
+        temporary_path = self._temporary_path
+        self._temporary_path = None
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink(missing_ok=True)
 
 
 def _duration_frames(duration_seconds: float, sample_rate: int) -> int:
@@ -611,85 +687,160 @@ class AssistantUtterance:
         first_audio = True
         first_request = True
         previous_segment_had_audio = False
-        text = await queue.get()
-        while text is not None:
-            if first_request:
-                metrics.PIPELINE_SECONDS.labels(stage='tts_first_request').observe(
-                    time.perf_counter() - final_at,
+        capture: _AtomicWavWriter | None = None
+        completed = False
+        try:
+            text = await queue.get()
+            while text is not None:
+                if first_request:
+                    metrics.PIPELINE_SECONDS.labels(stage='tts_first_request').observe(
+                        time.perf_counter() - final_at,
+                    )
+                    first_request = False
+                LOGGER.info(
+                    'TTS segment requested',
+                    extra={
+                        'event_id': 'ID_assistant_tts_segment_requested',
+                        'characters': len(text),
+                    },
                 )
-                first_request = False
-            LOGGER.info(
-                'TTS segment requested',
-                extra={'event_id': 'ID_assistant_tts_segment_requested', 'characters': len(text)},
-            )
-            LOGGER.debug(
-                'TTS segment',
-                extra={'event_id': 'ID_assistant_tts_segment', 'text': text},
-            )
-            segment: _SentencePcmBuffer | None = None
-            async for chunk, audio_format in self.tts.stream(text):
-                if expected_format is None:
-                    expected_format = audio_format
-                elif audio_format != expected_format:
-                    message = 'TTS audio format changed during the response'
-                    raise RuntimeError(message)
-                if not chunk:
-                    continue
-                if first_audio:
-                    first_audio = False
-                    first_audio_at = time.perf_counter()
-                    metrics.TTS_TIME_TO_FIRST_AUDIO.observe(first_audio_at - final_at)
-                    metrics.PIPELINE_SECONDS.labels(stage='tts_first_audio').observe(
-                        first_audio_at - final_at,
-                    )
-                    await send(
-                        {
-                            'type': 'response.audio.started',
-                            'format': 'pcm16',
-                            'sample_rate': audio_format.sample_rate,
-                            'sample_width': audio_format.sample_width,
-                            'channels': audio_format.channels,
-                        },
-                    )
-                if segment is None:
-                    segment = _SentencePcmBuffer(
-                        audio_format,
-                        self.settings.tts_sentence_crossfade_seconds,
-                        fade_in=previous_segment_had_audio,
-                    )
-                    if previous_segment_had_audio:
-                        pause_frames = _duration_frames(
-                            self.settings.tts_sentence_pause_seconds,
-                            audio_format.sample_rate,
-                        )
-                        await self._send_audio_delta(
-                            b'\0' * (pause_frames * segment.frame_width),
-                            send,
-                        )
-                await self._send_audio_delta(segment.append(chunk), send)
-
-            next_text = await queue.get()
-            if segment is not None:
-                await self._send_audio_delta(
-                    segment.finish(fade_out=next_text is not None),
-                    send,
+                LOGGER.debug(
+                    'TTS segment',
+                    extra={'event_id': 'ID_assistant_tts_segment', 'text': text},
                 )
-                previous_segment_had_audio = True
-            text = next_text
-        metrics.PIPELINE_SECONDS.labels(stage='tts_complete').observe(
-            time.perf_counter() - final_at,
-        )
-        await send({'type': 'response.audio.done'})
+                segment: _SentencePcmBuffer | None = None
+                async for chunk, audio_format in self.tts.stream(text):
+                    if expected_format is None:
+                        expected_format = audio_format
+                    elif audio_format != expected_format:
+                        message = 'TTS audio format changed during the response'
+                        raise RuntimeError(message)
+                    if not chunk:
+                        continue
+                    if first_audio:
+                        first_audio = False
+                        first_audio_at = time.perf_counter()
+                        metrics.TTS_TIME_TO_FIRST_AUDIO.observe(first_audio_at - final_at)
+                        metrics.PIPELINE_SECONDS.labels(stage='tts_first_audio').observe(
+                            first_audio_at - final_at,
+                        )
+                        await send(
+                            {
+                                'type': 'response.audio.started',
+                                'format': 'pcm16',
+                                'sample_rate': audio_format.sample_rate,
+                                'sample_width': audio_format.sample_width,
+                                'channels': audio_format.channels,
+                            },
+                        )
+                        if self.settings.save_latest_wav:
+                            capture = self._open_latest_wav_capture(audio_format)
+                    if segment is None:
+                        segment = _SentencePcmBuffer(
+                            audio_format,
+                            self.settings.tts_sentence_crossfade_seconds,
+                            fade_in=previous_segment_had_audio,
+                        )
+                        if previous_segment_had_audio:
+                            pause_frames = _duration_frames(
+                                self.settings.tts_sentence_pause_seconds,
+                                audio_format.sample_rate,
+                            )
+                            capture = await self._send_audio_delta(
+                                b'\0' * (pause_frames * segment.frame_width),
+                                send,
+                                capture,
+                            )
+                    capture = await self._send_audio_delta(
+                        segment.append(chunk),
+                        send,
+                        capture,
+                    )
 
-    @staticmethod
-    async def _send_audio_delta(pcm: bytes, send: EventSender) -> None:
+                next_text = await queue.get()
+                if segment is not None:
+                    capture = await self._send_audio_delta(
+                        segment.finish(fade_out=next_text is not None),
+                        send,
+                        capture,
+                    )
+                    previous_segment_had_audio = True
+                text = next_text
+            metrics.PIPELINE_SECONDS.labels(stage='tts_complete').observe(
+                time.perf_counter() - final_at,
+            )
+            await send({'type': 'response.audio.done'})
+            completed = True
+        finally:
+            self._finish_latest_wav_capture(capture, completed=completed)
+
+    async def _send_audio_delta(
+        self,
+        pcm: bytes,
+        send: EventSender,
+        capture: _AtomicWavWriter | None,
+    ) -> _AtomicWavWriter | None:
         if not pcm:
-            return
-        metrics.AUDIO_OUTPUT_BYTES.inc(len(pcm))
+            return capture
         await send(
             {
                 'type': 'response.audio.delta',
                 'audio': base64.b64encode(pcm).decode('ascii'),
+            },
+        )
+        metrics.AUDIO_OUTPUT_BYTES.inc(len(pcm))
+        if capture is None:
+            return None
+        try:
+            capture.write(pcm)
+        except (OSError, wave.Error):
+            capture.abort()
+            self._log_latest_wav_failure()
+            return None
+        return capture
+
+    def _open_latest_wav_capture(
+        self,
+        audio_format: AudioFormat,
+    ) -> _AtomicWavWriter | None:
+        try:
+            return _AtomicWavWriter(self.settings.latest_wav_path, audio_format)
+        except (OSError, wave.Error):
+            self._log_latest_wav_failure()
+            return None
+
+    def _finish_latest_wav_capture(
+        self,
+        capture: _AtomicWavWriter | None,
+        *,
+        completed: bool,
+    ) -> None:
+        if capture is None:
+            return
+        if not completed:
+            capture.abort()
+            return
+        try:
+            capture.commit()
+        except (OSError, wave.Error):
+            capture.abort()
+            self._log_latest_wav_failure()
+            return
+        LOGGER.info(
+            'Saved latest WebSocket audio recording',
+            extra={
+                'event_id': 'ID_assistant_latest_recording_saved',
+                'pcm_bytes': capture.pcm_bytes,
+                'path': str(self.settings.latest_wav_path),
+            },
+        )
+
+    def _log_latest_wav_failure(self) -> None:
+        LOGGER.exception(
+            'Failed to save latest WebSocket audio recording',
+            extra={
+                'event_id': 'ID_assistant_latest_recording_save_failed',
+                'path': str(self.settings.latest_wav_path),
             },
         )
 

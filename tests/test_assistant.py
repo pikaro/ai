@@ -8,6 +8,7 @@ import os
 import struct
 import tempfile
 import unittest
+import wave
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -50,6 +51,8 @@ class SettingsTest(unittest.TestCase):
             'ASSISTANT_LLM_SLOTS': '[1,2]',
             'ASSISTANT_MCP__CALENDAR__HOST': 'calendar-mcp',
             'ASSISTANT_MCP__CALENDAR__TRIGGERS': '["calendar","meeting"]',
+            'ASSISTANT_LATEST_WAV_PATH': '/recordings/latest.wav',
+            'ASSISTANT_SAVE_LATEST_WAV': 'true',
             'ASSISTANT_TTS_SENTENCE_PAUSE_SECONDS': '0.2',
             'ASSISTANT_TTS_SENTENCE_CROSSFADE_SECONDS': '0.02',
             'LOG_LEVEL': 'DEBUG',
@@ -60,6 +63,8 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.llm_slots, (1, 2))
         self.assertEqual(settings.listen_port, 9003)
         self.assertEqual(settings.log_level, 'DEBUG')
+        self.assertEqual(settings.latest_wav_path, Path('/recordings/latest.wav'))
+        self.assertTrue(settings.save_latest_wav)
         self.assertEqual(settings.tts_sentence_pause_seconds, 0.2)
         self.assertEqual(settings.tts_sentence_crossfade_seconds, 0.02)
         self.assertEqual(settings.mcp['calendar'].endpoint, 'http://calendar-mcp:8080/mcp')
@@ -648,6 +653,60 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
                 1_000,
             ),
         )
+
+    async def test_saved_wav_pcm_matches_emitted_websocket_deltas_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'latest.wav'
+            self.utterance.settings = self.settings.model_copy(
+                update={'save_latest_wav': True, 'latest_wav_path': destination},
+            )
+            self.llm.response = 'First sentence. Second!'
+            events: list[dict[str, object]] = []
+
+            async def send(event: dict[str, object]) -> None:
+                events.append(event)
+
+            await self.utterance.generate('hello', [], send)
+
+            emitted_pcm = b''.join(
+                base64.b64decode(str(event['audio']))
+                for event in events
+                if event['type'] == 'response.audio.delta'
+            )
+            with wave.open(str(destination), 'rb') as wav_file:
+                self.assertEqual(wav_file.getframerate(), 24_000)
+                self.assertEqual(wav_file.getnchannels(), 1)
+                self.assertEqual(wav_file.getsampwidth(), 2)
+                saved_pcm = wav_file.readframes(wav_file.getnframes())
+
+            self.assertEqual(saved_pcm, emitted_pcm)
+
+    async def test_interrupted_websocket_audio_does_not_replace_previous_recording(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'latest.wav'
+            previous_recording = b'previous recording'
+            _ = destination.write_bytes(previous_recording)
+            self.utterance.settings = self.settings.model_copy(
+                update={'save_latest_wav': True, 'latest_wav_path': destination},
+            )
+            self.llm.response = 'First sentence. Second!'
+            audio_delta_count = 0
+
+            async def send(event: dict[str, object]) -> None:
+                nonlocal audio_delta_count
+                if event['type'] != 'response.audio.delta':
+                    return
+                audio_delta_count += 1
+                if audio_delta_count == 2:  # noqa: PLR2004
+                    message = 'WebSocket send failed'
+                    raise RuntimeError(message)
+
+            with self.assertRaisesRegex(RuntimeError, 'WebSocket send failed'):
+                await self.utterance.generate('hello', [], send)
+
+            self.assertEqual(destination.read_bytes(), previous_recording)
 
 
 class MetricsTest(unittest.TestCase):

@@ -107,12 +107,23 @@ slots cannot introduce concurrent LLM inference. Other clients must not
 concurrently address the assistant's llama.cpp slot.
 
 LLM output is streamed immediately. Complete sentences are sent to TTS while
-the LLM continues decoding, and PCM is streamed to the caller without storing a
-WAV file. Every completed sentence is synthesized separately. The assistant
-stitches the resulting PCM streams with a short silence and linear fades at
-sentence boundaries; configure these with `tts_sentence_pause_seconds` and
-`tts_sentence_crossfade_seconds`, or the corresponding `ASSISTANT_` environment
-variables. Set either duration to zero to disable that part of the transition.
+the LLM continues decoding, and PCM is streamed to the caller without first
+storing a WAV file. Every completed sentence is synthesized separately. The
+assistant stitches the resulting PCM streams with a short silence and linear
+fades at sentence boundaries; configure these with
+`tts_sentence_pause_seconds` and `tts_sentence_crossfade_seconds`, or the
+corresponding `ASSISTANT_` environment variables. Set either duration to zero
+to disable that part of the transition.
+
+Set `ASSISTANT_SAVE_LATEST_WAV=true` to atomically overwrite the most recently
+completed WebSocket response recording. `ASSISTANT_LATEST_WAV_PATH` defaults to
+`/tmp/latest.wav`; point it at mounted storage when the recording must survive a
+pod replacement. The saved WAV frame data is the exact concatenation, in send
+order, of the PCM bytes in the response's successfully emitted
+`response.audio.delta` events. It therefore includes the assistant's sentence
+fades and inserted silence. An interrupted response does not replace the
+previous recording, and capture failures are logged without failing the
+WebSocket response.
 
 The assistant retires idle pooled upstream HTTP connections after four seconds,
 before the five-second idle timeout used by Uvicorn and llama.cpp. This avoids
@@ -226,9 +237,10 @@ completed synthesized recording. `TTS_LATEST_WAV_PATH` defaults to
 `/tmp/latest.wav`; point it at mounted storage when the recording must be read
 after a pod replacement. A WAV response is saved verbatim. For a PCM response,
 the saved WAV frame data is the exact concatenation of the PCM chunks emitted to
-the client; synthesis is not repeated. An interrupted stream does not replace
-the previous recording, and capture failures are logged without failing the
-speech request.
+the TTS client; synthesis is not repeated. This recording is upstream of the
+assistant's sentence stitching; use the assistant capture for the exact final
+WebSocket PCM. An interrupted stream does not replace the previous recording,
+and capture failures are logged without failing the speech request.
 
 Upload a Pocket TTS voice-state file as multipart form data. The endpoint does
 not require authentication:
