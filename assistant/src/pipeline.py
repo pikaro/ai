@@ -34,6 +34,112 @@ BASE_SYSTEM_PROMPT = (
 EventSender = Callable[[dict[str, object]], Awaitable[None]]
 
 
+class SystemPromptFile:
+    """Keep the system prompt in a user-editable file and reload stable revisions."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._signature: tuple[int, int, int, int, int] | None = None
+        self._prompt: str | None = None
+        self._write_default_if_missing()
+        _ = self.read()
+
+    def read(self) -> str:
+        try:
+            revision = self._read_revision()
+        except (OSError, UnicodeError):
+            if self._prompt is None:
+                raise
+            LOGGER.exception(
+                'System prompt reload failed',
+                extra={
+                    'event_id': 'ID_assistant_system_prompt_reload_failed',
+                    'path': str(self.path),
+                },
+            )
+            return self._prompt
+
+        if revision is None:
+            return self._defer_reload()
+
+        prompt, signature = revision
+        if signature != self._signature or self._prompt is None:
+            self._prompt = prompt
+            self._signature = signature
+            LOGGER.info(
+                'System prompt loaded',
+                extra={
+                    'event_id': 'ID_assistant_system_prompt_loaded',
+                    'path': str(self.path),
+                    'characters': len(prompt),
+                },
+            )
+        return self._prompt
+
+    def _read_revision(
+        self,
+    ) -> tuple[str, tuple[int, int, int, int, int]] | None:
+        signature = self._current_signature()
+        if signature == self._signature and self._prompt is not None:
+            return self._prompt, signature
+        return self._read_stable_revision()
+
+    def _current_signature(self) -> tuple[int, int, int, int, int]:
+        try:
+            status = self.path.stat()
+        except FileNotFoundError:
+            self._write_default_if_missing()
+            status = self.path.stat()
+        return self._file_signature(status)
+
+    def _defer_reload(self) -> str:
+        if self._prompt is None:
+            message = f'system prompt changed while being read: {self.path}'
+            raise RuntimeError(message)
+        LOGGER.warning(
+            'System prompt changed while being read; retaining previous revision',
+            extra={
+                'event_id': 'ID_assistant_system_prompt_reload_deferred',
+                'path': str(self.path),
+            },
+        )
+        return self._prompt
+
+    def _read_stable_revision(
+        self,
+    ) -> tuple[str, tuple[int, int, int, int, int]] | None:
+        for _attempt in range(2):
+            try:
+                before = self.path.stat()
+                prompt = self.path.read_text(encoding='utf-8').strip()
+                after = self.path.stat()
+            except FileNotFoundError:
+                self._write_default_if_missing()
+                continue
+            before_signature = self._file_signature(before)
+            signature = self._file_signature(after)
+            if before_signature == signature:
+                return prompt, signature
+        return None
+
+    def _write_default_if_missing(self) -> None:
+        try:
+            with self.path.open('x', encoding='utf-8') as prompt_file:
+                _ = prompt_file.write(f'{BASE_SYSTEM_PROMPT}\n')
+        except FileExistsError:
+            return
+
+    @staticmethod
+    def _file_signature(status: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            status.st_dev,
+            status.st_ino,
+            status.st_size,
+            status.st_mtime_ns,
+            status.st_ctime_ns,
+        )
+
+
 def _log_generated_response(response_text: str) -> None:
     LOGGER.info(
         'Assistant response generated',
@@ -69,14 +175,15 @@ def build_prompt(
     tools: list[ToolDefinition],
     history: list[tuple[str, str]] | None = None,
     *,
+    system_prompt: str = BASE_SYSTEM_PROMPT,
     force_answer: bool = False,
 ) -> str:
-    system_prompt = BASE_SYSTEM_PROMPT
+    complete_system_prompt = system_prompt
     if tools:
         tool_data = [
             tool.prompt_description() for tool in sorted(tools, key=lambda item: item.name)
         ]
-        system_prompt += (
+        complete_system_prompt += (
             '\nTools are available below. If a tool is needed, respond with only a JSON object '
             'of the form {"tool":"name","arguments":{}}. If no tool is needed or a tool result '
             'already answers the question, respond with {"answer":"short spoken answer"}. '
@@ -84,10 +191,12 @@ def build_prompt(
             f'{json.dumps(tool_data, ensure_ascii=False, separators=(",", ":"))}'
         )
     if force_answer:
-        system_prompt += '\nTool use is complete. Return only {"answer":"short spoken answer"}.'
+        complete_system_prompt += (
+            '\nTool use is complete. Return only {"answer":"short spoken answer"}.'
+        )
 
     parts = [
-        f'<|im_start|>system\n{system_prompt}\n<|im_end|>\n',
+        f'<|im_start|>system\n{complete_system_prompt}\n<|im_end|>\n',
         f'<|im_start|>user\n{transcript.strip()}\n/no_think\n<|im_end|>\n',
     ]
     for role, content in history or []:
@@ -307,19 +416,21 @@ def parse_tool_response(text: str) -> dict[str, Any] | None:
 
 
 class AssistantUtterance:
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         settings: Settings,
         slots: SlotPool,
         llm: LlmProtocol,
         tts: TtsProtocol,
         tools: ToolRegistry,
+        system_prompt: SystemPromptFile,
     ) -> None:
         self.settings = settings
         self.slots = slots
         self.llm = llm
         self.tts = tts
         self.tools = tools
+        self.system_prompt = system_prompt
         self.started_at = time.perf_counter()
         self.first_audio_at: float | None = None
         self.first_delta_at: float | None = None
@@ -373,8 +484,8 @@ class AssistantUtterance:
         if self._warm_worker is None:
             self._warm_worker = asyncio.create_task(self._run_cache_warms())
 
-    async def finalize_cache_warming(self, transcript: str) -> list[ToolDefinition]:
-        """Discard pending revisions, drain one active warm, and select final tools."""
+    async def finalize_cache_warming(self, _transcript: str) -> list[ToolDefinition]:
+        """Discard pending revisions, drain one active warm, and load available tools."""
         started = time.perf_counter()
         waited_for_active_warm = self._warm_worker_state == 'active'
         await self._stop_cache_warming()
@@ -388,9 +499,9 @@ class AssistantUtterance:
                 'waited_for_active_warm': waited_for_active_warm,
             },
         )
-        selected_tools = await self.tools.select(transcript)
-        self._note_toolset(selected_tools)
-        return selected_tools
+        available_tools = await self.tools.available()
+        self._note_tool_catalog(available_tools)
+        return available_tools
 
     async def _run_cache_warms(self) -> None:  # noqa: C901
         try:
@@ -418,7 +529,7 @@ class AssistantUtterance:
                 self._warm_worker_state = 'active'
                 self._last_warm_started_at = time.perf_counter()
                 try:
-                    await self._select_and_warm(transcript)
+                    await self._catalog_and_warm(transcript)
                 except Exception:
                     LOGGER.exception(
                         'Incremental LLM cache warm failed',
@@ -430,14 +541,18 @@ class AssistantUtterance:
             self._warm_worker_state = 'idle'
             self._warm_worker = None
 
-    async def _select_and_warm(self, transcript: str) -> None:
-        selected_tools = await self.tools.select(transcript)
-        self._note_toolset(selected_tools)
-        prompt = build_prompt(transcript, selected_tools)
+    async def _catalog_and_warm(self, transcript: str) -> None:
+        available_tools = await self.tools.available()
+        self._note_tool_catalog(available_tools)
+        prompt = build_prompt(
+            transcript,
+            available_tools,
+            system_prompt=self.system_prompt.read(),
+        )
         await self._warm(prompt, reason='delta')
 
-    def _note_toolset(self, selected_tools: list[ToolDefinition]) -> None:
-        tool_names = tuple(sorted(tool.name for tool in selected_tools))
+    def _note_tool_catalog(self, available_tools: list[ToolDefinition]) -> None:
+        tool_names = tuple(sorted(tool.name for tool in available_tools))
         if self.last_warmed_prompt is not None and tool_names != self.last_tool_names:
             metrics.CACHE_TOOLSET_CHANGES.inc()
         self.last_tool_names = tool_names
@@ -475,12 +590,16 @@ class AssistantUtterance:
     async def generate(
         self,
         transcript: str,
-        selected_tools: list[ToolDefinition],
+        available_tools: list[ToolDefinition],
         send: EventSender,
     ) -> None:
         final_at = self.final_transcript_at or time.perf_counter()
         metrics.TRANSCRIPT_CHARACTERS.observe(len(transcript))
-        prompt = build_prompt(transcript, selected_tools)
+        prompt = build_prompt(
+            transcript,
+            available_tools,
+            system_prompt=self.system_prompt.read(),
+        )
         await send(
             {
                 'type': 'response.created',
@@ -491,8 +610,8 @@ class AssistantUtterance:
             time.perf_counter() - final_at,
         )
 
-        if selected_tools:
-            response_text = await self._resolve_tools(transcript, selected_tools)
+        if available_tools:
+            response_text = await self._resolve_tools(transcript, available_tools)
             metrics.LLM_TIME_TO_FIRST_TOKEN.observe(time.perf_counter() - final_at)
             await self._speak_text(response_text, final_at, send)
         else:
@@ -509,10 +628,10 @@ class AssistantUtterance:
     async def _resolve_tools(  # noqa: C901
         self,
         transcript: str,
-        selected_tools: list[ToolDefinition],
+        available_tools: list[ToolDefinition],
     ) -> str:
         slot = await self._ensure_slot()
-        tools_by_name = {tool.name: tool for tool in selected_tools}
+        tools_by_name = {tool.name: tool for tool in available_tools}
         history: list[tuple[str, str]] = []
         LOGGER.info(
             'Tool resolution started',
@@ -523,7 +642,12 @@ class AssistantUtterance:
             },
         )
         for iteration in range(1, self.settings.maximum_tool_iterations + 1):
-            prompt = build_prompt(transcript, selected_tools, history)
+            prompt = build_prompt(
+                transcript,
+                available_tools,
+                history,
+                system_prompt=self.system_prompt.read(),
+            )
             raw_response = await self.llm.complete(
                 prompt,
                 slot,
@@ -575,8 +699,9 @@ class AssistantUtterance:
 
         final_prompt = build_prompt(
             transcript,
-            selected_tools,
+            available_tools,
             history,
+            system_prompt=self.system_prompt.read(),
             force_answer=True,
         )
         raw_response = await self.llm.complete(

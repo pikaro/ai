@@ -12,7 +12,7 @@ import wave
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi import WebSocket, WebSocketException, status
@@ -20,7 +20,7 @@ from pydantic import ValidationError
 from starlette.datastructures import Headers
 from starlette.websockets import WebSocketState
 
-from assistant.src.config import Settings
+from assistant.src.config import MCPConfig, Settings
 from assistant.src.main import (
     AssistantRuntime,
     RealtimeEvent,
@@ -30,7 +30,9 @@ from assistant.src.main import (
     realtime,
 )
 from assistant.src.pipeline import (
+    BASE_SYSTEM_PROMPT,
     AssistantUtterance,
+    SystemPromptFile,
     build_prompt,
     completed_sentences,
     parse_tool_response,
@@ -45,6 +47,12 @@ if TYPE_CHECKING:
 
 
 class SettingsTest(unittest.TestCase):
+    def test_system_prompt_defaults_to_requested_tmp_path(self) -> None:
+        self.assertEqual(
+            Settings().system_prompt_path,
+            Path('/tmp/system-prompt'),  # noqa: S108
+        )
+
     def test_environment_supports_nested_mcp_servers(self) -> None:
         environment = {
             'LISTEN_PORT': '9003',
@@ -118,42 +126,49 @@ class RealtimeEventTest(unittest.TestCase):
 
 class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
     async def test_patch_rebuilds_runtime_with_ephemeral_validated_settings(self) -> None:
-        original = AssistantRuntime(Settings())
-        assistant_app.state.runtime = original
-        transport = httpx.ASGITransport(app=assistant_app)
-        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
-            response = await client.patch(
-                '/config',
-                json={
-                    'llm_cache_warm_min_interval_seconds': 0.75,
-                    'llm_cache_warm_min_new_characters': 5,
-                },
-            )
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(system_prompt_path=Path(directory) / 'system-prompt')
+            original = AssistantRuntime(settings)
+            assistant_app.state.runtime = original
+            transport = httpx.ASGITransport(app=assistant_app)
+            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+                response = await client.patch(
+                    '/config',
+                    json={
+                        'llm_cache_warm_min_interval_seconds': 0.75,
+                        'llm_cache_warm_min_new_characters': 5,
+                    },
+                )
 
-        replacement = cast('AssistantRuntime', assistant_app.state.runtime)
-        try:
-            self.assertEqual(response.status_code, 200)
-            self.assertTrue(response.json()['ephemeral'])
-            self.assertEqual(
-                replacement.settings.llm_cache_warm_min_interval_seconds,
-                0.75,
-            )
-            self.assertEqual(replacement.settings.llm_cache_warm_min_new_characters, 5)
-        finally:
-            await replacement.close()
+            replacement = cast('AssistantRuntime', assistant_app.state.runtime)
+            try:
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.json()['ephemeral'])
+                self.assertEqual(
+                    replacement.settings.llm_cache_warm_min_interval_seconds,
+                    0.75,
+                )
+                self.assertEqual(replacement.settings.llm_cache_warm_min_new_characters, 5)
+            finally:
+                await replacement.close()
 
     async def test_restart_only_setting_is_rejected_without_replacing_runtime(self) -> None:
-        runtime = AssistantRuntime(Settings())
-        assistant_app.state.runtime = runtime
-        transport = httpx.ASGITransport(app=assistant_app)
-        try:
-            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
-                response = await client.patch('/config', json={'listen_port': 9000})
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(system_prompt_path=Path(directory) / 'system-prompt')
+            runtime = AssistantRuntime(settings)
+            assistant_app.state.runtime = runtime
+            transport = httpx.ASGITransport(app=assistant_app)
+            try:
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url='http://test',
+                ) as client:
+                    response = await client.patch('/config', json={'listen_port': 9000})
 
-            self.assertEqual(response.status_code, 409)
-            self.assertIs(assistant_app.state.runtime, runtime)
-        finally:
-            await runtime.close()
+                self.assertEqual(response.status_code, 409)
+                self.assertIs(assistant_app.state.runtime, runtime)
+            finally:
+                await runtime.close()
 
 
 class RealtimeWebSocketTest(unittest.IsolatedAsyncioTestCase):
@@ -331,8 +346,12 @@ class AccessLogFilterTest(unittest.TestCase):
 
 class UpstreamHealthTest(unittest.IsolatedAsyncioTestCase):
     def test_client_expires_connections_before_upstream_idle_timeout(self) -> None:
-        with patch('assistant.src.main.httpx.AsyncClient') as client_type:
-            _ = AssistantRuntime(Settings())
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch('assistant.src.main.httpx.AsyncClient') as client_type,
+        ):
+            settings = Settings(system_prompt_path=Path(directory) / 'system-prompt')
+            _ = AssistantRuntime(settings)
 
         limits = client_type.call_args.kwargs['limits']
         self.assertEqual(limits.keepalive_expiry, 4.0)
@@ -437,6 +456,16 @@ class PromptTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertIn('"name":"time"', first)
 
+    def test_custom_system_prompt_precedes_the_stable_tool_catalog(self) -> None:
+        prompt = build_prompt(
+            'hello',
+            discover_local_tools(),
+            system_prompt='Custom system prompt.',
+        )
+
+        self.assertIn('<|im_start|>system\nCustom system prompt.\nTools are available', prompt)
+        self.assertLess(prompt.index('"name":"time"'), prompt.index('<|im_start|>user\nhello'))
+
     def test_sentence_split_retains_incomplete_tail(self) -> None:
         sentences, remainder = completed_sentences('First sentence. Incomplete tail')
 
@@ -455,7 +484,7 @@ class PromptTest(unittest.TestCase):
         self.assertEqual(response, {'tool': 'time', 'arguments': {'mode': 'rough'}})
 
 
-class ToolSelectionTest(unittest.IsolatedAsyncioTestCase):
+class ToolCatalogTest(unittest.IsolatedAsyncioTestCase):
     registry: ToolRegistry
 
     async def asyncSetUp(self) -> None:
@@ -466,12 +495,66 @@ class ToolSelectionTest(unittest.IsolatedAsyncioTestCase):
             maximum_result_characters=8_000,
         )
 
-    async def test_trigger_words_use_word_boundaries(self) -> None:
-        selected = await self.registry.select('Can you estimate this?')
-        self.assertEqual(selected, [])
+    async def test_every_local_tool_is_available_without_prompt_filtering(self) -> None:
+        available = await self.registry.available()
 
-        selected = await self.registry.select('What is the date?')
-        self.assertEqual([tool.name for tool in selected], ['time'])
+        self.assertEqual([tool.name for tool in available], ['time'])
+
+    async def test_enabled_mcp_catalog_is_discovered_without_prompt_triggers(self) -> None:
+        config = MCPConfig(host='clock-mcp', triggers=frozenset({'never-used'}))
+        remote_tool = ToolDefinition(
+            name='clock__time',
+            description='Return remote time.',
+            input_schema={'type': 'object'},
+            triggers=frozenset(),
+            executor=lambda _arguments, _context: '',
+            source='mcp:clock',
+        )
+        registry = ToolRegistry(
+            [],
+            {'clock': config},
+            default_timezone='local',
+            maximum_result_characters=8_000,
+        )
+        discover = AsyncMock(return_value=[remote_tool])
+
+        with patch.object(registry, '_discover_mcp_tools', new=discover):
+            first = await registry.available()
+            second = await registry.available()
+
+        self.assertEqual([tool.name for tool in first], ['clock__time'])
+        self.assertEqual(second, first)
+        discover.assert_awaited_once_with('clock', config)
+
+
+class SystemPromptFileTest(unittest.TestCase):
+    def test_default_is_written_and_atomic_replacement_is_reloaded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'system-prompt'
+            system_prompt = SystemPromptFile(path)
+
+            self.assertEqual(path.read_text(encoding='utf-8'), f'{BASE_SYSTEM_PROMPT}\n')
+            self.assertEqual(system_prompt.read(), BASE_SYSTEM_PROMPT)
+
+            replacement = path.with_suffix('.new')
+            _ = replacement.write_text('User supplied prompt.\n', encoding='utf-8')
+            _ = replacement.replace(path)
+
+            self.assertEqual(system_prompt.read(), 'User supplied prompt.')
+
+            _ = path.write_text('In-place edit.\n', encoding='utf-8')
+
+            self.assertEqual(system_prompt.read(), 'In-place edit.')
+
+    def test_existing_prompt_is_not_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'system-prompt'
+            _ = path.write_text('Existing prompt.\n', encoding='utf-8')
+
+            system_prompt = SystemPromptFile(path)
+
+            self.assertEqual(system_prompt.read(), 'Existing prompt.')
+            self.assertEqual(path.read_text(encoding='utf-8'), 'Existing prompt.\n')
 
 
 class FakeLlm:
@@ -521,10 +604,14 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
     tts: FakeTts
     registry: ToolRegistry
     utterance: AssistantUtterance
+    system_prompt_directory: tempfile.TemporaryDirectory[str]
+    system_prompt: SystemPromptFile
 
     async def asyncSetUp(self) -> None:
+        self.system_prompt_directory = tempfile.TemporaryDirectory()
         self.settings = Settings(
             llm_slots=(7,),
+            system_prompt_path=Path(self.system_prompt_directory.name) / 'system-prompt',
             tts_sentence_pause_seconds=2 / 24_000,
             tts_sentence_crossfade_seconds=2 / 24_000,
         )
@@ -537,16 +624,19 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
             default_timezone='local',
             maximum_result_characters=8_000,
         )
+        self.system_prompt = SystemPromptFile(self.settings.system_prompt_path)
         self.utterance = AssistantUtterance(
             self.settings,
             self.slots,
             self.llm,
             self.tts,
             self.registry,
+            self.system_prompt,
         )
 
     async def asyncTearDown(self) -> None:
         await self.utterance.close()
+        self.system_prompt_directory.cleanup()
 
     async def test_final_during_interval_drops_the_pending_warm(self) -> None:
         self.utterance.schedule_cache_warm('what is the')
@@ -557,6 +647,22 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(self.llm.warms), 1)
         self.assertEqual(self.llm.warms[0][1], 7)
+
+    async def test_warm_uses_reloaded_system_prompt_and_complete_tool_catalog(self) -> None:
+        _ = self.settings.system_prompt_path.write_text(
+            'Reloaded prompt.\n',
+            encoding='utf-8',
+        )
+
+        self.utterance.schedule_cache_warm('unrelated command')
+        await asyncio.sleep(0)
+        _ = await self.utterance.finalize_cache_warming('unrelated command')
+
+        self.assertEqual(len(self.llm.warms), 1)
+        self.assertIn(
+            '<|im_start|>system\nReloaded prompt.\nTools are available', self.llm.warms[0][0]
+        )
+        self.assertIn('"name":"time"', self.llm.warms[0][0])
 
     async def test_final_transcript_drops_pending_warms_and_drains_only_active_work(self) -> None:
         class BlockingLlm(FakeLlm):
@@ -577,6 +683,7 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
             llm,
             self.tts,
             self.registry,
+            self.system_prompt,
         )
         try:
             utterance.schedule_cache_warm('first stable words')

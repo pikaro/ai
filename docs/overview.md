@@ -97,6 +97,16 @@ dropped, the one active warm is allowed to finish, and the generation request
 itself evaluates any remaining prompt suffix. No speculative LLM requests run
 concurrently and no partially cancelled cache state is assumed to be reusable.
 
+The prompt starts with the user-editable system prompt followed by the complete,
+deterministically sorted tool catalog. The current transcript follows that
+stable prefix, so ordinary command changes preserve the system and tool KV
+cache. On startup the assistant creates `/tmp/system-prompt` with the default
+prompt if the file is absent. It checks the configured `system_prompt_path`
+before each prompt build and reloads a stable file revision after an in-place
+edit or atomic replacement. Existing contents are never overwritten. `/tmp` is
+ephemeral across pod replacement; configure a mounted path when edits must
+persist.
+
 Set `llm_cache_warm_enabled` to disable incremental warming,
 `llm_cache_warm_min_interval_seconds` to limit warm start frequency, and
 `llm_cache_warm_min_new_characters` to ignore very small append-only updates.
@@ -137,20 +147,24 @@ Repo-local tools live in `assistant/src/tools/*.py` and export a
 `time.py` tool supports `rough` time by default, `exact` time, and `date`, with
 optional IANA timezone selection.
 
-Tools are included in the LLM prompt only when a configured trigger matches a
-whole word in the stable transcript. MCP servers use Streamable HTTP by default
-and may opt into legacy SSE. Server-level triggers expose that server's tools;
-`tool_triggers` can activate individual remote tools without exposing the rest
-of the server. An enabled MCP server with no triggers is never presented to the
-model. MCP discovery is lazy, so an unavailable optional server does not make
-assistant readiness fail.
+Every repo-local tool and every discovered tool from an enabled MCP server is
+included in the stable prompt prefix. Transcript triggers do not filter or
+whitelist tools. The legacy `triggers` and `tool_triggers` configuration fields
+are accepted for compatibility but ignored. MCP servers use Streamable HTTP by
+default and may opt into legacy SSE. Discovery starts on the first prompt build,
+runs concurrently across enabled servers, and is cached for the process
+lifetime. An unavailable optional server does not make assistant readiness
+fail; discovery is retried after its configured interval.
 
 Tool requests use one or more non-streaming `tool_decision` LLM operations. If
 the configured tool-iteration limit is exhausted, a final `tool_answer`
 operation forces a spoken answer. INFO records include the duration of each LLM,
 local tool, and MCP operation. DEBUG records include the corresponding request
 and response data, making it possible to distinguish model-generation latency
-from tool execution latency.
+from tool execution latency. Because the catalog is always present, normal
+answers also pass through the non-streaming JSON tool-decision operation; this
+keeps tool choice entirely with the model but delays TTS until that operation
+completes.
 
 Set `ASSISTANT_CONFIG_FILE=/config/assistant.yaml` (or `.yml` / `.json`) to load
 a mounted configuration file. Initialization arguments and `ASSISTANT_`

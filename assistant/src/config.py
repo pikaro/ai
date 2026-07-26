@@ -16,7 +16,7 @@ from pydantic_settings import (
 
 
 class MCPConfig(BaseModel):
-    """Connection and prompt-selection settings for one MCP server."""
+    """Connection settings for one MCP server."""
 
     model_config = ConfigDict(extra='forbid', frozen=True)
 
@@ -28,6 +28,8 @@ class MCPConfig(BaseModel):
     enabled: bool = True
     token: SecretStr | None = None
     transport: Literal['streamable-http', 'sse'] = 'streamable-http'
+    # Retained so existing mounted configurations remain valid. Every discovered tool is now
+    # exposed to the model, independent of these former prompt-selection fields.
     triggers: frozenset[str] = frozenset()
     tool_triggers: dict[str, frozenset[str]] = Field(default_factory=dict)
     timeout_seconds: float = Field(default=10.0, gt=0)
@@ -77,6 +79,7 @@ class Settings(BaseSettings):
     tts_sentence_crossfade_seconds: float = Field(default=0.01, ge=0, le=0.25)
     save_latest_wav: bool = False
     latest_wav_path: Path = Path(tempfile.gettempdir()) / 'latest.wav'
+    system_prompt_path: Path = Path('/tmp/system-prompt')  # noqa: S108
     llm_slots: tuple[int, ...] = (0,)
     llm_max_tokens: int = Field(default=128, ge=1)
     llm_tool_tokens: int = Field(default=128, ge=1)

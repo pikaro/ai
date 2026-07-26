@@ -55,7 +55,7 @@ CACHE_PROMPT_CHARACTERS = Histogram(
 )
 CACHE_TOOLSET_CHANGES = Counter(
     'assistant_llm_cache_toolset_changes_total',
-    'Cache prompt revisions caused by newly triggered tools',
+    'Cache prompt revisions caused by tool catalog availability changes',
 )
 CACHE_WARM_UPDATES = Counter(
     'assistant_llm_cache_warm_updates_total',
@@ -129,7 +129,7 @@ TTS_REALTIME_FACTOR = Histogram(
 
 TOOLS_SELECTED = Counter(
     'assistant_tools_selected_total',
-    'Tools selected by prompt triggers',
+    'Tools included in prompts',
     ['source'],
 )
 TOOL_CALLS = Counter(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import json
@@ -52,16 +53,7 @@ class ToolDefinition:
         }
 
 
-def _contains_trigger(text: str, triggers: frozenset[str]) -> bool:
-    folded = text.casefold()
-    return any(
-        re.search(rf'(?<!\w){re.escape(trigger.casefold())}(?!\w)', folded) is not None
-        for trigger in triggers
-        if trigger.strip()
-    )
-
-
-def discover_local_tools(  # noqa: C901
+def discover_local_tools(
     package_name: str = 'assistant.src.tools',
 ) -> list[ToolDefinition]:
     package = importlib.import_module(package_name)
@@ -76,9 +68,6 @@ def discover_local_tools(  # noqa: C901
             if not isinstance(definition, ToolDefinition):
                 message = f'{module_info.name} exports an invalid tool definition'
                 raise TypeError(message)
-            if not definition.triggers:
-                message = f'local tool {definition.name!r} must declare at least one trigger'
-                raise ValueError(message)
             discovered.append(definition)
     return discovered
 
@@ -98,6 +87,7 @@ class ToolRegistry:
         self._tools = self._unique_tools(local_tools)
         self._mcp_tools: dict[str, list[ToolDefinition]] = {}
         self._mcp_retry_after: dict[str, float] = {}
+        self._reported_catalog: tuple[str, ...] | None = None
 
     @property
     def local_tool_count(self) -> int:
@@ -113,70 +103,72 @@ class ToolRegistry:
             result[tool.name] = tool
         return result
 
-    async def select(self, prompt: str) -> list[ToolDefinition]:  # noqa: C901
-        selected = [
-            tool for tool in self._tools.values() if _contains_trigger(prompt, tool.triggers)
+    async def available(self) -> list[ToolDefinition]:
+        enabled_servers = [
+            (server_name, config) for server_name, config in self.mcp.items() if config.enabled
         ]
-        for server_name, config in self.mcp.items():
-            if not config.enabled or not self._server_triggered(prompt, config):
-                continue
-            tools = self._mcp_tools.get(server_name)
-            if tools is None:
-                if time.monotonic() < self._mcp_retry_after.get(server_name, 0):
-                    continue
-                try:
-                    tools = await self._discover_mcp_tools(server_name, config)
-                except Exception:
-                    LOGGER.exception(
-                        'MCP tool discovery failed',
-                        extra={
-                            'event_id': 'ID_assistant_mcp_tool_discovery_failed',
-                            'server': server_name,
-                        },
-                    )
-                    self._mcp_retry_after[server_name] = time.monotonic() + config.retry_seconds
-                    continue
-                self._mcp_tools[server_name] = tools
-                _ = self._mcp_retry_after.pop(server_name, None)
-            server_selected = _contains_trigger(prompt, config.triggers)
-            selected.extend(
-                tool
-                for tool in tools
-                if server_selected or _contains_trigger(prompt, tool.triggers)
-            )
-        for tool in selected:
+        remote_catalogs = await asyncio.gather(
+            *(
+                self._available_mcp_tools(server_name, config)
+                for server_name, config in enabled_servers
+            ),
+        )
+        available = list(self._tools.values())
+        for remote_tools in remote_catalogs:
+            available.extend(remote_tools)
+
+        for tool in available:
             metrics.TOOLS_SELECTED.labels(source=tool.source).inc()
-        if selected:
+        catalog = tuple(sorted(tool.name for tool in available))
+        if catalog != self._reported_catalog:
             LOGGER.info(
-                'Tools selected',
+                'Tool catalog available',
                 extra={
-                    'event_id': 'ID_assistant_tools_selected',
-                    'tool_count': len(selected),
-                    'tools': [tool.name for tool in selected],
-                    'sources': [tool.source for tool in selected],
+                    'event_id': 'ID_assistant_tool_catalog_available',
+                    'tool_count': len(available),
+                    'tools': list(catalog),
+                    'sources': sorted({tool.source for tool in available}),
                 },
             )
             if LOGGER.isEnabledFor(logging.DEBUG):
                 LOGGER.debug(
-                    'Tool selection',
+                    'Tool catalog',
                     extra={
-                        'event_id': 'ID_assistant_tool_selection',
-                        'transcript': prompt,
+                        'event_id': 'ID_assistant_tool_catalog',
                         'tools': [
                             {'source': tool.source, **tool.prompt_description()}
-                            for tool in selected
+                            for tool in sorted(available, key=lambda item: item.name)
                         ],
                     },
                 )
-        return selected
+            self._reported_catalog = catalog
+        return available
 
-    @staticmethod
-    def _server_triggered(prompt: str, config: MCPConfig) -> bool:
-        if _contains_trigger(prompt, config.triggers):
-            return True
-        return any(
-            _contains_trigger(prompt, triggers) for triggers in config.tool_triggers.values()
-        )
+    async def _available_mcp_tools(
+        self,
+        server_name: str,
+        config: MCPConfig,
+    ) -> list[ToolDefinition]:
+        tools = self._mcp_tools.get(server_name)
+        if tools is not None:
+            return tools
+        if time.monotonic() < self._mcp_retry_after.get(server_name, 0):
+            return []
+        try:
+            tools = await self._discover_mcp_tools(server_name, config)
+        except Exception:
+            LOGGER.exception(
+                'MCP tool discovery failed',
+                extra={
+                    'event_id': 'ID_assistant_mcp_tool_discovery_failed',
+                    'server': server_name,
+                },
+            )
+            self._mcp_retry_after[server_name] = time.monotonic() + config.retry_seconds
+            return []
+        self._mcp_tools[server_name] = tools
+        _ = self._mcp_retry_after.pop(server_name, None)
+        return tools
 
     async def call(self, tool: ToolDefinition, arguments: dict[str, Any]) -> str:
         started = time.perf_counter()

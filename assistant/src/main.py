@@ -28,7 +28,7 @@ from websockets.exceptions import ConnectionClosed
 
 from assistant.src import metrics
 from assistant.src.config import Settings
-from assistant.src.pipeline import AssistantUtterance
+from assistant.src.pipeline import AssistantUtterance, SystemPromptFile
 from assistant.src.tooling import ToolRegistry, discover_local_tools
 from assistant.src.upstream import LlmClient, SlotPool, TtsClient, upstream_health
 from runtime_config import (
@@ -125,6 +125,7 @@ class AssistantRuntime:
             default_timezone=settings.default_timezone,
             maximum_result_characters=settings.maximum_tool_result_characters,
         )
+        self.system_prompt = SystemPromptFile(settings.system_prompt_path)
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -155,7 +156,14 @@ class AssistantRuntime:
         )
 
     def utterance(self) -> AssistantUtterance:
-        return AssistantUtterance(self.settings, self.slots, self.llm, self.tts, self.tools)
+        return AssistantUtterance(
+            self.settings,
+            self.slots,
+            self.llm,
+            self.tts,
+            self.tools,
+            self.system_prompt,
+        )
 
     @property
     def stt_websocket_url(self) -> str:
@@ -308,7 +316,6 @@ async def _consume_transcription(  # noqa: C901, PLR0912
     send: EventSink,
 ) -> tuple[str, list[ToolDefinition]]:
     transcript = ''
-    selected_tools = []
     async for raw in stt:
         if not isinstance(raw, str):
             continue
@@ -384,8 +391,8 @@ async def _consume_transcription(  # noqa: C901, PLR0912
     if not transcript:
         raise SttEmptyTranscriptError
     utterance.note_final_transcript()
-    selected_tools = await utterance.finalize_cache_warming(transcript)
-    return transcript, selected_tools
+    available_tools = await utterance.finalize_cache_warming(transcript)
+    return transcript, available_tools
 
 
 async def _run_realtime_session(
@@ -425,8 +432,8 @@ async def _run_realtime_session(
                 return_exceptions=True,
             )
             raise
-        transcript, selected_tools = transcription_task.result()
-    await utterance.generate(transcript, selected_tools, send)
+        transcript, available_tools = transcription_task.result()
+    await utterance.generate(transcript, available_tools, send)
 
 
 @app.websocket('/v1/realtime')

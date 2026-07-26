@@ -8,6 +8,7 @@ tts_sentence_pause_seconds: 0.12
 tts_sentence_crossfade_seconds: 0.01
 save_latest_wav: false
 latest_wav_path: /tmp/latest.wav
+system_prompt_path: /tmp/system-prompt
 llm_slots: [0]
 llm_cache_warm_enabled: true
 llm_cache_warm_min_interval_seconds: 0.5
@@ -24,9 +25,6 @@ mcp:
     transport: streamable-http
     timeout_seconds: 10
     retry_seconds: 30
-    triggers: [home, lights]
-    tool_triggers:
-      get_temperature: [temperature]
 
   calendar:
     url: http://calendar-mcp:8080/mcp
@@ -34,6 +32,3 @@ mcp:
     transport: streamable-http
     timeout_seconds: 10
     retry_seconds: 30
-    triggers: [calendar]
-    tool_triggers:
-      list_events: [appointment, appointments, schedule]
