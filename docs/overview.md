@@ -41,7 +41,11 @@ the last loaded configuration and PATCH only the changed top-level fields.
 Assistant changes use its local configuration endpoint; STT and TTS changes are
 proxied to their existing `/config` endpoints, so their normal validation, busy
 rejection, and restart restrictions still apply. The dashboard also edits the
-assistant system prompt.
+assistant system prompt. Its audio debug controls record mono PCM16 at the
+browser's actual audio-context sample rate and can submit those exact bytes to
+STT or the assistant realtime endpoint. Assistant PCM responses and WAV files
+requested from TTS can be played in the browser. Browser microphone access
+requires a secure context, such as HTTPS or localhost.
 
 ## Logging
 
@@ -80,6 +84,7 @@ logs; failed health checks and all other requests remain visible.
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics`
 - `GET /dashboard`
+- `POST /dashboard/stt` and `POST /dashboard/tts` (dashboard debug helpers)
 - `GET /config` and `PATCH /config`
 - `GET /system-prompt` and `PUT /system-prompt`
 - `GET /v1/models`
@@ -248,7 +253,8 @@ libraries.
 
 ## TTS
 
-`tts/src/main.py` keeps Pocket TTS and the configured voice in memory and serves:
+`tts/src/main.py` keeps one Pocket TTS model and reusable voice states in memory
+and serves:
 
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics`
@@ -263,6 +269,12 @@ PCM16 and includes format headers. Pocket TTS is not thread-safe, so only one
 generation is admitted and concurrent requests receive `409 Conflict` instead
 of waiting on its model lock. Relevant settings use the `TTS_` prefix; defaults
 are declared in `tts/src/main.py`.
+
+Speech requests may select a voice with the `X-Voice` header. An omitted header
+or `X-Voice: default` selects `TTS_VOICE`; a named value such as
+`X-Voice: bender` selects the corresponding uploaded voice or Pocket TTS canned
+voice. Voice states are loaded on first use and retained while the process is
+running, sharing the single base model.
 
 Set `TTS_SAVE_LATEST_WAV=true` to atomically overwrite the most recently
 completed synthesized recording. `TTS_LATEST_WAV_PATH` defaults to
@@ -283,11 +295,12 @@ curl -F name=foo -F file=@foo.safetensors http://localhost:8080/v1/voices
 
 Uploads are stored atomically as `<name>.safetensors` in
 `TTS_DATA_DIRECTORY`, which defaults to `/data`. `TTS_MAXIMUM_VOICE_UPLOAD_BYTES`
-limits each upload and defaults to 100 MiB. When the service next starts with
-`TTS_VOICE=foo`, `/data/foo.safetensors` (or the corresponding file in the
-configured data directory) is loaded in place of the canned `foo` voice. Mount
-the data directory on persistent storage when uploads must survive container
-replacement.
+limits each upload and defaults to 100 MiB. A request with `X-Voice: foo`
+selects `/data/foo.safetensors` (or the corresponding file in the configured
+data directory); setting `TTS_VOICE=foo` makes it the default. Replacing a voice
+through the upload endpoint invalidates its cached state so the next request
+loads the new file. Mount the data directory on persistent storage when uploads
+must survive container replacement.
 
 The STT and TTS `/metrics` endpoints use Prometheus' text exposition format.
 They include Python process collectors, model readiness/load gauges, request

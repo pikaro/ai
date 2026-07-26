@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Final, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -14,6 +15,7 @@ import uvicorn
 from fastapi import (
     FastAPI,
     HTTPException,
+    Query,
     Request,
     WebSocket,
     WebSocketDisconnect,
@@ -25,7 +27,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from starlette.websockets import WebSocketState
 from websockets.asyncio.client import ClientConnection, connect
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, WebSocketException as UpstreamWebSocketException
 
 from assistant.src import metrics
 from assistant.src.config import Settings
@@ -51,6 +53,7 @@ LOGGER = logging.getLogger('assistant')
 UPSTREAM_KEEPALIVE_EXPIRY_SECONDS: Final = 4.0
 RESTART_REQUIRED_SETTINGS: Final = frozenset({'listen_port'})
 DASHBOARD_PATH: Final = Path(__file__).with_name('dashboard.html')
+DASHBOARD_PCM_CHUNK_BYTES: Final = 64 * 1024
 
 
 class SttEmptyTranscriptError(RuntimeError):
@@ -74,6 +77,12 @@ class RealtimeEvent(BaseModel):
     ]
     session: SessionOptions | None = None
     audio: str | None = None
+
+
+class DashboardSpeechRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    text: str = Field(min_length=1)
 
 
 class HealthResponse(BaseModel):
@@ -244,6 +253,10 @@ async def _proxy_configuration_request(
             detail=f'{service} configuration request failed',
         ) from error
 
+    return _forward_upstream_response(upstream_response)
+
+
+def _forward_upstream_response(upstream_response: httpx.Response) -> Response:
     headers = {
         name: value
         for name in ('content-type', 'retry-after')
@@ -254,6 +267,101 @@ async def _proxy_configuration_request(
         status_code=upstream_response.status_code,
         headers=headers,
     )
+
+
+def _update_dashboard_transcript(  # noqa: C901
+    transcript: str,
+    message: dict[str, object],
+) -> tuple[str, bool]:
+    message_type = str(message.get('type', ''))
+    if message_type == 'error':
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(message.get('message', 'STT request failed')),
+        )
+    if message_type.endswith('transcription.delta'):
+        current = message.get('transcript')
+        if isinstance(current, str) and current.strip():
+            return current.strip(), False
+        delta = message.get('delta')
+        if isinstance(delta, str):
+            return f'{transcript} {delta}'.strip(), False
+    if message_type.endswith('transcription.completed'):
+        completed = message.get('transcript')
+        if isinstance(completed, str) and completed.strip():
+            transcript = completed.strip()
+        return transcript, True
+    return transcript, False
+
+
+async def _transcribe_dashboard_pcm(  # noqa: C901
+    runtime: AssistantRuntime,
+    pcm: bytes,
+    sample_rate: int,
+    channels: int,
+) -> str:
+    transcript = ''
+    try:
+        async with asyncio.timeout(runtime.settings.request_timeout_seconds):
+            async with connect(
+                runtime.stt_websocket_url,
+                open_timeout=runtime.settings.connect_timeout_seconds,
+                close_timeout=runtime.settings.connect_timeout_seconds,
+                max_size=runtime.settings.maximum_websocket_message_bytes,
+            ) as stt:
+                await stt.send(
+                    RealtimeEvent(
+                        type='session.update',
+                        session=SessionOptions(
+                            input_audio_sample_rate=sample_rate,
+                            input_audio_channels=channels,
+                        ),
+                    ).model_dump_json(exclude_none=True),
+                )
+                for offset in range(0, len(pcm), DASHBOARD_PCM_CHUNK_BYTES):
+                    encoded = base64.b64encode(
+                        pcm[offset : offset + DASHBOARD_PCM_CHUNK_BYTES],
+                    ).decode('ascii')
+                    await stt.send(
+                        RealtimeEvent(
+                            type='input_audio_buffer.append',
+                            audio=encoded,
+                        ).model_dump_json(exclude_none=True),
+                    )
+                await stt.send(
+                    RealtimeEvent(type='input_audio_buffer.commit').model_dump_json(
+                        exclude_none=True,
+                    ),
+                )
+
+                async for raw in stt:
+                    if not isinstance(raw, str):
+                        continue
+                    try:
+                        message = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if not isinstance(message, dict):
+                        continue
+                    transcript, complete = _update_dashboard_transcript(transcript, message)
+                    if complete:
+                        break
+    except HTTPException:
+        raise
+    except (OSError, TimeoutError, UpstreamWebSocketException) as error:
+        LOGGER.warning(
+            'Dashboard STT request failed',
+            extra={
+                'event_id': 'ID_assistant_dashboard_stt_failed',
+                'error_type': type(error).__name__,
+                'error': str(error),
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail='STT request failed',
+        ) from error
+    return transcript
 
 
 def _restore_dashboard_secrets(current: object, proposed: object) -> object:
@@ -433,6 +541,67 @@ async def update_dashboard_configuration(
         return Response(result.model_dump_json(), media_type='application/json')
     runtime = _runtime_from_request(request)
     return await _proxy_configuration_request(runtime, service, 'PATCH', patch)
+
+
+@app.post('/dashboard/stt', include_in_schema=False)
+async def dashboard_transcription(
+    request: Request,
+    sample_rate: Annotated[int, Query(ge=8_000)],
+    channels: Annotated[int, Query(ge=1, le=2)] = 1,
+) -> dict[str, str]:
+    pcm = await request.body()
+    if not pcm:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail='PCM16 audio is empty',
+        )
+    frame_bytes = channels * 2
+    if len(pcm) % frame_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail='PCM16 audio must contain complete sample frames',
+        )
+    runtime = _runtime_from_request(request)
+    transcript = await _transcribe_dashboard_pcm(
+        runtime,
+        pcm,
+        sample_rate,
+        channels,
+    )
+    return {'transcript': transcript}
+
+
+@app.post('/dashboard/tts', include_in_schema=False)
+async def dashboard_speech(
+    request: Request,
+    speech_request: DashboardSpeechRequest,
+) -> Response:
+    runtime = _runtime_from_request(request)
+    url = f'{runtime.settings.tts_base_url.rstrip("/")}/v1/audio/speech'
+    try:
+        upstream_response = await runtime.http.request(
+            'POST',
+            url,
+            json={
+                'model': runtime.settings.tts_model,
+                'input': speech_request.text,
+                'response_format': 'wav',
+            },
+        )
+    except httpx.RequestError as error:
+        LOGGER.warning(
+            'Dashboard TTS request failed',
+            extra={
+                'event_id': 'ID_assistant_dashboard_tts_failed',
+                'error_type': type(error).__name__,
+                'error': str(error),
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail='TTS request failed',
+        ) from error
+    return _forward_upstream_response(upstream_response)
 
 
 async def _forward_client_audio(  # noqa: C901

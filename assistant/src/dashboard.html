@@ -17,7 +17,7 @@
       padding: 24px;
     }
 
-    h1, h2 {
+    h1, h2, h3 {
       margin: 0;
       font-family: system-ui, sans-serif;
     }
@@ -29,6 +29,10 @@
 
     h2 {
       font-size: 18px;
+    }
+
+    h3 {
+      font-size: 15px;
     }
 
     .hint, .status, .changes, .result, label, button {
@@ -75,7 +79,7 @@
       font-weight: 600;
     }
 
-    .editor-shell, .prompt-editor {
+    .editor-shell, .prompt-editor, .speech-editor {
       box-sizing: border-box;
       width: 100%;
       border: 1px solid #4b5563;
@@ -151,6 +155,30 @@
       line-height: 1.45;
     }
 
+    .speech-editor {
+      min-height: 88px;
+      padding: 10px;
+      resize: vertical;
+      color: #e5e7eb;
+      font: inherit;
+      line-height: 1.45;
+    }
+
+    .debug-tools {
+      margin-top: 18px;
+      padding-top: 16px;
+      border-top: 1px solid #374151;
+    }
+
+    .debug-tools .hint {
+      margin: 6px 0 12px;
+      font-size: 13px;
+    }
+
+    .debug-tools label {
+      margin-top: 16px;
+    }
+
     .changes {
       min-height: 18px;
       margin-top: 8px;
@@ -177,6 +205,11 @@
       background: #2563eb;
     }
 
+    button.recording {
+      border-color: #dc2626;
+      background: #b91c1c;
+    }
+
     button:disabled {
       cursor: not-allowed;
       opacity: 0.5;
@@ -190,6 +223,11 @@
 
     .error {
       color: #fca5a5;
+    }
+
+    .audio-player {
+      width: 100%;
+      margin-top: 12px;
     }
   </style>
 </head>
@@ -223,11 +261,27 @@
       <label for="prompt-editor">Prompt text</label>
       <textarea id="prompt-editor" class="prompt-editor" spellcheck="true"></textarea>
       <div class="changes">No local changes</div>
-      <div class="actions">
+      <div class="actions prompt-actions">
         <button class="primary save" type="button" disabled>Save prompt</button>
         <button class="reload" type="button">Reload</button>
       </div>
       <div class="result" role="status" aria-live="polite"></div>
+      <div class="debug-tools">
+        <h3>Audio debug</h3>
+        <p class="hint">Click a microphone button once to record, then again to submit.</p>
+        <div class="actions">
+          <button id="stt-mic" type="button">Record for STT</button>
+          <button id="assistant-mic" type="button">Record for Assistant</button>
+        </div>
+        <div id="mic-status" class="result" role="status" aria-live="polite"></div>
+        <label for="tts-text">Text to synthesize</label>
+        <textarea id="tts-text" class="speech-editor" spellcheck="true"></textarea>
+        <div class="actions">
+          <button id="speak" class="primary" type="button">Speak with TTS</button>
+        </div>
+        <audio id="audio-player" class="audio-player" controls hidden></audio>
+        <div id="audio-result" class="result" role="status" aria-live="polite"></div>
+      </div>
     </section>
   </main>
 
@@ -463,7 +517,8 @@
     }
 
     function setPromptBusy(busy) {
-      promptCard.querySelectorAll('button').forEach(button => { button.disabled = busy; });
+      promptCard.querySelectorAll('.prompt-actions button')
+        .forEach(button => { button.disabled = busy; });
       if (!busy) updatePromptChanges();
     }
 
@@ -521,6 +576,384 @@
     promptEditor.addEventListener('input', updatePromptChanges);
     promptCard.querySelector('.save').addEventListener('click', savePrompt);
     promptCard.querySelector('.reload').addEventListener('click', () => loadPrompt());
+
+    const sttMicButton = document.querySelector('#stt-mic');
+    const assistantMicButton = document.querySelector('#assistant-mic');
+    const microphoneStatus = document.querySelector('#mic-status');
+    const ttsEditor = document.querySelector('#tts-text');
+    const speakButton = document.querySelector('#speak');
+    const audioPlayer = document.querySelector('#audio-player');
+    const audioResult = document.querySelector('#audio-result');
+    const microphoneButtons = {
+      stt: sttMicButton,
+      assistant: assistantMicButton,
+    };
+    let activeRecording;
+    let microphoneStarting = false;
+    let playbackUrl;
+
+    function setAudioResult(message, error = false) {
+      audioResult.textContent = message;
+      audioResult.classList.toggle('error', error);
+    }
+
+    function setMicrophoneButtons(recordingMode = null, busy = false) {
+      for (const [mode, button] of Object.entries(microphoneButtons)) {
+        const recording = mode === recordingMode;
+        button.disabled = busy || (recordingMode !== null && !recording);
+        button.classList.toggle('recording', recording);
+        if (recording) {
+          button.textContent =
+            mode === 'stt' ? 'Stop and transcribe' : 'Stop and ask Assistant';
+        } else {
+          button.textContent = mode === 'stt' ? 'Record for STT' : 'Record for Assistant';
+        }
+      }
+    }
+
+    async function startMicrophone(mode) {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Microphone capture is unavailable; use HTTPS or localhost');
+      }
+      const AudioContextType = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextType) throw new Error('Web Audio is unavailable in this browser');
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+      let context;
+      try {
+        context = new AudioContextType({sampleRate: 16_000});
+        await context.resume();
+        const source = context.createMediaStreamSource(stream);
+        const processor = context.createScriptProcessor(1024, 1, 1);
+        const silentOutput = context.createGain();
+        silentOutput.gain.value = 0;
+        source.connect(processor);
+        processor.connect(silentOutput);
+        silentOutput.connect(context.destination);
+        const recording = {
+          mode,
+          context,
+          stream,
+          source,
+          processor,
+          silentOutput,
+          chunks: [],
+          totalSamples: 0,
+        };
+        processor.onaudioprocess = event => {
+          const input = event.inputBuffer.getChannelData(0);
+          const chunk = new Float32Array(input.length);
+          chunk.set(input);
+          recording.chunks.push(chunk);
+          recording.totalSamples += chunk.length;
+        };
+        return recording;
+      } catch (error) {
+        stream.getTracks().forEach(track => track.stop());
+        if (context) await context.close();
+        throw error;
+      }
+    }
+
+    async function finishMicrophone(recording) {
+      recording.processor.onaudioprocess = null;
+      recording.source.disconnect();
+      recording.processor.disconnect();
+      recording.silentOutput.disconnect();
+      recording.stream.getTracks().forEach(track => track.stop());
+      await recording.context.close();
+      if (!recording.totalSamples) throw new Error('No microphone audio was captured');
+
+      const pcm = new Int16Array(recording.totalSamples);
+      let offset = 0;
+      for (const chunk of recording.chunks) {
+        for (const value of chunk) {
+          const sample = Math.max(-1, Math.min(1, value));
+          pcm[offset] = sample < 0
+            ? Math.round(sample * 32768)
+            : Math.round(sample * 32767);
+          offset += 1;
+        }
+      }
+      return {pcm, sampleRate: recording.context.sampleRate, channels: 1};
+    }
+
+    function bytesToBase64(bytes) {
+      const parts = [];
+      for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        parts.push(String.fromCharCode(...bytes.subarray(offset, offset + 0x8000)));
+      }
+      return btoa(parts.join(''));
+    }
+
+    function base64ToBytes(encoded) {
+      const binary = atob(encoded);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return bytes;
+    }
+
+    function pcmBytes(recording) {
+      return new Uint8Array(
+        recording.pcm.buffer,
+        recording.pcm.byteOffset,
+        recording.pcm.byteLength,
+      );
+    }
+
+    function writeAscii(view, offset, text) {
+      for (let index = 0; index < text.length; index += 1) {
+        view.setUint8(offset + index, text.charCodeAt(index));
+      }
+    }
+
+    function pcmWavBlob(chunks, format) {
+      if (
+        !format ||
+        format.format !== 'pcm16' ||
+        format.sampleWidth !== 2 ||
+        !Number.isInteger(format.sampleRate) ||
+        !Number.isInteger(format.channels)
+      ) {
+        throw new Error('Assistant returned an unsupported audio format');
+      }
+      const audioBytes = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+      const header = new ArrayBuffer(44);
+      const view = new DataView(header);
+      writeAscii(view, 0, 'RIFF');
+      view.setUint32(4, 36 + audioBytes, true);
+      writeAscii(view, 8, 'WAVE');
+      writeAscii(view, 12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, format.channels, true);
+      view.setUint32(24, format.sampleRate, true);
+      view.setUint32(28, format.sampleRate * format.channels * format.sampleWidth, true);
+      view.setUint16(32, format.channels * format.sampleWidth, true);
+      view.setUint16(34, format.sampleWidth * 8, true);
+      writeAscii(view, 36, 'data');
+      view.setUint32(40, audioBytes, true);
+      return new Blob([header, ...chunks], {type: 'audio/wav'});
+    }
+
+    function playAudioBlob(blob) {
+      if (playbackUrl) URL.revokeObjectURL(playbackUrl);
+      playbackUrl = URL.createObjectURL(blob);
+      audioPlayer.src = playbackUrl;
+      audioPlayer.hidden = false;
+      audioPlayer.play().catch(() => {});
+    }
+
+    async function submitToStt(recording) {
+      setAudioResult('Submitting PCM16 to STT…');
+      const query = new URLSearchParams({
+        sample_rate: String(recording.sampleRate),
+        channels: String(recording.channels),
+      });
+      const response = await fetch(`/dashboard/stt?${query}`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/octet-stream'},
+        body: pcmBytes(recording),
+      });
+      const body = await responseBody(response);
+      if (!response.ok) throw new Error(`${response.status} ${JSON.stringify(body)}`);
+      const transcript = isObject(body) && typeof body.transcript === 'string'
+        ? body.transcript
+        : '';
+      setAudioResult(`STT transcript:\n${transcript || '(empty)'}`);
+    }
+
+    function assistantWebSocketUrl() {
+      const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${scheme}//${location.host}/v1/realtime`;
+    }
+
+    function submitToAssistant(recording) {
+      setAudioResult('Submitting PCM16 to Assistant…');
+      return new Promise((resolve, reject) => {
+        const socket = new WebSocket(assistantWebSocketUrl());
+        let settled = false;
+        let transcript = '';
+        let responseText = '';
+        let audioFormat;
+        const audioChunks = [];
+
+        const rejectOnce = error => {
+          if (settled) return;
+          settled = true;
+          socket.close();
+          reject(error);
+        };
+
+        socket.addEventListener('open', () => {
+          try {
+            socket.send(JSON.stringify({
+              type: 'session.update',
+              session: {
+                input_audio_sample_rate: recording.sampleRate,
+                input_audio_channels: recording.channels,
+              },
+            }));
+            const bytes = pcmBytes(recording);
+            for (let offset = 0; offset < bytes.length; offset += 64 * 1024) {
+              socket.send(JSON.stringify({
+                type: 'input_audio_buffer.append',
+                audio: bytesToBase64(bytes.subarray(offset, offset + 64 * 1024)),
+              }));
+            }
+            socket.send(JSON.stringify({type: 'input_audio_buffer.commit'}));
+          } catch (error) {
+            rejectOnce(error);
+          }
+        });
+
+        socket.addEventListener('message', event => {
+          try {
+            const message = JSON.parse(event.data);
+            const messageType = String(message.type || '');
+            if (messageType === 'error') {
+              rejectOnce(new Error(String(message.message || 'Assistant request failed')));
+              return;
+            }
+            if (messageType.endsWith('transcription.delta')) {
+              if (typeof message.transcript === 'string' && message.transcript.trim()) {
+                transcript = message.transcript.trim();
+              } else if (typeof message.delta === 'string') {
+                transcript = `${transcript} ${message.delta}`.trim();
+              }
+            } else if (messageType.endsWith('transcription.completed')) {
+              if (typeof message.transcript === 'string') {
+                transcript = message.transcript.trim();
+              }
+            } else if (messageType === 'response.text.delta') {
+              responseText += String(message.delta || '');
+            } else if (messageType === 'response.audio.started') {
+              audioFormat = {
+                format: message.format,
+                sampleRate: Number(message.sample_rate),
+                sampleWidth: Number(message.sample_width),
+                channels: Number(message.channels),
+              };
+            } else if (messageType === 'response.audio.delta') {
+              audioChunks.push(base64ToBytes(String(message.audio || '')));
+            } else if (messageType === 'response.done') {
+              if (audioChunks.length) playAudioBlob(pcmWavBlob(audioChunks, audioFormat));
+              settled = true;
+              resolve();
+            }
+            if (transcript || responseText) {
+              setAudioResult(
+                `Transcript:\n${transcript || '(waiting…)'}\n\n` +
+                `Assistant:\n${responseText || '(waiting…)'}`,
+              );
+            }
+          } catch (error) {
+            rejectOnce(error);
+          }
+        });
+
+        socket.addEventListener('error', () => {
+          rejectOnce(new Error('Assistant WebSocket failed'));
+        });
+        socket.addEventListener('close', event => {
+          if (!settled) {
+            const reason = event.reason ? `: ${event.reason}` : '';
+            rejectOnce(new Error(`Assistant closed (${event.code})${reason}`));
+          }
+        });
+      });
+    }
+
+    async function toggleMicrophone(mode) {
+      if (activeRecording) {
+        if (activeRecording.mode !== mode) return;
+        const recording = activeRecording;
+        activeRecording = undefined;
+        setMicrophoneButtons(null, true);
+        microphoneStatus.textContent = 'Stopping microphone…';
+        try {
+          const captured = await finishMicrophone(recording);
+          const seconds = captured.pcm.length / captured.sampleRate;
+          microphoneStatus.textContent =
+            `Captured ${seconds.toFixed(1)} s at ${captured.sampleRate} Hz; submitting…`;
+          if (mode === 'stt') {
+            await submitToStt(captured);
+          } else {
+            await submitToAssistant(captured);
+          }
+          microphoneStatus.textContent =
+            `Submitted ${seconds.toFixed(1)} s of mono PCM16 at ${captured.sampleRate} Hz`;
+          microphoneStatus.classList.remove('error');
+        } catch (error) {
+          microphoneStatus.textContent = String(error);
+          microphoneStatus.classList.add('error');
+          setAudioResult(String(error), true);
+        } finally {
+          setMicrophoneButtons();
+        }
+        return;
+      }
+      if (microphoneStarting) return;
+
+      microphoneStarting = true;
+      setMicrophoneButtons(null, true);
+      microphoneStatus.textContent = 'Requesting microphone access…';
+      microphoneStatus.classList.remove('error');
+      try {
+        activeRecording = await startMicrophone(mode);
+        setMicrophoneButtons(mode);
+        microphoneStatus.textContent =
+          `Recording mono PCM at ${activeRecording.context.sampleRate} Hz; click again to stop`;
+      } catch (error) {
+        microphoneStatus.textContent = String(error);
+        microphoneStatus.classList.add('error');
+        setMicrophoneButtons();
+      } finally {
+        microphoneStarting = false;
+      }
+    }
+
+    async function speakText() {
+      const text = ttsEditor.value.trim();
+      if (!text) {
+        setAudioResult('Enter text to synthesize', true);
+        return;
+      }
+      speakButton.disabled = true;
+      setAudioResult('Generating speech…');
+      try {
+        const response = await fetch('/dashboard/tts', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({text}),
+        });
+        if (!response.ok) {
+          const body = await responseBody(response);
+          throw new Error(`${response.status} ${JSON.stringify(body)}`);
+        }
+        const audio = await response.blob();
+        if (!audio.size) throw new Error('TTS returned empty audio');
+        playAudioBlob(audio);
+        setAudioResult(`${response.status} Playing TTS audio`);
+      } catch (error) {
+        setAudioResult(String(error), true);
+      } finally {
+        speakButton.disabled = false;
+      }
+    }
+
+    sttMicButton.addEventListener('click', () => toggleMicrophone('stt'));
+    assistantMicButton.addEventListener('click', () => toggleMicrophone('assistant'));
+    speakButton.addEventListener('click', speakText);
     loadPrompt();
   </script>
 </body>

@@ -11,7 +11,7 @@ import unittest
 import wave
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Self, cast
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -187,6 +187,10 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('class="json-highlight"', response.text)
         self.assertIn('function buildPatch(card)', response.text)
         self.assertIn("fetch('/system-prompt'", response.text)
+        self.assertIn('id="stt-mic"', response.text)
+        self.assertIn('id="assistant-mic"', response.text)
+        self.assertIn('fetch(`/dashboard/stt?', response.text)
+        self.assertIn("fetch('/dashboard/tts'", response.text)
 
     async def test_assistant_configuration_is_exposed_without_proxying(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -312,6 +316,139 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                     'PATCH',
                     'http://tts.test/config',
                     json=patch_body,
+                )
+            finally:
+                await runtime.close()
+
+    async def test_recorded_pcm_is_forwarded_exactly_to_stt_realtime(  # noqa: C901
+        self,
+    ) -> None:
+        class FakeSttConnection:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+                self.responses = iter(
+                    (
+                        json.dumps({'type': 'session.updated'}),
+                        json.dumps(
+                            {
+                                'type': ('conversation.item.input_audio_transcription.completed'),
+                                'transcript': 'debug transcript',
+                            },
+                        ),
+                    ),
+                )
+
+            async def __aenter__(self) -> Self:
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            def __aiter__(self) -> FakeSttConnection:
+                return self
+
+            async def __anext__(self) -> str:
+                try:
+                    return next(self.responses)
+                except StopIteration as error:
+                    raise StopAsyncIteration from error
+
+            async def send(self, message: str) -> None:
+                self.sent.append(message)
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                stt_base_url='http://stt.test',
+                system_prompt_path=Path(directory) / 'system-prompt',
+            )
+            runtime = AssistantRuntime(settings)
+            assistant_app.state.runtime = runtime
+            stt = FakeSttConnection()
+            pcm = bytes(range(256)) * 257
+            transport = httpx.ASGITransport(app=assistant_app)
+            try:
+                with patch('assistant.src.main.connect', return_value=stt) as connect_stt:
+                    async with httpx.AsyncClient(
+                        transport=transport,
+                        base_url='http://test',
+                    ) as client:
+                        response = await client.post(
+                            '/dashboard/stt',
+                            params={'sample_rate': 48_000, 'channels': 1},
+                            content=pcm,
+                            headers={'Content-Type': 'application/octet-stream'},
+                        )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), {'transcript': 'debug transcript'})
+                connect_stt.assert_called_once_with(
+                    'ws://stt.test/v1/realtime',
+                    open_timeout=settings.connect_timeout_seconds,
+                    close_timeout=settings.connect_timeout_seconds,
+                    max_size=settings.maximum_websocket_message_bytes,
+                )
+                events = [json.loads(message) for message in stt.sent]
+                self.assertEqual(
+                    [event['type'] for event in events],
+                    [
+                        'session.update',
+                        'input_audio_buffer.append',
+                        'input_audio_buffer.append',
+                        'input_audio_buffer.commit',
+                    ],
+                )
+                self.assertEqual(
+                    events[0]['session'],
+                    {
+                        'input_audio_sample_rate': 48_000,
+                        'input_audio_channels': 1,
+                    },
+                )
+                forwarded_pcm = b''.join(base64.b64decode(event['audio']) for event in events[1:-1])
+                self.assertEqual(forwarded_pcm, pcm)
+            finally:
+                await runtime.close()
+
+    async def test_tts_speech_and_wav_response_are_proxied(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                tts_base_url='http://tts.test',
+                tts_model='debug-tts',
+                system_prompt_path=Path(directory) / 'system-prompt',
+            )
+            runtime = AssistantRuntime(settings)
+            assistant_app.state.runtime = runtime
+            wav = b'RIFFdebug-wave'
+            upstream_response = httpx.Response(
+                200,
+                content=wav,
+                headers={'Content-Type': 'audio/wav'},
+                request=httpx.Request('POST', 'http://tts.test/v1/audio/speech'),
+            )
+            request_speech = AsyncMock(return_value=upstream_response)
+            transport = httpx.ASGITransport(app=assistant_app)
+            try:
+                with patch.object(runtime.http, 'request', request_speech):
+                    async with httpx.AsyncClient(
+                        transport=transport,
+                        base_url='http://test',
+                    ) as client:
+                        response = await client.post(
+                            '/dashboard/tts',
+                            json={'text': 'Speak this.'},
+                        )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.content, wav)
+                self.assertEqual(response.headers['content-type'], 'audio/wav')
+                request_speech.assert_awaited_once_with(
+                    'POST',
+                    'http://tts.test/v1/audio/speech',
+                    json={
+                        'model': 'debug-tts',
+                        'input': 'Speak this.',
+                        'response_format': 'wav',
+                    },
                 )
             finally:
                 await runtime.close()
