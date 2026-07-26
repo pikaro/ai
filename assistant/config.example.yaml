@@ -6,6 +6,7 @@ stt_base_url: http://nemo-asr.nemo-asr
 tts_base_url: http://pockettts.pockettts
 tts_sentence_pause_seconds: 0.12
 tts_sentence_crossfade_seconds: 0.01
+tts_sentence_terminators: ".!?"
 save_latest_wav: false
 latest_wav_path: /tmp/latest.wav
 system_prompt_path: /tmp/system-prompt

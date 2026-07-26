@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     tts_model: str = 'kyutai/pocket-tts'
     tts_sentence_pause_seconds: float = Field(default=0.12, ge=0, le=2)
     tts_sentence_crossfade_seconds: float = Field(default=0.01, ge=0, le=0.25)
+    tts_sentence_terminators: str = Field(default='.!?', min_length=1)
     save_latest_wav: bool = False
     latest_wav_path: Path = Path(tempfile.gettempdir()) / 'latest.wav'
     system_prompt_path: Path = Path('/tmp/system-prompt')  # noqa: S108

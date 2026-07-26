@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
@@ -19,7 +20,7 @@ from fastapi import (
     WebSocketException,
     status,
 )
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.websockets import WebSocketState
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger('assistant')
 UPSTREAM_KEEPALIVE_EXPIRY_SECONDS: Final = 4.0
 RESTART_REQUIRED_SETTINGS: Final = frozenset({'listen_port'})
+DASHBOARD_PATH: Final = Path(__file__).with_name('dashboard.html')
 
 
 class SttEmptyTranscriptError(RuntimeError):
@@ -207,6 +209,53 @@ def _runtime_from_websocket(websocket: WebSocket) -> AssistantRuntime:
     return cast('AssistantRuntime', websocket.app.state.runtime)
 
 
+def _upstream_configuration_url(
+    settings: Settings,
+    service: Literal['stt', 'tts'],
+) -> str:
+    base_url = settings.stt_base_url if service == 'stt' else settings.tts_base_url
+    return f'{base_url.rstrip("/")}/config'
+
+
+async def _proxy_configuration_request(
+    runtime: AssistantRuntime,
+    service: Literal['stt', 'tts'],
+    method: Literal['GET', 'PATCH'],
+    patch: dict[str, object] | None = None,
+) -> Response:
+    url = _upstream_configuration_url(runtime.settings, service)
+    try:
+        if patch is None:
+            upstream_response = await runtime.http.request(method, url)
+        else:
+            upstream_response = await runtime.http.request(method, url, json=patch)
+    except httpx.RequestError as error:
+        LOGGER.warning(
+            'Configuration proxy request failed',
+            extra={
+                'event_id': 'ID_assistant_configuration_proxy_failed',
+                'service': service,
+                'error_type': type(error).__name__,
+                'error': str(error),
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f'{service} configuration request failed',
+        ) from error
+
+    headers = {
+        name: value
+        for name in ('content-type', 'retry-after')
+        if (value := upstream_response.headers.get(name)) is not None
+    }
+    return Response(
+        upstream_response.content,
+        status_code=upstream_response.status_code,
+        headers=headers,
+    )
+
+
 def log_request_correlation(headers: Headers) -> None:
     """Log optional client correlation headers before starting request work."""
     request_id = headers.get('x-request-id')
@@ -231,6 +280,11 @@ async def live() -> dict[str, str]:
 @app.get('/metrics', include_in_schema=False)
 async def prometheus_metrics() -> Response:
     return Response(generate_latest(), headers={'Content-Type': CONTENT_TYPE_LATEST})
+
+
+@app.get('/dashboard', include_in_schema=False)
+async def dashboard() -> FileResponse:
+    return FileResponse(DASHBOARD_PATH, media_type='text/html')
 
 
 @app.get('/health', response_model=HealthResponse)
@@ -281,6 +335,30 @@ async def update_configuration(
         return ConfigurationUpdateResponse(changed=changed)
     finally:
         runtime.operations.release()
+
+
+@app.get('/dashboard/config/{service}', include_in_schema=False)
+async def dashboard_configuration(
+    request: Request,
+    service: Literal['assistant', 'stt', 'tts'],
+) -> Response:
+    runtime = _runtime_from_request(request)
+    if service == 'assistant':
+        return Response(runtime.settings.model_dump_json(), media_type='application/json')
+    return await _proxy_configuration_request(runtime, service, 'GET')
+
+
+@app.patch('/dashboard/config/{service}', include_in_schema=False)
+async def update_dashboard_configuration(
+    request: Request,
+    service: Literal['assistant', 'stt', 'tts'],
+    patch: dict[str, object],
+) -> Response:
+    if service == 'assistant':
+        result = await update_configuration(request, patch)
+        return Response(result.model_dump_json(), media_type='application/json')
+    runtime = _runtime_from_request(request)
+    return await _proxy_configuration_request(runtime, service, 'PATCH', patch)
 
 
 async def _forward_client_audio(  # noqa: C901

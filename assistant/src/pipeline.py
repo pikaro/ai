@@ -163,7 +163,14 @@ class LlmProtocol(Protocol):
         maximum_tokens: int,
     ) -> str: ...
 
-    def stream(self, prompt: str, slot: int) -> AsyncIterator[str]: ...
+    def stream(
+        self,
+        prompt: str,
+        slot: int,
+        *,
+        operation: str = 'generation',
+        maximum_tokens: int | None = None,
+    ) -> AsyncIterator[str]: ...
 
 
 class TtsProtocol(Protocol):
@@ -176,7 +183,6 @@ def build_prompt(
     history: list[tuple[str, str]] | None = None,
     *,
     system_prompt: str = BASE_SYSTEM_PROMPT,
-    force_answer: bool = False,
 ) -> str:
     complete_system_prompt = system_prompt
     if tools:
@@ -185,16 +191,11 @@ def build_prompt(
         ]
         complete_system_prompt += (
             '\nTools are available below. If a tool is needed, respond with only a JSON object '
-            'of the form {"tool":"name","arguments":{}}. If no tool is needed or a tool result '
-            'already answers the question, respond with {"answer":"short spoken answer"}. '
-            'Never invent a tool name or tool result.\nAvailable tools: '
+            'of the form {"tool":"name","arguments":{}}. Otherwise, reply directly with the '
+            'short spoken answer and do not wrap it in JSON. Never invent a tool name or tool '
+            'result.\nAvailable tools: '
             f'{json.dumps(tool_data, ensure_ascii=False, separators=(",", ":"))}'
         )
-    if force_answer:
-        complete_system_prompt += (
-            '\nTool use is complete. Return only {"answer":"short spoken answer"}.'
-        )
-
     parts = [
         f'<|im_start|>system\n{complete_system_prompt}\n<|im_end|>\n',
         f'<|im_start|>user\n{transcript.strip()}\n/no_think\n<|im_end|>\n',
@@ -212,10 +213,15 @@ def clean_response(text: str) -> str:
     return cleaned.strip()
 
 
-def completed_sentences(text: str) -> tuple[list[str], str]:
+def completed_sentences(
+    text: str,
+    terminators: str = '.!?',
+) -> tuple[list[str], str]:
+    if not terminators:
+        return [], text
     sentences: list[str] = []
     start = 0
-    for match in re.finditer(r'[.!?](?=\s|$)', text):
+    for match in re.finditer(rf'[{re.escape(terminators)}](?=\s|$)', text):
         sentence = text[start : match.end()].strip()
         if sentence:
             sentences.append(sentence)
@@ -611,9 +617,12 @@ class AssistantUtterance:
         )
 
         if available_tools:
-            response_text = await self._resolve_tools(transcript, available_tools)
-            metrics.LLM_TIME_TO_FIRST_TOKEN.observe(time.perf_counter() - final_at)
-            await self._speak_text(response_text, final_at, send)
+            await self._resolve_tools_and_speak(
+                transcript,
+                available_tools,
+                final_at,
+                send,
+            )
         else:
             await self._stream_and_speak(prompt, final_at, send)
 
@@ -625,14 +634,17 @@ class AssistantUtterance:
         )
         await send({'type': 'response.done'})
 
-    async def _resolve_tools(  # noqa: C901
+    async def _resolve_tools_and_speak(  # noqa: C901
         self,
         transcript: str,
         available_tools: list[ToolDefinition],
-    ) -> str:
+        final_at: float,
+        send: EventSender,
+    ) -> None:
         slot = await self._ensure_slot()
         tools_by_name = {tool.name: tool for tool in available_tools}
         history: list[tuple[str, str]] = []
+        observe_first_token = True
         LOGGER.info(
             'Tool resolution started',
             extra={
@@ -648,12 +660,21 @@ class AssistantUtterance:
                 history,
                 system_prompt=self.system_prompt.read(),
             )
-            raw_response = await self.llm.complete(
+            response_stream = self.llm.stream(
                 prompt,
                 slot,
                 operation='tool_decision',
                 maximum_tokens=self.settings.llm_tool_tokens,
             )
+            raw_response = await self._stream_spoken_or_buffer_json(
+                response_stream,
+                final_at,
+                send,
+                observe_first_token=observe_first_token,
+            )
+            observe_first_token = False
+            if raw_response is None:
+                return
             decision = parse_tool_response(raw_response)
             LOGGER.debug(
                 'Tool decision',
@@ -666,14 +687,17 @@ class AssistantUtterance:
                 },
             )
             if decision is None:
-                return clean_response(raw_response)
+                await self._speak_text(raw_response, final_at, send)
+                return
             answer = decision.get('answer')
             if isinstance(answer, str) and answer.strip():
-                return answer.strip()
+                await self._speak_text(answer, final_at, send)
+                return
             tool_name = decision.get('tool') or decision.get('name')
             arguments = decision.get('arguments', {})
             if not isinstance(tool_name, str) or tool_name not in tools_by_name:
-                return clean_response(raw_response)
+                await self._speak_text(raw_response, final_at, send)
+                return
             if not isinstance(arguments, dict):
                 arguments = {}
             tool = tools_by_name[tool_name]
@@ -692,55 +716,134 @@ class AssistantUtterance:
                 result = json.dumps({'error': 'tool execution failed'})
             history.extend(
                 (
-                    ('assistant', f'{QWEN_ASSISTANT_PREFILL}{json.dumps(decision)}'),
-                    ('tool', json.dumps({'tool': tool.name, 'result': result})),
+                    ('assistant', f'{QWEN_ASSISTANT_PREFILL}{raw_response}'),
+                    (
+                        'tool',
+                        json.dumps(
+                            {'tool': tool.name, 'result': result},
+                            ensure_ascii=False,
+                            separators=(',', ':'),
+                        ),
+                    ),
                 ),
             )
 
+        final_history = [
+            *history,
+            (
+                'user',
+                'No more tools. Reply directly with a short spoken answer, not JSON.',
+            ),
+        ]
         final_prompt = build_prompt(
             transcript,
             available_tools,
-            history,
+            final_history,
             system_prompt=self.system_prompt.read(),
-            force_answer=True,
         )
-        raw_response = await self.llm.complete(
+        response_stream = self.llm.stream(
             final_prompt,
             slot,
             operation='tool_answer',
             maximum_tokens=self.settings.llm_tool_tokens,
         )
+        raw_response = await self._stream_spoken_or_buffer_json(
+            response_stream,
+            final_at,
+            send,
+            observe_first_token=observe_first_token,
+        )
+        if raw_response is None:
+            return
         decision = parse_tool_response(raw_response)
         if decision is not None and isinstance(decision.get('answer'), str):
-            return str(decision['answer']).strip()
-        return clean_response(raw_response)
+            await self._speak_text(str(decision['answer']), final_at, send)
+            return
+        await self._speak_text(raw_response, final_at, send)
 
-    async def _stream_and_speak(  # noqa: C901
+    async def _stream_spoken_or_buffer_json(
+        self,
+        response_stream: AsyncIterator[str],
+        final_at: float,
+        send: EventSender,
+        *,
+        observe_first_token: bool,
+    ) -> str | None:
+        buffered: list[str] = []
+        first_token_pending = observe_first_token
+        async for token in response_stream:
+            if first_token_pending:
+                self._observe_llm_first_token(final_at)
+                first_token_pending = False
+            buffered.append(token)
+            response_prefix = ''.join(buffered).lstrip()
+            if not response_prefix:
+                continue
+            if response_prefix.startswith('{'):
+                buffered.extend(
+                    [remaining_token async for remaining_token in response_stream],
+                )
+                return ''.join(buffered)
+            await self._speak_token_stream(
+                self._prepend_tokens(buffered, response_stream),
+                final_at,
+                send,
+                observe_first_token=False,
+            )
+            return None
+        self._raise_empty_response()
+        return None
+
+    @staticmethod
+    async def _prepend_tokens(
+        buffered: list[str],
+        response_stream: AsyncIterator[str],
+    ) -> AsyncIterator[str]:
+        for token in buffered:
+            yield token
+        async for token in response_stream:
+            yield token
+
+    async def _stream_and_speak(
         self,
         prompt: str,
         final_at: float,
         send: EventSender,
     ) -> None:
+        slot = await self._ensure_slot()
+        await self._speak_token_stream(
+            self.llm.stream(prompt, slot),
+            final_at,
+            send,
+            observe_first_token=True,
+        )
+
+    async def _speak_token_stream(  # noqa: C901
+        self,
+        response_stream: AsyncIterator[str],
+        final_at: float,
+        send: EventSender,
+        *,
+        observe_first_token: bool,
+    ) -> None:
         queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=2)
         tts_task = asyncio.create_task(self._tts_worker(queue, final_at, send))
         parts: list[str] = []
         pending_text = ''
-        first_token = True
+        first_token_pending = observe_first_token
         first_sentence = True
         try:
-            slot = await self._ensure_slot()
-            async for token in self.llm.stream(prompt, slot):
-                if first_token:
-                    first_token_at = time.perf_counter()
-                    metrics.LLM_TIME_TO_FIRST_TOKEN.observe(first_token_at - final_at)
-                    metrics.PIPELINE_SECONDS.labels(stage='llm_first_token').observe(
-                        first_token_at - final_at,
-                    )
-                    first_token = False
+            async for token in response_stream:
+                if first_token_pending:
+                    self._observe_llm_first_token(final_at)
+                    first_token_pending = False
                 parts.append(token)
                 pending_text += token
                 await send({'type': 'response.text.delta', 'delta': token})
-                sentences, pending_text = completed_sentences(pending_text)
+                sentences, pending_text = completed_sentences(
+                    pending_text,
+                    self.settings.tts_sentence_terminators,
+                )
                 for sentence in sentences:
                     if first_sentence:
                         metrics.PIPELINE_SECONDS.labels(stage='llm_first_sentence').observe(
@@ -771,6 +874,14 @@ class AssistantUtterance:
             _ = await asyncio.gather(tts_task, return_exceptions=True)
             raise
 
+    @staticmethod
+    def _observe_llm_first_token(final_at: float) -> None:
+        first_token_at = time.perf_counter()
+        metrics.LLM_TIME_TO_FIRST_TOKEN.observe(first_token_at - final_at)
+        metrics.PIPELINE_SECONDS.labels(stage='llm_first_token').observe(
+            first_token_at - final_at,
+        )
+
     async def _speak_text(  # noqa: C901
         self,
         response_text: str,
@@ -788,7 +899,10 @@ class AssistantUtterance:
         queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=2)
         tts_task = asyncio.create_task(self._tts_worker(queue, final_at, send))
         try:
-            sentences, remainder = completed_sentences(cleaned)
+            sentences, remainder = completed_sentences(
+                cleaned,
+                self.settings.tts_sentence_terminators,
+            )
             for sentence in sentences:
                 await self._queue_or_raise(queue, sentence, tts_task)
             if remainder:

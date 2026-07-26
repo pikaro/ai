@@ -35,6 +35,12 @@ curl -X PATCH http://assistant/config \
   -d '{"llm_cache_warm_min_interval_seconds":0.75,"llm_cache_warm_min_new_characters":5}'
 ```
 
+The assistant also exposes `GET /dashboard`, a small internal configuration
+page for all three services. It displays each current configuration and accepts
+a top-level JSON patch. Assistant changes use its local configuration endpoint;
+STT and TTS changes are proxied to their existing `/config` endpoints, so their
+normal validation, busy rejection, and restart restrictions still apply.
+
 ## Logging
 
 Every application, dependency, and Uvicorn logging record is emitted as one
@@ -71,6 +77,7 @@ logs; failed health checks and all other requests remain visible.
 
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics`
+- `GET /dashboard`
 - `GET /config` and `PATCH /config`
 - `GET /v1/models`
 - `WS /v1/realtime`
@@ -116,11 +123,15 @@ time and closes a concurrent session with code `1013`, so additional configured
 slots cannot introduce concurrent LLM inference. Other clients must not
 concurrently address the assistant's llama.cpp slot.
 
-LLM output is streamed immediately. Complete sentences are sent to TTS while
-the LLM continues decoding, and PCM is streamed to the caller without first
-storing a WAV file. Every completed sentence is synthesized separately. The
-assistant stitches the resulting PCM streams with a short silence and linear
-fades at sentence boundaries; configure these with
+LLM output is streamed immediately. For tool-aware responses, leading
+whitespace is ignored while classifying the first output character: `{` buffers
+a JSON tool request for validation and execution, while any other character
+starts the spoken-answer stream. Complete sentences are sent to TTS while the
+LLM continues decoding, and PCM is streamed to the caller without first storing
+a WAV file. Every completed sentence is synthesized separately. Configure the
+sentence-ending character set with `tts_sentence_terminators` (`.!?` by
+default). The assistant stitches the resulting PCM streams with a short silence
+and linear fades at sentence boundaries; configure these with
 `tts_sentence_pause_seconds` and `tts_sentence_crossfade_seconds`, or the
 corresponding `ASSISTANT_` environment variables. Set either duration to zero
 to disable that part of the transition.
@@ -156,15 +167,17 @@ runs concurrently across enabled servers, and is cached for the process
 lifetime. An unavailable optional server does not make assistant readiness
 fail; discovery is retried after its configured interval.
 
-Tool requests use one or more non-streaming `tool_decision` LLM operations. If
-the configured tool-iteration limit is exhausted, a final `tool_answer`
-operation forces a spoken answer. INFO records include the duration of each LLM,
-local tool, and MCP operation. DEBUG records include the corresponding request
-and response data, making it possible to distinguish model-generation latency
-from tool execution latency. Because the catalog is always present, normal
-answers also pass through the non-streaming JSON tool-decision operation; this
-keeps tool choice entirely with the model but delays TTS until that operation
-completes.
+Tool decisions use the same streamed LLM operation as spoken answers. JSON is
+buffered only when the response begins with `{`; ordinary text reaches sentence
+TTS without waiting for the complete answer. Subsequent tool iterations keep
+the system prompt and catalog unchanged, replay the model's generated tool JSON
+exactly so llama.cpp can reuse that KV suffix, and append compact tool-result
+JSON afterward. If the configured tool-iteration limit is exhausted, the
+instruction to produce a final spoken answer is appended as conversation
+history rather than changing the system prompt. INFO records include the
+duration of each LLM, local tool, and MCP operation. DEBUG records include the
+corresponding request and response data, making it possible to distinguish
+model-generation latency from tool execution latency.
 
 Set `ASSISTANT_CONFIG_FILE=/config/assistant.yaml` (or `.yml` / `.json`) to load
 a mounted configuration file. Initialization arguments and `ASSISTANT_`

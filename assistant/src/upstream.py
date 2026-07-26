@@ -162,18 +162,25 @@ class LlmClient:
                 },
             )
 
-    async def stream(self, prompt: str, slot: int) -> AsyncGenerator[str]:  # noqa: C901
+    async def stream(  # noqa: C901
+        self,
+        prompt: str,
+        slot: int,
+        *,
+        operation: str = 'generation',
+        maximum_tokens: int | None = None,
+    ) -> AsyncGenerator[str]:
         started = time.perf_counter()
         outcome = 'success'
         error_type: str | None = None
         final_data: dict[str, Any] = {}
         first_token = True
-        operation = 'generation'
+        token_limit = self.settings.llm_max_tokens if maximum_tokens is None else maximum_tokens
         url = f'{self.settings.llm_base_url.rstrip("/")}/completion'
         payload = self._payload(
             prompt,
             slot,
-            maximum_tokens=self.settings.llm_max_tokens,
+            maximum_tokens=token_limit,
             stream=True,
         )
         LOGGER.info(
@@ -184,7 +191,7 @@ class LlmClient:
                 'slot': slot,
                 'stream': True,
                 'prompt_characters': len(prompt),
-                'maximum_tokens': self.settings.llm_max_tokens,
+                'maximum_tokens': token_limit,
             },
         )
         LOGGER.debug(

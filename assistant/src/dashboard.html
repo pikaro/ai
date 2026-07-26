@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI service configuration</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #111827;
+      color: #e5e7eb;
+    }
+
+    body {
+      margin: 0 auto;
+      max-width: 1500px;
+      padding: 24px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font: 600 24px system-ui, sans-serif;
+    }
+
+    .hint {
+      margin: 0 0 24px;
+      color: #9ca3af;
+      font: 14px system-ui, sans-serif;
+    }
+
+    .services {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 16px;
+    }
+
+    .service {
+      min-width: 0;
+      padding: 16px;
+      border: 1px solid #374151;
+      border-radius: 8px;
+      background: #1f2937;
+    }
+
+    .service header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    h2 {
+      margin: 0;
+      font: 600 18px system-ui, sans-serif;
+      text-transform: uppercase;
+    }
+
+    .status {
+      color: #9ca3af;
+      font: 13px system-ui, sans-serif;
+    }
+
+    pre,
+    textarea {
+      box-sizing: border-box;
+      width: 100%;
+      border: 1px solid #4b5563;
+      border-radius: 5px;
+      background: #111827;
+      color: #e5e7eb;
+      font: inherit;
+      line-height: 1.4;
+    }
+
+    pre {
+      min-height: 280px;
+      max-height: 55vh;
+      margin: 0 0 14px;
+      padding: 12px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 6px;
+      color: #d1d5db;
+      font: 600 13px system-ui, sans-serif;
+    }
+
+    textarea {
+      min-height: 110px;
+      padding: 10px;
+      resize: vertical;
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    button {
+      padding: 7px 12px;
+      border: 1px solid #6b7280;
+      border-radius: 5px;
+      background: #374151;
+      color: #f9fafb;
+      cursor: pointer;
+      font: 600 13px system-ui, sans-serif;
+    }
+
+    button.primary {
+      border-color: #2563eb;
+      background: #2563eb;
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.6;
+    }
+
+    .result {
+      min-height: 18px;
+      margin-top: 10px;
+      color: #9ca3af;
+      font: 13px system-ui, sans-serif;
+      white-space: pre-wrap;
+    }
+
+    .result.error {
+      color: #fca5a5;
+    }
+  </style>
+</head>
+<body>
+  <h1>AI service configuration</h1>
+  <p class="hint">
+    Changes are validated by each service and remain in memory only. Enter a top-level JSON
+    object containing just the fields to change.
+  </p>
+
+  <main class="services">
+    <section class="service" data-service="assistant">
+      <header><h2>Assistant</h2><span class="status">Loading…</span></header>
+      <pre class="current">Loading…</pre>
+      <label for="assistant-patch">PATCH body</label>
+      <textarea id="assistant-patch" class="patch" spellcheck="false">{}</textarea>
+      <div class="actions">
+        <button class="primary apply" type="button">Apply PATCH</button>
+        <button class="reload" type="button">Reload</button>
+      </div>
+      <div class="result" role="status" aria-live="polite"></div>
+    </section>
+
+    <section class="service" data-service="stt">
+      <header><h2>STT</h2><span class="status">Loading…</span></header>
+      <pre class="current">Loading…</pre>
+      <label for="stt-patch">PATCH body</label>
+      <textarea id="stt-patch" class="patch" spellcheck="false">{}</textarea>
+      <div class="actions">
+        <button class="primary apply" type="button">Apply PATCH</button>
+        <button class="reload" type="button">Reload</button>
+      </div>
+      <div class="result" role="status" aria-live="polite"></div>
+    </section>
+
+    <section class="service" data-service="tts">
+      <header><h2>TTS</h2><span class="status">Loading…</span></header>
+      <pre class="current">Loading…</pre>
+      <label for="tts-patch">PATCH body</label>
+      <textarea id="tts-patch" class="patch" spellcheck="false">{}</textarea>
+      <div class="actions">
+        <button class="primary apply" type="button">Apply PATCH</button>
+        <button class="reload" type="button">Reload</button>
+      </div>
+      <div class="result" role="status" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <script>
+    'use strict';
+
+    const endpoint = service => `/dashboard/config/${service}`;
+
+    async function responseBody(response) {
+      const text = await response.text();
+      if (!text) return null;
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
+    }
+
+    async function loadConfiguration(card) {
+      const service = card.dataset.service;
+      const status = card.querySelector('.status');
+      const current = card.querySelector('.current');
+      status.textContent = 'Loading…';
+      try {
+        const response = await fetch(endpoint(service), {
+          headers: {Accept: 'application/json'},
+        });
+        const body = await responseBody(response);
+        if (!response.ok) {
+          throw new Error(`${response.status} ${JSON.stringify(body)}`);
+        }
+        current.textContent = JSON.stringify(body, null, 2);
+        status.textContent = 'Loaded';
+      } catch (error) {
+        current.textContent = String(error);
+        status.textContent = 'Unavailable';
+      }
+    }
+
+    async function applyPatch(card) {
+      const service = card.dataset.service;
+      const editor = card.querySelector('.patch');
+      const result = card.querySelector('.result');
+      const buttons = card.querySelectorAll('button');
+      result.classList.remove('error');
+
+      let patch;
+      try {
+        patch = JSON.parse(editor.value);
+        if (patch === null || Array.isArray(patch) || typeof patch !== 'object') {
+          throw new Error('PATCH body must be a JSON object');
+        }
+      } catch (error) {
+        result.textContent = String(error);
+        result.classList.add('error');
+        return;
+      }
+
+      buttons.forEach(button => { button.disabled = true; });
+      try {
+        const response = await fetch(endpoint(service), {
+          method: 'PATCH',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(patch),
+        });
+        const body = await responseBody(response);
+        result.textContent = `${response.status} ${JSON.stringify(body, null, 2)}`;
+        result.classList.toggle('error', !response.ok);
+        if (response.ok) {
+          editor.value = '{}';
+          await loadConfiguration(card);
+        }
+      } catch (error) {
+        result.textContent = String(error);
+        result.classList.add('error');
+      } finally {
+        buttons.forEach(button => { button.disabled = false; });
+      }
+    }
+
+    document.querySelectorAll('.service').forEach(card => {
+      card.querySelector('.apply').addEventListener('click', () => applyPatch(card));
+      card.querySelector('.reload').addEventListener('click', () => loadConfiguration(card));
+      loadConfiguration(card);
+    });
+  </script>
+</body>
+</html>
