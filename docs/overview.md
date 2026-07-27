@@ -315,17 +315,26 @@ clause. `pipeline_clause_pause_seconds` (40 ms by default) and
 `pipeline_sentence_pause_seconds` (120 ms by default) specify the target total
 silence at each join. Model-generated trailing silence counts toward that
 target; excess trailing silence and leading silence from the next segment are
-removed while voiced PCM continues streaming immediately. Silence is detected
-in short frames using `pipeline_silence_threshold_dbfs`; configure how long a
-candidate must remain silent with `pipeline_silence_confirmation_seconds`.
-Linear boundary fades are configured with
+removed while voiced PCM continues streaming immediately. Detection uses
+short-frame RMS rather than peak amplitude. `pipeline_silence_threshold_dbfs`
+defaults to -43 dBFS and is the configurable voice/noise-floor boundary.
+`pipeline_speech_hysteresis_db` (6 dB by default) places the speech-resume
+threshold above it, and `pipeline_speech_confirmation_seconds` (40 ms by
+default) requires sustained speech before leaving silence.
+`pipeline_silence_confirmation_seconds` controls when silence becomes a tail
+candidate. Linear boundary fades are configured with
 `pipeline_sentence_crossfade_seconds`.
 
-The stitcher assumes synthesis stays ahead of playback. It logs a warning when
-the current sample end, next segment, or next voiced frame misses the projected
-playback deadline. Voiced audio after silence clipping logs an error because
-the candidate tail was actually an internal pause. The corresponding
-environment variables are prefixed with `TTS_`, for example
+Tail candidates remain reversible: if sustained speech resumes while synthesis
+is ahead of playback, the candidate is emitted unchanged as an internal pause.
+Irreversible clipping occurs only when model EOF confirms the terminal tail, or
+when playback reaches the candidate before EOF is available. The latter logs a
+warning and continued sustained speech then logs an error. The stitcher also
+warns when the next segment or its first voiced frame misses the projected
+playback deadline. Detection and confirmation buffers do not add PCM silence,
+so setting clause pause, sentence pause, and crossfade to zero produces no
+configured transition floor. The corresponding environment variables are
+prefixed with `TTS_`, for example
 `TTS_PIPELINE_FIRST_SEGMENT_COMMA_DELIMITER=false`. Set any transition duration
 to zero to disable that component.
 

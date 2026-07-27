@@ -45,6 +45,8 @@ class SettingsTest(unittest.TestCase):
             'TTS_PIPELINE_SENTENCE_TERMINATORS': '.!?;',
             'TTS_PIPELINE_SILENCE_CONFIRMATION_SECONDS': '0.01',
             'TTS_PIPELINE_SILENCE_THRESHOLD_DBFS': '-45',
+            'TTS_PIPELINE_SPEECH_CONFIRMATION_SECONDS': '0.03',
+            'TTS_PIPELINE_SPEECH_HYSTERESIS_DB': '8',
             'TTS_SAVE_LATEST_WAV': 'true',
             'TTS_VOICE': 'juergen',
         }
@@ -65,6 +67,8 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.pipeline_sentence_terminators, '.!?;')
         self.assertEqual(settings.pipeline_silence_confirmation_seconds, 0.01)
         self.assertEqual(settings.pipeline_silence_threshold_dbfs, -45)
+        self.assertEqual(settings.pipeline_speech_confirmation_seconds, 0.03)
+        self.assertEqual(settings.pipeline_speech_hysteresis_db, 8)
         self.assertTrue(settings.save_latest_wav)
         self.assertEqual(settings.voice, 'juergen')
         self.assertEqual(settings.data_directory, Path('/voices'))
@@ -290,6 +294,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_clause_pause_seconds=0.02,
                 pipeline_sentence_crossfade_seconds=0,
                 pipeline_silence_confirmation_seconds=0.01,
+                pipeline_speech_confirmation_seconds=0.01,
             ),
         )
         cast('MagicMock', runtime.model).sample_rate = 1_000
@@ -322,6 +327,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_clause_pause_seconds=0.02,
                 pipeline_sentence_crossfade_seconds=0,
                 pipeline_silence_confirmation_seconds=0.02,
+                pipeline_speech_confirmation_seconds=0.01,
             ),
         )
         cast('MagicMock', runtime.model).sample_rate = 1_000
@@ -344,12 +350,139 @@ class PipelineTest(unittest.TestCase):
             (*([1_000] * 20), *([0] * 20), *([2_000] * 20)),
         )
 
+    def test_zero_transitions_remove_low_level_tail_and_next_leading_noise(self) -> None:
+        runtime = self.runtime(
+            Settings(
+                pipeline_clause_pause_seconds=0,
+                pipeline_sentence_crossfade_seconds=0,
+                pipeline_sentence_pause_seconds=0,
+                pipeline_silence_confirmation_seconds=0.01,
+                pipeline_speech_confirmation_seconds=0.02,
+            ),
+        )
+        cast('MagicMock', runtime.model).sample_rate = 1_000
+
+        def generate(_voice: object, text: str) -> object:
+            if text == 'Yes,':
+                return iter(
+                    [
+                        struct.pack('<30h', *([1_000] * 30)) + struct.pack('<100h', *([200] * 100)),
+                    ],
+                )
+            return iter(
+                [
+                    struct.pack('<80h', *([200] * 80)) + struct.pack('<30h', *([2_000] * 30)),
+                ],
+            )
+
+        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = generate
+        with (
+            patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+            patch('tts.src.main.time.perf_counter', return_value=0.0),
+            self.assertNoLogs('tts', level='WARNING'),
+        ):
+            pcm = b''.join(runtime.stream_pipeline_pcm('Yes, Next.', 'alba'))
+
+        self.assertEqual(
+            struct.unpack(f'<{len(pcm) // 2}h', pcm),
+            (*([1_000] * 30), *([2_000] * 30)),
+        )
+
+    def test_silence_threshold_is_tunable_for_a_voice_noise_floor(self) -> None:
+        audio = struct.pack('<30h', *([1_000] * 30)) + struct.pack(
+            '<30h',
+            *([200] * 30),
+        )
+
+        def synthesize(threshold_dbfs: float) -> tuple[int, ...]:
+            runtime = self.runtime(
+                Settings(
+                    pipeline_sentence_crossfade_seconds=0,
+                    pipeline_sentence_pause_seconds=0,
+                    pipeline_silence_threshold_dbfs=threshold_dbfs,
+                    pipeline_speech_confirmation_seconds=0.02,
+                ),
+            )
+            cast('MagicMock', runtime.model).sample_rate = 1_000
+            cast('MagicMock', runtime.model).generate_audio_stream.side_effect = (
+                lambda _voice, _text: iter([audio])
+            )
+            with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+                pcm = b''.join(runtime.stream_pipeline_pcm('Yes.', 'alba'))
+            return struct.unpack(f'<{len(pcm) // 2}h', pcm)
+
+        self.assertEqual(
+            synthesize(-50),
+            (*([1_000] * 30), *([200] * 30)),
+        )
+        self.assertEqual(synthesize(-40), (*([1_000] * 30),))
+
+    def test_speech_hysteresis_ignores_short_noise_islands(self) -> None:
+        runtime = self.runtime(
+            Settings(
+                pipeline_sentence_crossfade_seconds=0,
+                pipeline_sentence_pause_seconds=0,
+                pipeline_silence_confirmation_seconds=0.01,
+                pipeline_speech_confirmation_seconds=0.02,
+            ),
+        )
+        cast('MagicMock', runtime.model).sample_rate = 1_000
+        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = lambda _voice, _text: (
+            iter(
+                [
+                    struct.pack('<30h', *([1_000] * 30))
+                    + struct.pack('<20h', *([0] * 20))
+                    + struct.pack('<10h', *([1_000] * 10))
+                    + struct.pack('<30h', *([0] * 30)),
+                ],
+            )
+        )
+
+        with (
+            patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+            patch('tts.src.main.time.perf_counter', return_value=0.0),
+            self.assertNoLogs('tts', level='WARNING'),
+        ):
+            pcm = b''.join(runtime.stream_pipeline_pcm('Yes.', 'alba'))
+
+        self.assertEqual(
+            struct.unpack(f'<{len(pcm) // 2}h', pcm),
+            (*([1_000] * 30),),
+        )
+
+    def test_speech_hysteresis_does_not_latch_short_startup_noise(self) -> None:
+        runtime = self.runtime(
+            Settings(
+                pipeline_sentence_crossfade_seconds=0,
+                pipeline_speech_confirmation_seconds=0.02,
+            ),
+        )
+        cast('MagicMock', runtime.model).sample_rate = 1_000
+        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = lambda _voice, _text: (
+            iter(
+                [
+                    struct.pack('<10h', *([1_000] * 10))
+                    + struct.pack('<500h', *([0] * 500))
+                    + struct.pack('<30h', *([2_000] * 30)),
+                ],
+            )
+        )
+
+        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            pcm = b''.join(runtime.stream_pipeline_pcm('Yes.', 'alba'))
+
+        self.assertEqual(
+            struct.unpack(f'<{len(pcm) // 2}h', pcm),
+            (*([2_000] * 30),),
+        )
+
     def test_voiced_audio_after_late_clipping_logs_warning_and_error(self) -> None:
         runtime = self.runtime(
             Settings(
                 pipeline_clause_pause_seconds=0,
                 pipeline_sentence_crossfade_seconds=0,
                 pipeline_silence_confirmation_seconds=0.01,
+                pipeline_speech_confirmation_seconds=0.01,
             ),
         )
         cast('MagicMock', runtime.model).sample_rate = 1_000
@@ -375,15 +508,24 @@ class PipelineTest(unittest.TestCase):
             _ = b''.join(runtime.stream_pipeline_pcm('Foobar yes, Next.', 'alba'))
 
         event_ids = [getattr(record, 'event_id', None) for record in captured.records]
-        self.assertIn('ID_tts_pipeline_stitch_lookahead_warning', event_ids)
-        self.assertIn('ID_tts_pipeline_stitch_false_tail', event_ids)
+        self.assertEqual(event_ids.count('ID_tts_pipeline_stitch_false_tail'), 1)
+        sample_end_warnings = [
+            record
+            for record in captured.records
+            if getattr(record, 'reason', None) == 'sample_end_unavailable'
+        ]
+        self.assertEqual(len(sample_end_warnings), 1)
+        self.assertTrue(
+            getattr(sample_end_warnings[0], 'speculative_tail_cut', False),
+        )
 
-    def test_voiced_audio_after_clipping_with_lookahead_logs_only_error(self) -> None:
+    def test_internal_silence_with_lookahead_is_preserved_without_error(self) -> None:
         runtime = self.runtime(
             Settings(
                 pipeline_clause_pause_seconds=0,
                 pipeline_sentence_crossfade_seconds=0,
                 pipeline_silence_confirmation_seconds=0.01,
+                pipeline_speech_confirmation_seconds=0.01,
             ),
         )
         cast('MagicMock', runtime.model).sample_rate = 1_000
@@ -403,12 +545,14 @@ class PipelineTest(unittest.TestCase):
         with (
             patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
             patch('tts.src.main.time.perf_counter', return_value=0.0),
-            self.assertLogs('tts', level='ERROR') as captured,
+            self.assertNoLogs('tts', level='WARNING'),
         ):
-            _ = b''.join(runtime.stream_pipeline_pcm('Foobar yes, Next.', 'alba'))
+            pcm = b''.join(runtime.stream_pipeline_pcm('Foobar yes, Next.', 'alba'))
 
-        event_ids = [getattr(record, 'event_id', None) for record in captured.records]
-        self.assertEqual(event_ids, ['ID_tts_pipeline_stitch_false_tail'])
+        self.assertEqual(
+            struct.unpack(f'<{len(pcm) // 2}h', pcm)[:70],
+            (*([1_000] * 20), *([0] * 30), *([1_000] * 20)),
+        )
 
     def test_long_terminal_silence_completed_with_lookahead_does_not_warn(self) -> None:
         runtime = self.runtime(
@@ -416,6 +560,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_clause_pause_seconds=0,
                 pipeline_sentence_crossfade_seconds=0,
                 pipeline_silence_confirmation_seconds=0.01,
+                pipeline_speech_confirmation_seconds=0.01,
             ),
         )
         cast('MagicMock', runtime.model).sample_rate = 1_000
@@ -443,6 +588,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_clause_pause_seconds=0,
                 pipeline_sentence_crossfade_seconds=0,
                 pipeline_silence_confirmation_seconds=0.01,
+                pipeline_speech_confirmation_seconds=0.01,
             ),
         )
         cast('MagicMock', runtime.model).sample_rate = 1_000
@@ -926,6 +1072,7 @@ class LatestWavTest(unittest.TestCase):
                     save_latest_wav=True,
                     latest_wav_path=destination,
                     pipeline_sentence_crossfade_seconds=0,
+                    pipeline_speech_confirmation_seconds=1 / 24_000,
                 ),
             )
             runtime.model = MagicMock(sample_rate=24_000)
