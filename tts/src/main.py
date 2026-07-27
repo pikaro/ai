@@ -202,23 +202,26 @@ class _TextSegmenter:
         self.pending = ''
         self.first_segment = True
 
-    def append(self, text: str) -> list[str]:
+    def append(self, text: str) -> list[tuple[str, Literal['clause', 'sentence', 'input_end']]]:
         self.pending += text
-        segments: list[str] = []
+        segments: list[tuple[str, Literal['clause', 'sentence', 'input_end']]] = []
         while match := self._next_boundary():
             segment = self.pending[: match.end()].strip()
             self.pending = self.pending[match.end() :].lstrip()
             if segment:
-                segments.append(segment)
+                boundary: Literal['clause', 'sentence', 'input_end'] = (
+                    'clause' if match.group() == ',' else 'sentence'
+                )
+                segments.append((segment, boundary))
                 self.first_segment = False
         return segments
 
-    def finish(self) -> list[str]:
+    def finish(self) -> list[tuple[str, Literal['clause', 'sentence', 'input_end']]]:
         segments = self.append('')
         tail = self.pending.strip()
         self.pending = ''
         if tail:
-            segments.append(tail)
+            segments.append((tail, 'input_end'))
             self.first_segment = False
         return segments
 
@@ -334,6 +337,7 @@ class Settings(BaseSettings):
     torch_threads: int = Field(default=2, ge=1)
     maximum_input_characters: int = Field(default=4_000, ge=1)
     maximum_voice_upload_bytes: int = Field(default=100 * 1024**2, ge=1)
+    pipeline_clause_pause_seconds: float = Field(default=0.04, ge=0, le=2)
     pipeline_sentence_pause_seconds: float = Field(default=0.12, ge=0, le=2)
     pipeline_sentence_crossfade_seconds: float = Field(default=0.01, ge=0, le=0.25)
     pipeline_sentence_terminators: str = Field(default='.!?', min_length=1)
@@ -720,8 +724,8 @@ class TtsRuntime:
         )
         completed = False
         try:
-            for segment in segments:
-                yield from pipeline.add_segment(segment)
+            for segment, boundary in segments:
+                yield from pipeline.add_segment(segment, boundary)
             yield from pipeline.finish()
             completed = True
         finally:
@@ -896,11 +900,16 @@ class _PcmPipeline:
         self.capture_attempted = False
         self.capture: _AtomicWavWriter | None = None
         self.pending: _SentencePcmBuffer | None = None
+        self.last_audio_boundary: Literal['clause', 'sentence', 'input_end'] | None = None
         self.previous_segment_had_audio = False
         self.output_bytes = 0
         self.closed = False
 
-    def add_segment(self, text: str) -> Generator[bytes, None, None]:  # noqa: C901
+    def add_segment(  # noqa: C901
+        self,
+        text: str,
+        boundary: Literal['clause', 'sentence', 'input_end'],
+    ) -> Generator[bytes, None, None]:
         if self.pending is not None:
             tail = self.pending.finish(fade_out=True)
             self.pending = None
@@ -908,6 +917,13 @@ class _PcmPipeline:
             if tail:
                 yield self._capture(tail)
 
+        pause_seconds = 0.0
+        if self.previous_segment_had_audio:
+            pause_seconds = (
+                self.runtime.settings.pipeline_clause_pause_seconds
+                if self.last_audio_boundary == 'clause'
+                else self.runtime.settings.pipeline_sentence_pause_seconds
+            )
         PIPELINE_SEGMENTS.labels(transport=self.transport).inc()
         LOGGER.info(
             'TTS pipeline segment requested',
@@ -915,6 +931,8 @@ class _PcmPipeline:
                 'event_id': 'ID_tts_pipeline_segment_requested',
                 'transport': self.transport,
                 'characters': len(text),
+                'boundary': boundary,
+                'pause_before_seconds': pause_seconds,
             },
         )
         LOGGER.debug(
@@ -936,7 +954,7 @@ class _PcmPipeline:
                 )
                 if self.previous_segment_had_audio:
                     pause_frames = _duration_frames(
-                        self.runtime.settings.pipeline_sentence_pause_seconds,
+                        pause_seconds,
                         self.sample_rate,
                     )
                     if pause_frames:
@@ -945,6 +963,8 @@ class _PcmPipeline:
             if output:
                 yield self._capture(output)
         self.pending = segment
+        if segment is not None:
+            self.last_audio_boundary = boundary
 
     def finish(self) -> Generator[bytes, None, None]:
         if self.pending is None:
@@ -1295,8 +1315,8 @@ async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
 
             if pipeline is None or sender is None:
                 continue
-            for segment in segments:
-                await sender.send(pipeline.add_segment(segment))
+            for segment, boundary in segments:
+                await sender.send(pipeline.add_segment(segment, boundary))
 
         if pipeline is None or sender is None:
             _raise_empty_pipeline()

@@ -37,6 +37,7 @@ class SettingsTest(unittest.TestCase):
             'TTS_LATEST_WAV_PATH': '/recordings/latest.wav',
             'TTS_MAXIMUM_INPUT_CHARACTERS': '120',
             'TTS_MAXIMUM_VOICE_UPLOAD_BYTES': '2048',
+            'TTS_PIPELINE_CLAUSE_PAUSE_SECONDS': '0.04',
             'TTS_PIPELINE_FIRST_SEGMENT_COMMA_DELIMITER': 'false',
             'TTS_PIPELINE_IDLE_TIMEOUT_SECONDS': '15',
             'TTS_PIPELINE_SENTENCE_CROSSFADE_SECONDS': '0.02',
@@ -54,6 +55,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.latest_wav_path, Path('/recordings/latest.wav'))
         self.assertEqual(settings.maximum_input_characters, 120)
         self.assertEqual(settings.maximum_voice_upload_bytes, 2048)
+        self.assertEqual(settings.pipeline_clause_pause_seconds, 0.04)
         self.assertFalse(settings.pipeline_first_segment_comma_delimiter)
         self.assertEqual(settings.pipeline_idle_timeout_seconds, 15)
         self.assertEqual(settings.pipeline_sentence_crossfade_seconds, 0.02)
@@ -237,6 +239,43 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(
             requested_text,
             ['First clause,', 'rest of sentence.', 'Second clause, remains intact.'],
+        )
+
+    def test_clause_and_sentence_boundaries_use_separate_pauses(self) -> None:
+        runtime = self.runtime(
+            Settings(
+                pipeline_clause_pause_seconds=1 / 24_000,
+                pipeline_sentence_pause_seconds=2 / 24_000,
+                pipeline_sentence_crossfade_seconds=0,
+            ),
+        )
+        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            pcm = b''.join(
+                runtime.stream_pipeline_pcm(
+                    'Yes, I can hear you. How can I help?',
+                    'alba',
+                ),
+            )
+
+        self.assertEqual(
+            struct.unpack(f'<{len(pcm) // 2}h', pcm),
+            (
+                1_000,
+                1_000,
+                1_000,
+                1_000,
+                0,
+                1_000,
+                1_000,
+                1_000,
+                1_000,
+                0,
+                0,
+                1_000,
+                1_000,
+                1_000,
+                1_000,
+            ),
         )
 
     def test_first_comma_delimiter_can_be_disabled(self) -> None:
@@ -491,6 +530,7 @@ class PipelineWebSocketTest(unittest.IsolatedAsyncioTestCase):
     async def test_incremental_text_produces_audio_before_input_done(self) -> None:  # noqa: C901
         runtime = TtsRuntime(
             Settings(
+                pipeline_clause_pause_seconds=0,
                 pipeline_sentence_crossfade_seconds=0,
                 pipeline_sentence_pause_seconds=0,
             ),

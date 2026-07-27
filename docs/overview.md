@@ -311,12 +311,13 @@ Pipeline text normally splits on `.!?`. Configure this with
 `pipeline_sentence_terminators`. With
 `pipeline_first_segment_comma_delimiter=true`, the default, a comma may
 additionally finish only the first segment so audio can begin with the opening
-clause. TTS inserts a short silence and linear fades between synthesized
-segments; configure these with `pipeline_sentence_pause_seconds` and
-`pipeline_sentence_crossfade_seconds`. The corresponding environment variables
-are prefixed with `TTS_`, for example
-`TTS_PIPELINE_FIRST_SEGMENT_COMMA_DELIMITER=false`. Set either duration to zero
-to disable that transition component.
+clause. TTS inserts separate short silences after a clause and after a sentence;
+configure these with `pipeline_clause_pause_seconds` (40 ms by default) and
+`pipeline_sentence_pause_seconds` (120 ms by default). Linear boundary fades are
+configured with `pipeline_sentence_crossfade_seconds`. The corresponding
+environment variables are prefixed with `TTS_`, for example
+`TTS_PIPELINE_FIRST_SEGMENT_COMMA_DELIMITER=false`. Set any transition duration
+to zero to disable that component.
 
 Set `TTS_SAVE_LATEST_WAV=true` to atomically overwrite the most recently
 completed synthesized recording. `TTS_LATEST_WAV_PATH` defaults to
