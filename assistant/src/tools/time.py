@@ -86,7 +86,7 @@ TOOL = ToolDefinition(
             'timezone': {
                 'type': 'string',
                 'description': 'Optional IANA timezone such as Europe/Berlin.',
-                'defaut': 'Europe/Berlin',
+                'default': 'Europe/Berlin',
             },
         },
         'additionalProperties': False,

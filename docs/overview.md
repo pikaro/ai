@@ -43,9 +43,14 @@ proxied to their existing `/config` endpoints, so their normal validation, busy
 rejection, and restart restrictions still apply. The dashboard also edits the
 assistant system prompt. Its audio debug controls record mono PCM16 at the
 browser's actual audio-context sample rate and can submit those exact bytes to
-STT or the assistant realtime endpoint. Assistant PCM responses and WAV files
-requested from TTS can be played in the browser. Browser microphone access
-requires a secure context, such as HTTPS or localhost.
+STT or the assistant realtime endpoint. The TTS debug form selects a voice,
+toggles the server-side pipeline, and requests either WAV or PCM. PCM stays
+streamed through the dashboard proxy and is scheduled through the browser audio
+context as chunks arrive. A small playback-ahead bound propagates backpressure
+instead of buffering an arbitrary response. The page reports first-chunk and
+completion timing, then adds a WAV container locally for replay. Assistant PCM
+responses and TTS audio can therefore both be played in the browser. Browser
+microphone access requires a secure context, such as HTTPS or localhost.
 
 ## Logging
 
@@ -104,25 +109,35 @@ sample rate, sample width, and channel count. If STT produces an empty
 transcript, the assistant emits no response event and closes with WebSocket code
 1008 so clients can treat the empty utterance as an expected outcome.
 
-Stable STT word deltas feed a latest-wins llama.cpp cache warmer using
-`cache_prompt=true`. At most one warm is active and only one pending transcript
-is retained; a newer partial replaces that pending value. The STT receive loop
-never waits for a partial warm. On final transcription the pending partial is
-dropped, the one active warm is allowed to finish, and the generation request
-itself evaluates any remaining prompt suffix. No speculative LLM requests run
-concurrently and no partially cancelled cache state is assumed to be reusable.
+Before the application starts serving, it discovers the tool catalog and warms
+every configured llama.cpp slot with the immutable system/tool prefix. Startup
+does not complete until these requests succeed, so this warm also gates
+readiness.
 
-The prompt starts with the user-editable system prompt followed by the complete,
-deterministically sorted tool catalog. The current transcript follows that
-stable prefix, so ordinary command changes preserve the system and tool KV
-cache. On startup the assistant creates `/tmp/system-prompt` with the default
-prompt if the file is absent. It checks the configured `system_prompt_path`
-before each prompt build and reloads a stable file revision after an in-place
-edit or atomic replacement. `GET /system-prompt` returns the active text and
-`PUT /system-prompt` atomically replaces it; updates are rejected while the
-assistant is busy. Existing contents are never overwritten during startup.
-`/tmp` is ephemeral across pod replacement; configure a mounted path when edits
-must persist.
+Stable STT word deltas feed a latest-wins llama.cpp cache warmer using
+`cache_prompt=true`. Warm requests end immediately after the stable transcript
+prefix. They intentionally omit the closing user marker and assistant
+generation marker because each transcript extension would move and invalidate
+that otherwise immutable suffix. At most one warm is active and only one pending
+transcript is retained; a newer partial replaces that pending value. The STT
+receive loop never waits for a partial warm. On final transcription the pending
+partial is dropped, the one active warm is allowed to finish, and the generation
+request appends and evaluates the final chat suffix. No speculative LLM requests
+run concurrently and no partially cancelled cache state is assumed to be
+reusable.
+
+The prompt uses the non-thinking Qwen3 Instruct chat format. It starts with the
+user-editable system prompt followed by the complete, deterministically sorted
+tool catalog; it does not add `/no_think` or `<think>` prefill tokens. The
+current transcript follows that stable prefix, so ordinary command changes
+preserve the system and tool KV cache. On startup the assistant creates
+`/tmp/system-prompt` with the default prompt if the file is absent. It checks
+the configured `system_prompt_path` before each prompt build and reloads a
+stable file revision after an in-place edit or atomic replacement. `GET
+/system-prompt` returns the active text and `PUT /system-prompt` atomically
+replaces it; updates are rejected while the assistant is busy. Existing
+contents are never overwritten during startup. `/tmp` is ephemeral across pod
+replacement; configure a mounted path when edits must persist.
 
 Set `llm_cache_warm_enabled` to disable incremental warming,
 `llm_cache_warm_min_interval_seconds` to limit warm start frequency, and
@@ -136,25 +151,12 @@ concurrently address the assistant's llama.cpp slot.
 LLM output is streamed immediately. For tool-aware responses, leading
 whitespace is ignored while classifying the first output character: `{` buffers
 a JSON tool request for validation and execution, while any other character
-starts the spoken-answer stream. Complete sentences are sent to TTS while the
-LLM continues decoding, and PCM is streamed to the caller without first storing
-a WAV file. Every completed sentence is synthesized separately. Configure the
-sentence-ending character set with `tts_sentence_terminators` (`.!?` by
-default). The assistant stitches the resulting PCM streams with a short silence
-and linear fades at sentence boundaries; configure these with
-`tts_sentence_pause_seconds` and `tts_sentence_crossfade_seconds`, or the
-corresponding `ASSISTANT_` environment variables. Set either duration to zero
-to disable that part of the transition.
-
-Set `ASSISTANT_SAVE_LATEST_WAV=true` to atomically overwrite the most recently
-completed WebSocket response recording. `ASSISTANT_LATEST_WAV_PATH` defaults to
-`/tmp/latest.wav`; point it at mounted storage when the recording must survive a
-pod replacement. The saved WAV frame data is the exact concatenation, in send
-order, of the PCM bytes in the response's successfully emitted
-`response.audio.delta` events. It therefore includes the assistant's sentence
-fades and inserted silence. An interrupted response does not replace the
-previous recording, and capture failures are logged without failing the
-WebSocket response.
+starts the spoken-answer stream. The assistant forwards those text deltas over
+one TTS pipeline WebSocket while continuing LLM decoding, then translates the
+returned binary PCM frames into `response.audio.delta` events. Text and audio
+flow concurrently. Sentence detection, sequential synthesis, pauses, fades, and
+composite WAV capture belong to TTS rather than the assistant orchestration
+layer.
 
 The assistant retires idle pooled upstream HTTP connections after four seconds,
 before the five-second idle timeout used by Uvicorn and llama.cpp. This avoids
@@ -166,14 +168,17 @@ a clean in-cluster connection instead.
 Repo-local tools live in `assistant/src/tools/*.py` and export a
 `ToolDefinition` as `TOOL` (or multiple definitions as `TOOLS`). The included
 `time.py` tool supports `rough` time by default, `exact` time, and `date`, with
-optional IANA timezone selection.
+optional IANA timezone selection. Its catalog declares `rough` and
+`Europe/Berlin` as defaults. The model is instructed to omit arguments that
+match catalog defaults and include only non-default overrides, while the tool
+executor applies the same defaults when fields are absent.
 
 Every repo-local tool and every discovered tool from an enabled MCP server is
 included in the stable prompt prefix. Transcript triggers do not filter or
 whitelist tools. The legacy `triggers` and `tool_triggers` configuration fields
 are accepted for compatibility but ignored. MCP servers use Streamable HTTP by
-default and may opt into legacy SSE. Discovery starts on the first prompt build,
-runs concurrently across enabled servers, and is cached for the process
+default and may opt into legacy SSE. Discovery starts during the startup cache
+warm, runs concurrently across enabled servers, and is cached for the process
 lifetime. An unavailable optional server does not make assistant readiness
 fail; discovery is retried after its configured interval.
 
@@ -213,7 +218,7 @@ TTFT, total/evaluated/cached/generated tokens, correctly denominatored cache
 reuse, prompt/decode throughput, tool and MCP outcomes/latency, TTS first-audio
 latency and real-time factor, audio bytes, configuration updates, and
 end-to-end stages from final transcript through LLM request, first token, first
-sentence, TTS request, first audio, and completion. Labels are limited to
+TTS text, first audio, and completion. Labels are limited to
 configured services, operations, tools, stages, dispositions, and outcomes.
 
 ## STT
@@ -262,6 +267,8 @@ and serves:
 - `GET /v1/models`
 - `POST /v1/voices`
 - `POST /v1/audio/speech`
+- `POST /v1/audio/speech/pipeline`
+- `WS /v1/audio/speech/pipeline`
 - compatibility endpoints `POST /synthesize` and `POST /synthesize_stream`
 
 `response_format=wav` returns a complete WAV file. `response_format=pcm` streams
@@ -276,15 +283,51 @@ such as `"voice": "bender"` selects the corresponding uploaded voice or Pocket
 TTS canned voice. Voice states are loaded on first use and retained while the
 process is running, sharing the single base model.
 
+The server-side voice pipeline accepts one complete speech request at `POST
+/v1/audio/speech/pipeline`. The regular `POST /v1/audio/speech` enables the same
+behavior when `X-Pipeline: true` is present; without the header its behavior is
+unchanged. A complete paragraph is split inside TTS, so a PCM response can begin
+with the first completed segment without sender-managed sentence requests. WAV
+responses use the same synthesis path but are buffered until a complete WAV can
+be returned.
+
+The incremental `WS /v1/audio/speech/pipeline` interface preserves overlap with
+a text generator such as the assistant LLM. The client first sends a
+`session.start` JSON event, followed by `input_text.delta` events and one
+`input_text.done`. TTS replies with `session.ready`, streams raw PCM as binary
+frames, and finishes with `response.audio.done`. While one segment is being
+synthesized the server deliberately stops reading more text; WebSocket/TCP flow
+control therefore propagates backpressure to the producer without another
+unbounded application queue. The exclusive TTS gate is acquired on the first
+text delta and retained through completion. An incomplete client has
+`pipeline_idle_timeout_seconds` to provide the next delta before its session is
+closed.
+
+Pipeline text normally splits on `.!?`. Configure this with
+`pipeline_sentence_terminators`. With
+`pipeline_first_segment_comma_delimiter=true`, the default, a comma may
+additionally finish only the first segment so audio can begin with the opening
+clause. TTS inserts a short silence and linear fades between synthesized
+segments; configure these with `pipeline_sentence_pause_seconds` and
+`pipeline_sentence_crossfade_seconds`. The corresponding environment variables
+are prefixed with `TTS_`, for example
+`TTS_PIPELINE_FIRST_SEGMENT_COMMA_DELIMITER=false`. Set either duration to zero
+to disable that transition component.
+
 Set `TTS_SAVE_LATEST_WAV=true` to atomically overwrite the most recently
 completed synthesized recording. `TTS_LATEST_WAV_PATH` defaults to
 `/tmp/latest.wav`; point it at mounted storage when the recording must be read
 after a pod replacement. A WAV response is saved verbatim. For a PCM response,
 the saved WAV frame data is the exact concatenation of the PCM chunks emitted to
-the TTS client; synthesis is not repeated. This recording is upstream of the
-assistant's sentence stitching; use the assistant capture for the exact final
-WebSocket PCM. An interrupted stream does not replace the previous recording,
-and capture failures are logged without failing the speech request.
+the TTS client; synthesis is not repeated. Pipeline requests save one stitched
+recording containing all segment fades and inserted silence, rather than
+overwriting the file for each internal segment. An interrupted stream does not
+replace the previous recording, and capture failures are logged without failing
+the speech request.
+
+Deploy a pipeline-capable TTS image before an assistant image that uses the
+incremental endpoint; the services roll independently and the assistant does
+not retain its former per-sentence fallback.
 
 Upload a Pocket TTS voice-state file as multipart form data. The endpoint does
 not require authentication:
@@ -307,8 +350,9 @@ They include Python process collectors, model readiness/load gauges, request
 counts and latency, active requests, busy rejections, and configuration updates.
 STT additionally reports audio duration, chunk and commit processing latency,
 and time to first stable delta. TTS additionally reports voice load duration,
-time to first PCM audio, output duration, and real-time factor. Metrics stay
-local until a Prometheus server is configured to scrape them.
+time to first PCM audio, output duration, real-time factor, and pipeline
+requests and synthesized segment counts by transport. Metrics stay local until
+a Prometheus server is configured to scrape them.
 
 ## Dependencies
 

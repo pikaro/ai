@@ -35,12 +35,12 @@ TRANSCRIPT_CHARACTERS = Histogram(
 
 CACHE_WARMS = Counter(
     'assistant_llm_cache_warm_requests_total',
-    'Incremental llama.cpp prompt-cache warm requests',
+    'llama.cpp prompt-cache warm requests',
     ['reason', 'outcome'],
 )
 CACHE_WARM_SECONDS = Histogram(
     'assistant_llm_cache_warm_duration_seconds',
-    'Incremental llama.cpp prompt-cache warm latency',
+    'llama.cpp prompt-cache warm latency',
     ['reason'],
 )
 CACHE_WARMS_PER_SESSION = Histogram(
@@ -119,7 +119,7 @@ TTS_TIME_TO_FIRST_AUDIO = Histogram(
 )
 TTS_AUDIO_SECONDS = Histogram(
     'assistant_tts_audio_seconds',
-    'Audio duration produced per TTS segment',
+    'Audio duration produced per TTS pipeline response',
 )
 TTS_REALTIME_FACTOR = Histogram(
     'assistant_tts_realtime_factor',

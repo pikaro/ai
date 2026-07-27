@@ -22,7 +22,7 @@ from fastapi import (
     WebSocketException,
     status,
 )
-from fastapi.responses import FileResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from starlette.websockets import WebSocketState
@@ -31,7 +31,12 @@ from websockets.exceptions import ConnectionClosed, WebSocketException as Upstre
 
 from assistant.src import metrics
 from assistant.src.config import Settings
-from assistant.src.pipeline import AssistantUtterance, SystemPromptFile
+from assistant.src.pipeline import (
+    AssistantUtterance,
+    SystemPromptFile,
+    build_prompt_prefix,
+    warm_llm_cache,
+)
 from assistant.src.tooling import ToolRegistry, discover_local_tools
 from assistant.src.upstream import LlmClient, SlotPool, TtsClient, upstream_health
 from runtime_config import (
@@ -83,6 +88,9 @@ class DashboardSpeechRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     text: str = Field(min_length=1)
+    voice: str | None = Field(default=None, min_length=1)
+    pipeline: bool = False
+    response_format: Literal['pcm', 'wav'] = 'wav'
 
 
 class HealthResponse(BaseModel):
@@ -137,6 +145,17 @@ class AssistantRuntime:
             maximum_result_characters=settings.maximum_tool_result_characters,
         )
         self.system_prompt = SystemPromptFile(settings.system_prompt_path)
+
+    async def start(self) -> None:
+        """Warm every configured LLM slot before the application becomes ready."""
+        available_tools = await self.tools.available()
+        prompt = build_prompt_prefix(
+            '',
+            available_tools,
+            system_prompt=self.system_prompt.read(),
+        )
+        for slot in self.settings.llm_slots:
+            await warm_llm_cache(self.llm, prompt, slot, reason='startup')
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -202,6 +221,7 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
     runtime = AssistantRuntime(SETTINGS)
     application.state.runtime = runtime
     try:
+        await runtime.start()
         yield
     finally:
         await cast('AssistantRuntime', application.state.runtime).close()
@@ -256,17 +276,37 @@ async def _proxy_configuration_request(
     return _forward_upstream_response(upstream_response)
 
 
-def _forward_upstream_response(upstream_response: httpx.Response) -> Response:
-    headers = {
+def _forward_upstream_headers(upstream_response: httpx.Response) -> dict[str, str]:
+    return {
         name: value
-        for name in ('content-type', 'retry-after')
+        for name in (
+            'content-type',
+            'retry-after',
+            'x-audio-format',
+            'x-audio-sample-rate',
+            'x-audio-sample-width',
+            'x-audio-channels',
+        )
         if (value := upstream_response.headers.get(name)) is not None
     }
+
+
+def _forward_upstream_response(upstream_response: httpx.Response) -> Response:
     return Response(
         upstream_response.content,
         status_code=upstream_response.status_code,
-        headers=headers,
+        headers=_forward_upstream_headers(upstream_response),
     )
+
+
+async def _stream_upstream_response(
+    upstream_response: httpx.Response,
+) -> AsyncGenerator[bytes]:
+    try:
+        async for chunk in upstream_response.aiter_raw():
+            yield chunk
+    finally:
+        await upstream_response.aclose()
 
 
 def _update_dashboard_transcript(  # noqa: C901
@@ -578,16 +618,37 @@ async def dashboard_speech(
 ) -> Response:
     runtime = _runtime_from_request(request)
     url = f'{runtime.settings.tts_base_url.rstrip("/")}/v1/audio/speech'
+    request_body: dict[str, object] = {
+        'model': runtime.settings.tts_model,
+        'input': speech_request.text,
+        'response_format': speech_request.response_format,
+    }
+    if speech_request.voice is not None:
+        request_body['voice'] = speech_request.voice
+    pipeline_headers = {'X-Pipeline': 'true'} if speech_request.pipeline else None
     try:
-        upstream_response = await runtime.http.request(
-            'POST',
-            url,
-            json={
-                'model': runtime.settings.tts_model,
-                'input': speech_request.text,
-                'response_format': 'wav',
-            },
-        )
+        if speech_request.response_format == 'pcm':
+            upstream_request = runtime.http.build_request(
+                'POST',
+                url,
+                headers=pipeline_headers,
+                json=request_body,
+            )
+            upstream_response = await runtime.http.send(upstream_request, stream=True)
+            return StreamingResponse(
+                _stream_upstream_response(upstream_response),
+                status_code=upstream_response.status_code,
+                headers=_forward_upstream_headers(upstream_response),
+            )
+        if pipeline_headers is None:
+            upstream_response = await runtime.http.request('POST', url, json=request_body)
+        else:
+            upstream_response = await runtime.http.request(
+                'POST',
+                url,
+                headers=pipeline_headers,
+                json=request_body,
+            )
     except httpx.RequestError as error:
         LOGGER.warning(
             'Dashboard TTS request failed',

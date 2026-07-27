@@ -8,7 +8,6 @@ import os
 import struct
 import tempfile
 import unittest
-import wave
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast
@@ -25,22 +24,22 @@ from assistant.src.main import (
     AssistantRuntime,
     RealtimeEvent,
     app as assistant_app,
+    lifespan,
     log_request_correlation,
     prometheus_metrics,
     realtime,
 )
 from assistant.src.pipeline import (
     BASE_SYSTEM_PROMPT,
-    QWEN_ASSISTANT_PREFILL,
     AssistantUtterance,
     SystemPromptFile,
     build_prompt,
-    completed_sentences,
+    build_prompt_prefix,
     parse_tool_response,
 )
 from assistant.src.tooling import ToolDefinition, ToolRegistry, discover_local_tools
 from assistant.src.tools.time import rough_time
-from assistant.src.upstream import AudioFormat, LlmClient, SlotPool, upstream_health
+from assistant.src.upstream import AudioFormat, LlmClient, SlotPool, TtsClient, upstream_health
 from service_logging import SuccessfulHealthCheckFilter
 
 if TYPE_CHECKING:
@@ -49,10 +48,11 @@ if TYPE_CHECKING:
 
 class SettingsTest(unittest.TestCase):
     def test_system_prompt_defaults_to_requested_tmp_path(self) -> None:
-        self.assertEqual(
-            Settings().system_prompt_path,
-            Path('/tmp/system-prompt'),  # noqa: S108
-        )
+        settings = Settings()
+
+        self.assertEqual(settings.system_prompt_path, Path('/tmp/system-prompt'))  # noqa: S108
+        self.assertEqual(settings.model_id, 'qwen3-4b-instruct')
+        self.assertEqual(settings.default_timezone, 'Europe/Berlin')
 
     def test_environment_supports_nested_mcp_servers(self) -> None:
         environment = {
@@ -60,11 +60,6 @@ class SettingsTest(unittest.TestCase):
             'ASSISTANT_LLM_SLOTS': '[1,2]',
             'ASSISTANT_MCP__CALENDAR__HOST': 'calendar-mcp',
             'ASSISTANT_MCP__CALENDAR__TRIGGERS': '["calendar","meeting"]',
-            'ASSISTANT_LATEST_WAV_PATH': '/recordings/latest.wav',
-            'ASSISTANT_SAVE_LATEST_WAV': 'true',
-            'ASSISTANT_TTS_SENTENCE_PAUSE_SECONDS': '0.2',
-            'ASSISTANT_TTS_SENTENCE_CROSSFADE_SECONDS': '0.02',
-            'ASSISTANT_TTS_SENTENCE_TERMINATORS': '.!?;',
             'LOG_LEVEL': 'DEBUG',
         }
         with patch.dict(os.environ, environment, clear=True):
@@ -73,11 +68,6 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.llm_slots, (1, 2))
         self.assertEqual(settings.listen_port, 9003)
         self.assertEqual(settings.log_level, 'DEBUG')
-        self.assertEqual(settings.latest_wav_path, Path('/recordings/latest.wav'))
-        self.assertTrue(settings.save_latest_wav)
-        self.assertEqual(settings.tts_sentence_pause_seconds, 0.2)
-        self.assertEqual(settings.tts_sentence_crossfade_seconds, 0.02)
-        self.assertEqual(settings.tts_sentence_terminators, '.!?;')
         self.assertEqual(settings.mcp['calendar'].endpoint, 'http://calendar-mcp:8080/mcp')
         self.assertEqual(settings.mcp['calendar'].triggers, {'calendar', 'meeting'})
 
@@ -191,6 +181,11 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="assistant-mic"', response.text)
         self.assertIn('fetch(`/dashboard/stt?', response.text)
         self.assertIn("fetch('/dashboard/tts'", response.text)
+        self.assertIn('id="tts-voice"', response.text)
+        self.assertIn('id="tts-format"', response.text)
+        self.assertIn('id="tts-pipeline"', response.text)
+        self.assertIn('function schedulePcmChunk(context, playback, chunk, format)', response.text)
+        self.assertIn('function collectPcmResponse(response, startedAt, context)', response.text)
 
     async def test_assistant_configuration_is_exposed_without_proxying(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -450,6 +445,70 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                         'response_format': 'wav',
                     },
                 )
+            finally:
+                await runtime.close()
+
+    async def test_tts_pipeline_pcm_voice_and_format_headers_are_streamed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                tts_base_url='http://tts.test',
+                tts_model='debug-tts',
+                system_prompt_path=Path(directory) / 'system-prompt',
+            )
+            runtime = AssistantRuntime(settings)
+            assistant_app.state.runtime = runtime
+            pcm = b'\x01\x02\x03\x04'
+            upstream_response = httpx.Response(
+                200,
+                stream=httpx.ByteStream(pcm),
+                headers={
+                    'Content-Type': 'application/octet-stream',
+                    'X-Audio-Format': 'pcm_s16le',
+                    'X-Audio-Sample-Rate': '24000',
+                    'X-Audio-Sample-Width': '2',
+                    'X-Audio-Channels': '1',
+                },
+                request=httpx.Request('POST', 'http://tts.test/v1/audio/speech'),
+            )
+            send_speech = AsyncMock(return_value=upstream_response)
+            transport = httpx.ASGITransport(app=assistant_app)
+            try:
+                with patch.object(runtime.http, 'send', send_speech):
+                    async with httpx.AsyncClient(
+                        transport=transport,
+                        base_url='http://test',
+                    ) as client:
+                        response = await client.post(
+                            '/dashboard/tts',
+                            json={
+                                'text': 'Stream this.',
+                                'voice': 'bender',
+                                'pipeline': True,
+                                'response_format': 'pcm',
+                            },
+                        )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.content, pcm)
+                self.assertEqual(response.headers['content-type'], 'application/octet-stream')
+                self.assertEqual(response.headers['x-audio-format'], 'pcm_s16le')
+                self.assertEqual(response.headers['x-audio-sample-rate'], '24000')
+                send_speech.assert_awaited_once()
+                await_args = send_speech.await_args_list[0]
+                upstream_request = cast('httpx.Request', await_args.args[0])
+                self.assertEqual(str(upstream_request.url), 'http://tts.test/v1/audio/speech')
+                self.assertEqual(upstream_request.headers['x-pipeline'], 'true')
+                self.assertEqual(
+                    json.loads(upstream_request.content),
+                    {
+                        'model': 'debug-tts',
+                        'input': 'Stream this.',
+                        'response_format': 'pcm',
+                        'voice': 'bender',
+                    },
+                )
+                self.assertEqual(await_args.kwargs, {'stream': True})
+                self.assertTrue(upstream_response.is_closed)
             finally:
                 await runtime.close()
 
@@ -777,6 +836,64 @@ class LlmLoggingTest(unittest.IsolatedAsyncioTestCase):
         observe_reuse.assert_called_once_with(0.75)
 
 
+class TtsPipelineClientTest(unittest.IsolatedAsyncioTestCase):
+    async def test_incremental_text_is_sent_and_binary_pcm_is_streamed(self) -> None:  # noqa: C901
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+                self.incoming: list[str | bytes] = [
+                    (
+                        '{"type":"session.ready","format":"pcm16",'
+                        '"sample_rate":24000,"sample_width":2,"channels":1}'
+                    ),
+                    b'\x01\x02',
+                    '{"type":"response.audio.done"}',
+                ]
+
+            async def __aenter__(self) -> Self:
+                return self
+
+            async def __aexit__(self, *_arguments: object) -> None:
+                return
+
+            async def send(self, message: str) -> None:
+                self.sent.append(message)
+
+            async def recv(self) -> str | bytes:
+                await asyncio.sleep(0)
+                return self.incoming.pop(0)
+
+            async def close(self, code: int = 1000) -> None:
+                del code
+
+        async def text_stream() -> AsyncIterator[str]:
+            yield 'First sentence.'
+            yield ' Second sentence.'
+
+        connection = FakeConnection()
+        settings = Settings(tts_base_url='http://tts.test')
+        async with httpx.AsyncClient() as client:
+            tts = TtsClient(client, settings)
+            with patch('assistant.src.upstream.connect', return_value=connection):
+                chunks = [item async for item in tts.stream(text_stream())]
+
+        self.assertEqual(
+            chunks,
+            [(b'\x01\x02', AudioFormat(sample_rate=24_000, sample_width=2, channels=1))],
+        )
+        self.assertEqual(tts.pipeline_websocket_url, 'ws://tts.test/v1/audio/speech/pipeline')
+        sent_events = [json.loads(message) for message in connection.sent]
+        self.assertEqual(sent_events[0]['type'], 'session.start')
+        self.assertEqual(
+            [event['type'] for event in sent_events[1:]],
+            ['input_text.delta', 'input_text.delta', 'input_text.done'],
+        )
+        self.assertEqual(
+            ''.join(str(event.get('delta', '')) for event in sent_events),
+            'First sentence. Second sentence.',
+        )
+
+
 class TimeToolTest(unittest.TestCase):
     def test_rough_time_rounds_to_spoken_five_minute_interval(self) -> None:
         value = datetime(2026, 7, 13, 14, 44, tzinfo=UTC)
@@ -794,6 +911,9 @@ class PromptTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertIn('"name":"time"', first)
         self.assertIn('do not wrap it in JSON', first)
+        self.assertIn('omit arguments when those defaults match the request', first)
+        self.assertIn('"default":"rough"', first)
+        self.assertIn('"default":"Europe/Berlin"', first)
 
     def test_custom_system_prompt_precedes_the_stable_tool_catalog(self) -> None:
         prompt = build_prompt(
@@ -805,23 +925,17 @@ class PromptTest(unittest.TestCase):
         self.assertIn('<|im_start|>system\nCustom system prompt.\nTools are available', prompt)
         self.assertLess(prompt.index('"name":"time"'), prompt.index('<|im_start|>user\nhello'))
 
-    def test_sentence_split_retains_incomplete_tail(self) -> None:
-        sentences, remainder = completed_sentences('First sentence. Incomplete tail')
+    def test_cache_warm_prefix_excludes_generation_suffix(self) -> None:
+        tools = discover_local_tools()
 
-        self.assertEqual(sentences, ['First sentence.'])
-        self.assertEqual(remainder, 'Incomplete tail')
+        prefix = build_prompt_prefix('what is', tools)
+        final_prompt = build_prompt('what is the time', tools)
 
-    def test_sentence_split_returns_every_completed_sentence(self) -> None:
-        sentences, remainder = completed_sentences('First sentence. Second! Third?')
-
-        self.assertEqual(sentences, ['First sentence.', 'Second!', 'Third?'])
-        self.assertEqual(remainder, '')
-
-    def test_sentence_split_uses_configured_terminators(self) -> None:
-        sentences, remainder = completed_sentences('First clause; Second sentence.', ';')
-
-        self.assertEqual(sentences, ['First clause;'])
-        self.assertEqual(remainder, 'Second sentence.')
+        self.assertTrue(prefix.endswith('<|im_start|>user\nwhat is'))
+        self.assertTrue(final_prompt.startswith(prefix))
+        self.assertTrue(final_prompt.endswith('<|im_start|>assistant\n'))
+        self.assertNotIn('/no_think', final_prompt)
+        self.assertNotIn('<think>', final_prompt)
 
     def test_tool_json_is_extracted_from_model_response(self) -> None:
         response = parse_tool_response('{"tool":"time","arguments":{"mode":"rough"}}')
@@ -939,8 +1053,11 @@ class FakeTts:
     def __init__(self) -> None:
         self.requests: list[str] = []
 
-    async def stream(self, text: str) -> AsyncIterator[tuple[bytes, AudioFormat]]:
-        self.requests.append(text)
+    async def stream(
+        self,
+        text_stream: AsyncIterator[str],
+    ) -> AsyncIterator[tuple[bytes, AudioFormat]]:
+        self.requests.append(''.join([delta async for delta in text_stream]))
         yield (
             struct.pack('<hhhh', 1_000, 1_000, 1_000, 1_000),
             AudioFormat(
@@ -949,6 +1066,37 @@ class FakeTts:
                 channels=1,
             ),
         )
+
+
+class StartupWarmTest(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_warms_every_slot_with_prefix_only_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                llm_slots=(3, 5),
+                system_prompt_path=Path(directory) / 'system-prompt',
+            )
+            runtime = AssistantRuntime(settings)
+            warm_cache = AsyncMock()
+            try:
+                with patch.object(runtime.llm, 'warm_cache', warm_cache):
+                    await runtime.start()
+            finally:
+                await runtime.close()
+
+        self.assertEqual([item.args[1] for item in warm_cache.await_args_list], [3, 5])
+        prompt = str(warm_cache.await_args_list[0].args[0])
+        self.assertTrue(prompt.endswith('<|im_start|>user\n'))
+        self.assertIn('"name":"time"', prompt)
+        self.assertNotIn('<|im_start|>assistant', prompt)
+
+    async def test_lifespan_waits_for_startup_warm_before_serving(self) -> None:
+        runtime = AsyncMock(spec=AssistantRuntime)
+        with patch('assistant.src.main.AssistantRuntime', return_value=runtime):
+            async with lifespan(assistant_app):
+                runtime.start.assert_awaited_once_with()
+                runtime.close.assert_not_awaited()
+
+        runtime.close.assert_awaited_once_with()
 
 
 class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
@@ -966,8 +1114,6 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
         self.settings = Settings(
             llm_slots=(7,),
             system_prompt_path=Path(self.system_prompt_directory.name) / 'system-prompt',
-            tts_sentence_pause_seconds=2 / 24_000,
-            tts_sentence_crossfade_seconds=2 / 24_000,
         )
         self.slots = SlotPool(self.settings.llm_slots)
         self.llm = FakeLlm()
@@ -1017,6 +1163,8 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
             '<|im_start|>system\nReloaded prompt.\nTools are available', self.llm.warms[0][0]
         )
         self.assertIn('"name":"time"', self.llm.warms[0][0])
+        self.assertTrue(self.llm.warms[0][0].endswith('<|im_start|>user\nunrelated command'))
+        self.assertNotIn('<|im_start|>assistant', self.llm.warms[0][0])
 
     async def test_final_transcript_drops_pending_warms_and_drains_only_active_work(self) -> None:
         class BlockingLlm(FakeLlm):
@@ -1077,7 +1225,7 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event_types[-1], 'response.done')
         self.assertEqual(self.llm.warms, [])
 
-    async def test_generation_splits_and_stitches_every_sentence(self) -> None:
+    async def test_generation_streams_complete_text_to_one_tts_pipeline(self) -> None:
         self.llm.response = 'First sentence. Second! Third?'
         events: list[dict[str, object]] = []
 
@@ -1086,36 +1234,18 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
 
         await self.utterance.generate('hello', [], send)
 
-        self.assertEqual(self.tts.requests, ['First sentence.', 'Second!', 'Third?'])
+        self.assertEqual(self.tts.requests, ['First sentence. Second! Third?'])
         pcm = b''.join(
             base64.b64decode(str(event['audio']))
             for event in events
             if event['type'] == 'response.audio.delta'
         )
         samples = struct.unpack(f'<{len(pcm) // 2}h', pcm)
-        self.assertEqual(
-            samples,
-            (
-                1_000,
-                1_000,
-                1_000,
-                0,
-                0,
-                0,
-                0,
-                1_000,
-                1_000,
-                0,
-                0,
-                0,
-                0,
-                1_000,
-                1_000,
-                1_000,
-            ),
-        )
+        self.assertEqual(samples, (1_000, 1_000, 1_000, 1_000))
 
-    async def test_tool_aware_answer_reaches_tts_before_llm_stream_finishes(self) -> None:
+    async def test_tool_aware_answer_reaches_tts_before_llm_stream_finishes(  # noqa: C901
+        self,
+    ) -> None:
         first_sentence_requested = asyncio.Event()
 
         class GatedLlm(FakeLlm):
@@ -1134,14 +1264,22 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
                 yield ' Second sentence.'
 
         class SignalingTts(FakeTts):
-            async def stream(self, text: str) -> AsyncIterator[tuple[bytes, AudioFormat]]:
-                self.requests.append(text)
-                if text == 'First sentence.':
-                    first_sentence_requested.set()
-                yield (
-                    struct.pack('<hhhh', 1_000, 1_000, 1_000, 1_000),
-                    AudioFormat(sample_rate=24_000, sample_width=2, channels=1),
-                )
+            async def stream(
+                self,
+                text_stream: AsyncIterator[str],
+            ) -> AsyncIterator[tuple[bytes, AudioFormat]]:
+                parts: list[str] = []
+                first_audio = True
+                async for text in text_stream:
+                    parts.append(text)
+                    if first_audio and '.' in text:
+                        first_audio = False
+                        first_sentence_requested.set()
+                        yield (
+                            struct.pack('<hhhh', 1_000, 1_000, 1_000, 1_000),
+                            AudioFormat(sample_rate=24_000, sample_width=2, channels=1),
+                        )
+                self.requests.append(''.join(parts))
 
         llm = GatedLlm()
         tts = SignalingTts()
@@ -1158,7 +1296,7 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
             timeout=1,
         )
 
-        self.assertEqual(tts.requests, ['First sentence.', 'Second sentence.'])
+        self.assertEqual(tts.requests, ['First sentence. Second sentence.'])
         self.assertEqual(
             llm.stream_requests,
             [('tool_decision', self.settings.llm_tool_tokens)],
@@ -1210,7 +1348,7 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn('"tool"', spoken_deltas)
         self.assertEqual(spoken_deltas, 'It is around three. Done?')
-        self.assertEqual(self.tts.requests, ['It is around three.', 'Done?'])
+        self.assertEqual(self.tts.requests, ['It is around three. Done?'])
         self.assertEqual(
             llm.stream_requests,
             [
@@ -1222,7 +1360,7 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
         final_system = llm.prompts[1].split('<|im_start|>user\n', maxsplit=1)[0]
         self.assertEqual(final_system, initial_system)
         self.assertIn(
-            f'{QWEN_ASSISTANT_PREFILL} {{"tool":"time","arguments":{{"mode":"rough"}}}}',
+            '<|im_start|>assistant\n {"tool":"time","arguments":{"mode":"rough"}}',
             llm.prompts[1],
         )
         self.assertNotIn('{"tool": "time"', llm.prompts[1])
@@ -1231,60 +1369,6 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
             '<|im_start|>user\nNo more tools. Reply directly',
             llm.prompts[1],
         )
-
-    async def test_saved_wav_pcm_matches_emitted_websocket_deltas_exactly(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            destination = Path(directory) / 'latest.wav'
-            self.utterance.settings = self.settings.model_copy(
-                update={'save_latest_wav': True, 'latest_wav_path': destination},
-            )
-            self.llm.response = 'First sentence. Second!'
-            events: list[dict[str, object]] = []
-
-            async def send(event: dict[str, object]) -> None:
-                events.append(event)
-
-            await self.utterance.generate('hello', [], send)
-
-            emitted_pcm = b''.join(
-                base64.b64decode(str(event['audio']))
-                for event in events
-                if event['type'] == 'response.audio.delta'
-            )
-            with wave.open(str(destination), 'rb') as wav_file:
-                self.assertEqual(wav_file.getframerate(), 24_000)
-                self.assertEqual(wav_file.getnchannels(), 1)
-                self.assertEqual(wav_file.getsampwidth(), 2)
-                saved_pcm = wav_file.readframes(wav_file.getnframes())
-
-            self.assertEqual(saved_pcm, emitted_pcm)
-
-    async def test_interrupted_websocket_audio_does_not_replace_previous_recording(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            destination = Path(directory) / 'latest.wav'
-            previous_recording = b'previous recording'
-            _ = destination.write_bytes(previous_recording)
-            self.utterance.settings = self.settings.model_copy(
-                update={'save_latest_wav': True, 'latest_wav_path': destination},
-            )
-            self.llm.response = 'First sentence. Second!'
-            audio_delta_count = 0
-
-            async def send(event: dict[str, object]) -> None:
-                nonlocal audio_delta_count
-                if event['type'] != 'response.audio.delta':
-                    return
-                audio_delta_count += 1
-                if audio_delta_count == 2:  # noqa: PLR2004
-                    message = 'WebSocket send failed'
-                    raise RuntimeError(message)
-
-            with self.assertRaisesRegex(RuntimeError, 'WebSocket send failed'):
-                await self.utterance.generate('hello', [], send)
-
-            self.assertEqual(destination.read_bytes(), previous_recording)
 
 
 class MetricsTest(unittest.TestCase):

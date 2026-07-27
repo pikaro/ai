@@ -5,17 +5,20 @@ import json
 import logging
 import time
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from websockets.asyncio.client import ClientConnection, connect
 
 from assistant.src import metrics
 
 LOGGER = logging.getLogger('assistant.upstream')
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, AsyncIterator
 
     from assistant.src.config import Settings
 
@@ -25,6 +28,34 @@ class AudioFormat:
     sample_rate: int
     sample_width: int
     channels: int
+
+
+def _require_audio_format(audio_format: AudioFormat | None) -> AudioFormat:
+    if audio_format is not None:
+        return audio_format
+    message = 'TTS pipeline sent audio before session metadata'
+    raise RuntimeError(message)
+
+
+def _pipeline_event(message: str) -> tuple[str | None, AudioFormat | None]:
+    event = json.loads(message)
+    if not isinstance(event, dict):
+        message = 'TTS pipeline returned an invalid event'
+        raise TypeError(message)
+    event_type = event.get('type')
+    if event_type == 'session.ready':
+        return (
+            event_type,
+            AudioFormat(
+                sample_rate=int(event['sample_rate']),
+                sample_width=int(event['sample_width']),
+                channels=int(event['channels']),
+            ),
+        )
+    if event_type == 'error':
+        error_message = str(event.get('message') or 'TTS pipeline failed')
+        raise RuntimeError(error_message)
+    return (event_type if isinstance(event_type, str) else None), None
 
 
 class SlotPool:
@@ -334,36 +365,59 @@ class TtsClient:
 
     async def stream(  # noqa: C901
         self,
-        text: str,
+        text_stream: AsyncIterator[str],
     ) -> AsyncGenerator[tuple[bytes, AudioFormat]]:
         started = time.perf_counter()
         outcome = 'success'
         output_bytes = 0
         audio_format: AudioFormat | None = None
+        sender: asyncio.Task[None] | None = None
+        response_done = False
         try:
-            async with self.client.stream(
-                'POST',
-                f'{self.settings.tts_base_url.rstrip("/")}/v1/audio/speech',
-                json={
-                    'model': self.settings.tts_model,
-                    'input': text,
-                    'response_format': 'pcm',
-                },
-            ) as response:
-                _ = response.raise_for_status()
-                audio_format = AudioFormat(
-                    sample_rate=int(response.headers.get('X-Audio-Sample-Rate', '24000')),
-                    sample_width=int(response.headers.get('X-Audio-Sample-Width', '2')),
-                    channels=int(response.headers.get('X-Audio-Channels', '1')),
+            async with connect(
+                self.pipeline_websocket_url,
+                open_timeout=self.settings.connect_timeout_seconds,
+                close_timeout=self.settings.connect_timeout_seconds,
+                max_size=self.settings.maximum_websocket_message_bytes,
+                max_queue=2,
+            ) as websocket:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            'type': 'session.start',
+                            'model': self.settings.tts_model,
+                        },
+                        separators=(',', ':'),
+                    ),
                 )
-                async for chunk in response.aiter_bytes():
-                    if chunk:
-                        output_bytes += len(chunk)
-                        yield chunk, audio_format
+                sender = asyncio.create_task(self._send_text(websocket, text_stream))
+                while not response_done:
+                    message = await self._receive_or_sender(websocket, sender)
+                    if isinstance(message, bytes):
+                        audio_format = _require_audio_format(audio_format)
+                        if message:
+                            output_bytes += len(message)
+                            yield message, audio_format
+                        continue
+
+                    event_type, ready_format = _pipeline_event(message)
+                    if event_type == 'session.ready':
+                        audio_format = ready_format
+                    elif event_type == 'response.audio.done':
+                        response_done = True
+
+                await sender
+        except asyncio.CancelledError:
+            outcome = 'cancelled'
+            raise
         except Exception:
             outcome = 'error'
             raise
         finally:
+            if sender is not None:
+                if not sender.done():
+                    _ = sender.cancel()
+                _ = await asyncio.gather(sender, return_exceptions=True)
             wall_seconds = time.perf_counter() - started
             if audio_format is not None:
                 bytes_per_second = (
@@ -375,6 +429,51 @@ class TtsClient:
                     metrics.TTS_REALTIME_FACTOR.observe(wall_seconds / audio_seconds)
             metrics.TTS_REQUESTS.labels(outcome=outcome).inc()
             metrics.TTS_REQUEST_SECONDS.observe(wall_seconds)
+
+    @property
+    def pipeline_websocket_url(self) -> str:
+        parsed = urlsplit(self.settings.tts_base_url.rstrip('/'))
+        scheme = 'wss' if parsed.scheme == 'https' else 'ws'
+        return urlunsplit(
+            (scheme, parsed.netloc, '/v1/audio/speech/pipeline', '', ''),
+        )
+
+    @staticmethod
+    async def _send_text(
+        websocket: ClientConnection,
+        text_stream: AsyncIterator[str],
+    ) -> None:
+        try:
+            async for delta in text_stream:
+                if delta:
+                    await websocket.send(
+                        json.dumps(
+                            {'type': 'input_text.delta', 'delta': delta},
+                            ensure_ascii=False,
+                            separators=(',', ':'),
+                        ),
+                    )
+            await websocket.send('{"type":"input_text.done"}')
+        except BaseException:
+            with suppress(Exception):
+                await websocket.close(code=1011)
+            raise
+
+    @staticmethod
+    async def _receive_or_sender(
+        websocket: ClientConnection,
+        sender: asyncio.Task[None],
+    ) -> str | bytes:
+        receive = asyncio.create_task(websocket.recv())
+        done, _ = await asyncio.wait((receive, sender), return_when=asyncio.FIRST_COMPLETED)
+        if sender in done:
+            try:
+                await sender
+            except BaseException:
+                _ = receive.cancel()
+                _ = await asyncio.gather(receive, return_exceptions=True)
+                raise
+        return await receive
 
 
 async def upstream_health(

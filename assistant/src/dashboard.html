@@ -164,6 +164,41 @@
       line-height: 1.45;
     }
 
+    .tts-options {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .debug-tools .tts-option {
+      margin-top: 0;
+    }
+
+    .tts-option input[type="text"], .tts-option select {
+      box-sizing: border-box;
+      width: 100%;
+      margin-top: 6px;
+      padding: 7px 8px;
+      border: 1px solid #4b5563;
+      border-radius: 5px;
+      background: #111827;
+      color: #e5e7eb;
+      font: inherit;
+    }
+
+    .tts-toggle {
+      display: flex;
+      align-items: center;
+      align-self: end;
+      gap: 8px;
+      min-height: 32px;
+    }
+
+    .tts-toggle input {
+      margin: 0;
+    }
+
     .debug-tools {
       margin-top: 18px;
       padding-top: 16px;
@@ -276,6 +311,26 @@
         <div id="mic-status" class="result" role="status" aria-live="polite"></div>
         <label for="tts-text">Text to synthesize</label>
         <textarea id="tts-text" class="speech-editor" spellcheck="true"></textarea>
+        <div class="tts-options">
+          <label class="tts-option" for="tts-voice">
+            Voice (`default` or name)
+            <input id="tts-voice" type="text" value="default" spellcheck="false">
+          </label>
+          <label class="tts-option" for="tts-format">
+            Response format
+            <select id="tts-format">
+              <option value="pcm" selected>PCM16 stream</option>
+              <option value="wav">WAV</option>
+            </select>
+          </label>
+          <label class="tts-option tts-toggle" for="tts-pipeline">
+            <input id="tts-pipeline" type="checkbox" checked>
+            Enable TTS pipeline
+          </label>
+        </div>
+        <p class="hint">
+          PCM plays while streaming, reports first-chunk timing, and becomes a WAV for replay.
+        </p>
         <div class="actions">
           <button id="speak" class="primary" type="button">Speak with TTS</button>
         </div>
@@ -581,6 +636,9 @@
     const assistantMicButton = document.querySelector('#assistant-mic');
     const microphoneStatus = document.querySelector('#mic-status');
     const ttsEditor = document.querySelector('#tts-text');
+    const ttsVoiceInput = document.querySelector('#tts-voice');
+    const ttsFormatSelect = document.querySelector('#tts-format');
+    const ttsPipelineToggle = document.querySelector('#tts-pipeline');
     const speakButton = document.querySelector('#speak');
     const audioPlayer = document.querySelector('#audio-player');
     const audioResult = document.querySelector('#audio-result');
@@ -591,6 +649,7 @@
     let activeRecording;
     let microphoneStarting = false;
     let playbackUrl;
+    let pcmPlaybackContext;
 
     function setAudioResult(message, error = false) {
       audioResult.textContent = message;
@@ -716,17 +775,27 @@
       }
     }
 
-    function pcmWavBlob(chunks, format) {
+    function pcmFrameBytes(format) {
       if (
         !format ||
         format.format !== 'pcm16' ||
         format.sampleWidth !== 2 ||
         !Number.isInteger(format.sampleRate) ||
-        !Number.isInteger(format.channels)
+        format.sampleRate <= 0 ||
+        !Number.isInteger(format.channels) ||
+        format.channels <= 0
       ) {
-        throw new Error('Assistant returned an unsupported audio format');
+        throw new Error('Service returned an unsupported PCM audio format');
       }
+      return format.sampleWidth * format.channels;
+    }
+
+    function pcmWavBlob(chunks, format) {
       const audioBytes = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+      const frameBytes = pcmFrameBytes(format);
+      if (audioBytes % frameBytes) {
+        throw new Error('Service returned an incomplete PCM sample frame');
+      }
       const header = new ArrayBuffer(44);
       const view = new DataView(header);
       writeAscii(view, 0, 'RIFF');
@@ -745,12 +814,124 @@
       return new Blob([header, ...chunks], {type: 'audio/wav'});
     }
 
-    function playAudioBlob(blob) {
+    function pcmFormatFromResponse(response) {
+      const encoding = String(response.headers.get('X-Audio-Format') || '').toLowerCase();
+      return {
+        format: encoding === 'pcm_s16le' ? 'pcm16' : encoding,
+        sampleRate: Number(response.headers.get('X-Audio-Sample-Rate')),
+        sampleWidth: Number(response.headers.get('X-Audio-Sample-Width')),
+        channels: Number(response.headers.get('X-Audio-Channels')),
+      };
+    }
+
+    function schedulePcmChunk(context, playback, chunk, format) {
+      const frameBytes = pcmFrameBytes(format);
+      let bytes = chunk;
+      if (playback.pending.byteLength) {
+        const combined = new Uint8Array(playback.pending.byteLength + chunk.byteLength);
+        combined.set(playback.pending);
+        combined.set(chunk, playback.pending.byteLength);
+        bytes = combined;
+      }
+      const completeBytes = bytes.byteLength - (bytes.byteLength % frameBytes);
+      playback.pending = bytes.slice(completeBytes);
+      if (!completeBytes) return;
+
+      const frames = completeBytes / frameBytes;
+      const audioBuffer = context.createBuffer(format.channels, frames, format.sampleRate);
+      const channels = Array.from(
+        {length: format.channels},
+        (_, channel) => audioBuffer.getChannelData(channel),
+      );
+      const view = new DataView(bytes.buffer, bytes.byteOffset, completeBytes);
+      for (let frame = 0; frame < frames; frame += 1) {
+        for (let channel = 0; channel < format.channels; channel += 1) {
+          const offset = (frame * format.channels + channel) * format.sampleWidth;
+          channels[channel][frame] = view.getInt16(offset, true) / 32768;
+        }
+      }
+
+      const source = context.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(context.destination);
+      const startsAt = Math.max(playback.scheduledUntil, context.currentTime + 0.05);
+      source.start(startsAt);
+      playback.scheduledUntil = startsAt + audioBuffer.duration;
+    }
+
+    async function applyPcmPlaybackBackpressure(context, playback) {
+      while (
+        context.state === 'running' &&
+        playback.scheduledUntil - context.currentTime > 1.5
+      ) {
+        await new Promise(resolve => window.setTimeout(resolve, 50));
+      }
+    }
+
+    function closePcmContextAfterPlayback(context, scheduledUntil) {
+      const delayMilliseconds =
+        Math.max(0, scheduledUntil - context.currentTime) * 1000 + 100;
+      window.setTimeout(() => {
+        if (pcmPlaybackContext === context) pcmPlaybackContext = undefined;
+        context.close().catch(() => {});
+      }, delayMilliseconds);
+    }
+
+    async function collectPcmResponse(response, startedAt, context) {
+      if (!response.body) throw new Error('Browser cannot stream the PCM response');
+      const format = pcmFormatFromResponse(response);
+      pcmFrameBytes(format);
+      const reader = response.body.getReader();
+      const chunks = [];
+      const playback = {
+        pending: new Uint8Array(),
+        scheduledUntil: context?.currentTime || 0,
+      };
+      let audioBytes = 0;
+      let firstChunkMilliseconds;
+      try {
+        while (true) {
+          const {value, done} = await reader.read();
+          if (done) break;
+          if (!value?.byteLength) continue;
+          if (firstChunkMilliseconds === undefined) {
+            firstChunkMilliseconds = performance.now() - startedAt;
+            setAudioResult(
+              `First PCM chunk after ${firstChunkMilliseconds.toFixed(0)} ms; ` +
+              `${context ? 'playing' : 'receiving'} audio…`,
+            );
+          }
+          chunks.push(value);
+          audioBytes += value.byteLength;
+          if (context) {
+            schedulePcmChunk(context, playback, value, format);
+            await applyPcmPlaybackBackpressure(context, playback);
+          }
+        }
+      } catch (error) {
+        await reader.cancel().catch(() => {});
+        throw error;
+      } finally {
+        reader.releaseLock();
+      }
+      if (!audioBytes) throw new Error('TTS returned empty PCM audio');
+      if (playback.pending.byteLength) {
+        throw new Error('TTS returned an incomplete PCM sample frame');
+      }
+      return {
+        audio: pcmWavBlob(chunks, format),
+        audioBytes,
+        firstChunkMilliseconds,
+        scheduledUntil: playback.scheduledUntil,
+      };
+    }
+
+    function playAudioBlob(blob, autoplay = true) {
       if (playbackUrl) URL.revokeObjectURL(playbackUrl);
       playbackUrl = URL.createObjectURL(blob);
       audioPlayer.src = playbackUrl;
       audioPlayer.hidden = false;
-      audioPlayer.play().catch(() => {});
+      if (autoplay) audioPlayer.play().catch(() => {});
     }
 
     async function submitToStt(recording) {
@@ -928,26 +1109,75 @@
         setAudioResult('Enter text to synthesize', true);
         return;
       }
-      speakButton.disabled = true;
-      setAudioResult('Generating speech…');
+      const voice = ttsVoiceInput.value.trim() || 'default';
+      const responseFormat = ttsFormatSelect.value;
+      const pipeline = ttsPipelineToggle.checked;
+      const mode = `${pipeline ? 'pipelined' : 'direct'} ${responseFormat.toUpperCase()}`;
+      const startedAt = performance.now();
+      [speakButton, ttsVoiceInput, ttsFormatSelect, ttsPipelineToggle]
+        .forEach(control => { control.disabled = true; });
+      setAudioResult(`Generating ${mode} speech with voice ${voice}…`);
+      let pcmContext;
       try {
+        if (pcmPlaybackContext) {
+          await pcmPlaybackContext.close().catch(() => {});
+          pcmPlaybackContext = undefined;
+        }
+        audioPlayer.pause();
+        if (responseFormat === 'pcm') {
+          const AudioContextType = window.AudioContext || window.webkitAudioContext;
+          if (AudioContextType) {
+            pcmContext = new AudioContextType();
+            pcmPlaybackContext = pcmContext;
+            await pcmContext.resume();
+          }
+        }
         const response = await fetch('/dashboard/tts', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({text}),
+          body: JSON.stringify({
+            text,
+            voice,
+            pipeline,
+            response_format: responseFormat,
+          }),
         });
         if (!response.ok) {
           const body = await responseBody(response);
           throw new Error(`${response.status} ${JSON.stringify(body)}`);
         }
-        const audio = await response.blob();
-        if (!audio.size) throw new Error('TTS returned empty audio');
-        playAudioBlob(audio);
-        setAudioResult(`${response.status} Playing TTS audio`);
+        if (responseFormat === 'pcm') {
+          const result = await collectPcmResponse(response, startedAt, pcmContext);
+          playAudioBlob(result.audio, !pcmContext);
+          if (pcmContext) {
+            closePcmContextAfterPlayback(pcmContext, result.scheduledUntil);
+          }
+          const completedMilliseconds = performance.now() - startedAt;
+          setAudioResult(
+            `${response.status} ${mode} with voice ${voice}\n` +
+            `First PCM: ${result.firstChunkMilliseconds.toFixed(0)} ms; ` +
+            `complete: ${completedMilliseconds.toFixed(0)} ms; ` +
+            `${result.audioBytes} bytes`,
+          );
+        } else {
+          const audio = await response.blob();
+          if (!audio.size) throw new Error('TTS returned empty audio');
+          playAudioBlob(audio);
+          const completedMilliseconds = performance.now() - startedAt;
+          setAudioResult(
+            `${response.status} ${mode} with voice ${voice}; ` +
+            `complete: ${completedMilliseconds.toFixed(0)} ms`,
+          );
+        }
       } catch (error) {
+        if (pcmContext) {
+          if (pcmPlaybackContext === pcmContext) pcmPlaybackContext = undefined;
+          pcmContext.close().catch(() => {});
+        }
         setAudioResult(String(error), true);
       } finally {
-        speakButton.disabled = false;
+        [speakButton, ttsVoiceInput, ttsFormatSelect, ttsPipelineToggle]
+          .forEach(control => { control.disabled = false; });
       }
     }
 

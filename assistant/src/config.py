@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import tempfile
 from pathlib import Path
 from typing import Literal
 
@@ -66,7 +65,7 @@ class Settings(BaseSettings):
         extra='ignore',
     )
 
-    model_id: str = 'qwen3-4b'
+    model_id: str = 'qwen3-4b-instruct'
     log_level: Literal['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] = Field(
         default='INFO',
         validation_alias='LOG_LEVEL',
@@ -75,11 +74,6 @@ class Settings(BaseSettings):
     stt_base_url: str = 'http://nemo-asr.nemo-asr'
     tts_base_url: str = 'http://pockettts.pockettts'
     tts_model: str = 'kyutai/pocket-tts'
-    tts_sentence_pause_seconds: float = Field(default=0.12, ge=0, le=2)
-    tts_sentence_crossfade_seconds: float = Field(default=0.01, ge=0, le=0.25)
-    tts_sentence_terminators: str = Field(default='.!?', min_length=1)
-    save_latest_wav: bool = False
-    latest_wav_path: Path = Path(tempfile.gettempdir()) / 'latest.wav'
     system_prompt_path: Path = Path('/tmp/system-prompt')  # noqa: S108
     llm_slots: tuple[int, ...] = (0,)
     llm_max_tokens: int = Field(default=128, ge=1)
@@ -96,7 +90,7 @@ class Settings(BaseSettings):
     maximum_websocket_message_bytes: int = Field(default=2 * 1024**2, ge=1)
     maximum_tool_iterations: int = Field(default=2, ge=1, le=5)
     maximum_tool_result_characters: int = Field(default=8_000, ge=128)
-    default_timezone: str = 'local'
+    default_timezone: str = 'Europe/Berlin'
     listen_port: int = Field(
         default=8080,
         ge=1,

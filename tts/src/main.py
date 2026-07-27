@@ -6,20 +6,34 @@ import io
 import logging
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
 import wave
+from array import array
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Never, Protocol, cast
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.responses import Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from starlette.websockets import WebSocketState
 
 from runtime_config import (
     ConfigurationUpdateResponse,
@@ -30,7 +44,7 @@ from runtime_config import (
 from service_logging import configure_logging
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Generator
+    from collections.abc import AsyncGenerator, Generator, Iterator
 
     from starlette.types import Receive, Scope, Send
 
@@ -61,6 +75,16 @@ REALTIME_FACTOR = Histogram(
     'tts_realtime_factor',
     'TTS generation wall time divided by output audio duration',
     buckets=(0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1, 1.5, 2, 5),
+)
+PIPELINE_REQUESTS = Counter(
+    'tts_pipeline_requests_total',
+    'Completed server-side text segmentation and stitching pipelines',
+    ['transport', 'outcome'],
+)
+PIPELINE_SEGMENTS = Counter(
+    'tts_pipeline_segments_total',
+    'Text segments synthesized by the TTS pipeline',
+    ['transport'],
 )
 RESTART_REQUIRED_SETTINGS: Final = frozenset({'model_id', 'language', 'listen_port'})
 
@@ -164,6 +188,132 @@ class _ClosingStreamingResponse(StreamingResponse):
             await asyncio.to_thread(self._content.close)
 
 
+class _TextSegmenter:
+    """Incrementally split text while retaining only the incomplete tail."""
+
+    def __init__(
+        self,
+        terminators: str,
+        *,
+        first_segment_comma_delimiter: bool,
+    ) -> None:
+        self.terminators = terminators
+        self.first_segment_comma_delimiter = first_segment_comma_delimiter
+        self.pending = ''
+        self.first_segment = True
+
+    def append(self, text: str) -> list[str]:
+        self.pending += text
+        segments: list[str] = []
+        while match := self._next_boundary():
+            segment = self.pending[: match.end()].strip()
+            self.pending = self.pending[match.end() :].lstrip()
+            if segment:
+                segments.append(segment)
+                self.first_segment = False
+        return segments
+
+    def finish(self) -> list[str]:
+        segments = self.append('')
+        tail = self.pending.strip()
+        self.pending = ''
+        if tail:
+            segments.append(tail)
+            self.first_segment = False
+        return segments
+
+    def _next_boundary(self) -> re.Match[str] | None:
+        terminators = self.terminators
+        if self.first_segment and self.first_segment_comma_delimiter:
+            terminators += ','
+        return re.search(rf'[{re.escape(terminators)}](?=\s|$)', self.pending)
+
+
+def _duration_frames(duration_seconds: float, sample_rate: int) -> int:
+    return int(duration_seconds * sample_rate + 0.5)
+
+
+def _linear_fade_pcm16(  # noqa: C901
+    pcm: bytes,
+    *,
+    start_frame: int,
+    fade_frames: int,
+    fade_in: bool,
+) -> bytes:
+    if not pcm or fade_frames <= 1 or start_frame >= fade_frames:
+        return pcm
+    if len(pcm) % 2:
+        message = 'TTS returned a partial PCM16 frame'
+        raise RuntimeError(message)
+
+    samples = array('h')
+    samples.frombytes(pcm)
+    if sys.byteorder == 'big':
+        samples.byteswap()
+    frames_to_fade = min(len(samples), fade_frames - start_frame)
+    denominator = fade_frames - 1
+    for frame_offset in range(frames_to_fade):
+        fade_frame = start_frame + frame_offset
+        numerator = fade_frame if fade_in else denominator - fade_frame
+        samples[frame_offset] = round(samples[frame_offset] * numerator / denominator)
+    if sys.byteorder == 'big':
+        samples.byteswap()
+    return samples.tobytes()
+
+
+class _SentencePcmBuffer:
+    """Stream a segment while retaining only the tail needed for its boundary fade."""
+
+    def __init__(
+        self,
+        sample_rate: int,
+        crossfade_seconds: float,
+        *,
+        fade_in: bool,
+    ) -> None:
+        self.crossfade_frames = _duration_frames(crossfade_seconds, sample_rate)
+        self.fade_in = fade_in
+        self.frames_emitted = 0
+        self.buffer = bytearray()
+
+    def append(self, pcm: bytes) -> bytes:
+        self.buffer.extend(pcm)
+        emit_bytes = max(0, len(self.buffer) - self.crossfade_frames * 2)
+        emit_bytes -= emit_bytes % 2
+        if not emit_bytes:
+            return b''
+        output = bytes(self.buffer[:emit_bytes])
+        del self.buffer[:emit_bytes]
+        return self._apply_fade_in(output)
+
+    def finish(self, *, fade_out: bool) -> bytes:
+        if len(self.buffer) % 2:
+            message = 'TTS returned a partial PCM16 frame'
+            raise RuntimeError(message)
+        output = self._apply_fade_in(bytes(self.buffer))
+        self.buffer.clear()
+        if not fade_out:
+            return output
+        return _linear_fade_pcm16(
+            output,
+            start_frame=0,
+            fade_frames=len(output) // 2,
+            fade_in=False,
+        )
+
+    def _apply_fade_in(self, pcm: bytes) -> bytes:
+        output = pcm
+        if self.fade_in:
+            output = _linear_fade_pcm16(
+                pcm,
+                start_frame=self.frames_emitted,
+                fade_frames=self.crossfade_frames,
+                fade_in=True,
+            )
+        self.frames_emitted += len(pcm) // 2
+        return output
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix='TTS_',
@@ -184,6 +334,11 @@ class Settings(BaseSettings):
     torch_threads: int = Field(default=2, ge=1)
     maximum_input_characters: int = Field(default=4_000, ge=1)
     maximum_voice_upload_bytes: int = Field(default=100 * 1024**2, ge=1)
+    pipeline_sentence_pause_seconds: float = Field(default=0.12, ge=0, le=2)
+    pipeline_sentence_crossfade_seconds: float = Field(default=0.01, ge=0, le=0.25)
+    pipeline_sentence_terminators: str = Field(default='.!?', min_length=1)
+    pipeline_first_segment_comma_delimiter: bool = True
+    pipeline_idle_timeout_seconds: float = Field(default=30.0, gt=0)
     save_latest_wav: bool = False
     latest_wav_path: Path = Path(tempfile.gettempdir()) / 'latest.wav'
     listen_port: int = Field(
@@ -201,6 +356,7 @@ class HealthResponse(BaseModel):
     language: str
     streaming: Literal[True] = True
     stream_endpoint: Literal['/v1/audio/speech'] = '/v1/audio/speech'
+    pipeline_endpoint: Literal['/v1/audio/speech/pipeline'] = '/v1/audio/speech/pipeline'
     sample_rate: int
     load_seconds: float
     voice_load_seconds: float
@@ -214,6 +370,35 @@ class SpeechRequest(BaseModel):
     voice: str | None = None
     response_format: Literal['pcm', 'wav'] = 'wav'
     speed: float = Field(default=1.0, gt=0)
+
+
+class PipelineSessionRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    type: Literal['session.start']
+    model: str = MODEL_ID
+    voice: str | None = None
+    speed: float = Field(default=1.0, gt=0)
+
+
+class PipelineTextDelta(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    type: Literal['input_text.delta']
+    delta: str = Field(min_length=1)
+
+
+class PipelineTextDone(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    type: Literal['input_text.done']
+
+
+PipelineInputEvent = Annotated[
+    PipelineTextDelta | PipelineTextDone,
+    Field(discriminator='type'),
+]
+PIPELINE_INPUT_ADAPTER = TypeAdapter(PipelineInputEvent)
 
 
 class LegacySpeechRequest(BaseModel):
@@ -316,7 +501,7 @@ class TtsRuntime:
             'Loading TTS model',
             extra={'event_id': 'ID_tts_model_loading', 'model': self.settings.model_id},
         )
-        self.settings.data_directory.mkdir(parents=True, exist_ok=True)
+        _ = self.settings.data_directory.mkdir(parents=True, exist_ok=True)
         self.torch = cast('_TorchModule', importlib.import_module('torch'))
         pocket_tts = importlib.import_module('pocket_tts')
         self.torch.set_num_threads(self.settings.torch_threads)
@@ -439,13 +624,11 @@ class TtsRuntime:
 
     def validate_request(self, request: SpeechRequest) -> str:
         text = request.input.strip()
-        if request.model != self.settings.model_id:
-            detail = f'loaded model is {self.settings.model_id}, not {request.model}'
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-        if request.speed != 1.0:
+        self.validate_options(request.model, request.speed)
+        if not text:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Pocket TTS does not support speed adjustment',
+                detail='input must contain non-whitespace text',
             )
         if len(text) > self.settings.maximum_input_characters:
             raise HTTPException(
@@ -453,6 +636,16 @@ class TtsRuntime:
                 detail='input exceeds TTS_MAX_INPUT_CHARACTERS',
             )
         return text
+
+    def validate_options(self, model: str, speed: float) -> None:
+        if model != self.settings.model_id:
+            detail = f'loaded model is {self.settings.model_id}, not {model}'
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+        if speed != 1.0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Pocket TTS does not support speed adjustment',
+            )
 
     def generate_wav(self, text: str, voice: str) -> bytes:
         model, voice_state = self._loaded_model(voice)
@@ -463,28 +656,33 @@ class TtsRuntime:
             self._save_latest_wav_response(wav)
         return wav
 
-    def stream_pcm(self, text: str, voice: str) -> Generator[bytes, None, None]:
+    def stream_model_pcm(self, text: str, voice: str) -> Generator[bytes, None, None]:
+        """Stream raw model PCM without request-level recording semantics."""
         model, voice_state = self._loaded_model(voice)
+        with self.lock:
+            for audio_chunk in model.generate_audio_stream(voice_state, text):
+                chunk = self._pcm16_bytes(audio_chunk)
+                if chunk:
+                    yield chunk
+
+    def stream_pcm(self, text: str, voice: str) -> Generator[bytes, None, None]:
         output_bytes = 0
         capture: _AtomicWavWriter | None = None
         completed = False
-        with self.lock:
-            if self.settings.save_latest_wav:
-                capture = self._open_latest_wav_capture(int(model.sample_rate))
-            try:
-                for audio_chunk in model.generate_audio_stream(voice_state, text):
-                    chunk = self._pcm16_bytes(audio_chunk)
-                    if chunk:
-                        output_bytes += len(chunk)
-                        yield chunk
-                        capture = self._write_latest_wav_chunk(capture, chunk)
-                completed = True
-            finally:
-                self._finish_latest_wav_capture(
-                    capture,
-                    completed=completed,
-                    pcm_bytes=output_bytes,
-                )
+        if self.settings.save_latest_wav:
+            capture = self.open_latest_wav_capture(self.sample_rate())
+        try:
+            for chunk in self.stream_model_pcm(text, voice):
+                output_bytes += len(chunk)
+                yield chunk
+                capture = self.write_latest_wav_chunk(capture, chunk)
+            completed = True
+        finally:
+            self.finish_latest_wav_capture(
+                capture,
+                completed=completed,
+                pcm_bytes=output_bytes,
+            )
         LOGGER.info(
             'Speech synthesis completed',
             extra={
@@ -494,12 +692,47 @@ class TtsRuntime:
             },
         )
 
+    def generate_pipeline_wav(self, text: str, voice: str) -> tuple[bytes, int]:
+        pcm = b''.join(self.stream_pipeline_pcm(text, voice, capture_latest=False))
+        wav = self._wav_from_pcm(self.sample_rate(), pcm)
+        if self.settings.save_latest_wav:
+            self._save_latest_wav_response(wav)
+        return wav, len(pcm)
+
+    def stream_pipeline_pcm(
+        self,
+        text: str,
+        voice: str,
+        *,
+        capture_latest: bool = True,
+        transport: str = 'http',
+    ) -> Generator[bytes, None, None]:
+        segmenter = _TextSegmenter(
+            self.settings.pipeline_sentence_terminators,
+            first_segment_comma_delimiter=self.settings.pipeline_first_segment_comma_delimiter,
+        )
+        segments = [*segmenter.append(text), *segmenter.finish()]
+        pipeline = _PcmPipeline(
+            self,
+            voice,
+            capture_latest=capture_latest,
+            transport=transport,
+        )
+        completed = False
+        try:
+            for segment in segments:
+                yield from pipeline.add_segment(segment)
+            yield from pipeline.finish()
+            completed = True
+        finally:
+            pipeline.close(completed=completed)
+
     def _save_latest_wav_response(self, wav: bytes) -> None:
         """Atomically persist the exact WAV response body without regenerating audio."""
         destination = self.settings.latest_wav_path
         temporary_path: Path | None = None
         try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = destination.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
                 dir=destination.parent,
                 prefix=f'.{destination.name}.',
@@ -527,14 +760,14 @@ class TtsRuntime:
             },
         )
 
-    def _open_latest_wav_capture(self, sample_rate: int) -> _AtomicWavWriter | None:
+    def open_latest_wav_capture(self, sample_rate: int) -> _AtomicWavWriter | None:
         try:
             return _AtomicWavWriter(self.settings.latest_wav_path, sample_rate)
         except (OSError, wave.Error):
             self._log_latest_wav_failure()
             return None
 
-    def _write_latest_wav_chunk(
+    def write_latest_wav_chunk(
         self,
         capture: _AtomicWavWriter | None,
         chunk: bytes,
@@ -549,7 +782,7 @@ class TtsRuntime:
             return None
         return capture
 
-    def _finish_latest_wav_capture(
+    def finish_latest_wav_capture(
         self,
         capture: _AtomicWavWriter | None,
         *,
@@ -631,13 +864,115 @@ class TtsRuntime:
         return cast('bytes', tensor.numpy().tobytes())
 
     def _wav_bytes(self, sample_rate: int, audio: Any) -> bytes:  # noqa: ANN401
+        return self._wav_from_pcm(sample_rate, self._pcm16_bytes(audio))
+
+    @staticmethod
+    def _wav_from_pcm(sample_rate: int, pcm: bytes) -> bytes:
         output = io.BytesIO()
         with wave.open(output, 'wb') as wav_file:
             wav_file.setnchannels(1)
             wav_file.setsampwidth(2)
             wav_file.setframerate(sample_rate)
-            wav_file.writeframes(self._pcm16_bytes(audio))
+            wav_file.writeframes(pcm)
         return output.getvalue()
+
+
+class _PcmPipeline:
+    """Synthesize text segments while streaming one stitched PCM response."""
+
+    def __init__(
+        self,
+        runtime: TtsRuntime,
+        voice: str,
+        *,
+        capture_latest: bool,
+        transport: str,
+    ) -> None:
+        self.runtime = runtime
+        self.voice = voice
+        self.transport = transport
+        self.sample_rate = runtime.sample_rate()
+        self.capture_latest = capture_latest and runtime.settings.save_latest_wav
+        self.capture_attempted = False
+        self.capture: _AtomicWavWriter | None = None
+        self.pending: _SentencePcmBuffer | None = None
+        self.previous_segment_had_audio = False
+        self.output_bytes = 0
+        self.closed = False
+
+    def add_segment(self, text: str) -> Generator[bytes, None, None]:  # noqa: C901
+        if self.pending is not None:
+            tail = self.pending.finish(fade_out=True)
+            self.pending = None
+            self.previous_segment_had_audio = True
+            if tail:
+                yield self._capture(tail)
+
+        PIPELINE_SEGMENTS.labels(transport=self.transport).inc()
+        LOGGER.info(
+            'TTS pipeline segment requested',
+            extra={
+                'event_id': 'ID_tts_pipeline_segment_requested',
+                'transport': self.transport,
+                'characters': len(text),
+            },
+        )
+        LOGGER.debug(
+            'TTS pipeline segment',
+            extra={
+                'event_id': 'ID_tts_pipeline_segment',
+                'transport': self.transport,
+                'text': text,
+            },
+        )
+
+        segment: _SentencePcmBuffer | None = None
+        for chunk in self.runtime.stream_model_pcm(text, self.voice):
+            if segment is None:
+                segment = _SentencePcmBuffer(
+                    self.sample_rate,
+                    self.runtime.settings.pipeline_sentence_crossfade_seconds,
+                    fade_in=self.previous_segment_had_audio,
+                )
+                if self.previous_segment_had_audio:
+                    pause_frames = _duration_frames(
+                        self.runtime.settings.pipeline_sentence_pause_seconds,
+                        self.sample_rate,
+                    )
+                    if pause_frames:
+                        yield self._capture(b'\0' * (pause_frames * 2))
+            output = segment.append(chunk)
+            if output:
+                yield self._capture(output)
+        self.pending = segment
+
+    def finish(self) -> Generator[bytes, None, None]:
+        if self.pending is None:
+            return
+        output = self.pending.finish(fade_out=False)
+        self.pending = None
+        self.previous_segment_had_audio = True
+        if output:
+            yield self._capture(output)
+
+    def close(self, *, completed: bool) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.runtime.finish_latest_wav_capture(
+            self.capture,
+            completed=completed,
+            pcm_bytes=self.output_bytes,
+        )
+        self.capture = None
+
+    def _capture(self, pcm: bytes) -> bytes:
+        if self.capture_latest and not self.capture_attempted:
+            self.capture_attempted = True
+            self.capture = self.runtime.open_latest_wav_capture(self.sample_rate)
+        self.capture = self.runtime.write_latest_wav_chunk(self.capture, pcm)
+        self.output_bytes += len(pcm)
+        return pcm
 
 
 SETTINGS = Settings()
@@ -662,6 +997,10 @@ def _runtime(request: Request) -> TtsRuntime:
     return cast('TtsRuntime', request.app.state.runtime)
 
 
+def _runtime_from_websocket(websocket: WebSocket) -> TtsRuntime:
+    return cast('TtsRuntime', websocket.app.state.runtime)
+
+
 def _observe_request(
     response_format: str,
     outcome: str,
@@ -678,19 +1017,27 @@ def _observe_request(
         REALTIME_FACTOR.observe(wall_seconds / audio_seconds)
 
 
-def _stream_speech(
+def _stream_speech(  # noqa: C901
     runtime: TtsRuntime,
     text: str,
     voice: str,
     started: float,
+    *,
+    pipeline: bool,
 ) -> Generator[bytes, None, None]:
     outcome = 'success'
     output_bytes = 0
     first_audio = True
     sample_rate = 0
+    chunks: Generator[bytes, None, None] | None = None
     try:
         sample_rate = runtime.sample_rate()
-        for chunk in runtime.stream_pcm(text, voice):
+        chunks = (
+            runtime.stream_pipeline_pcm(text, voice, transport='http')
+            if pipeline
+            else runtime.stream_pcm(text, voice)
+        )
+        for chunk in chunks:
             if first_audio:
                 first_audio = False
                 TIME_TO_FIRST_AUDIO.observe(time.perf_counter() - started)
@@ -703,14 +1050,28 @@ def _stream_speech(
         outcome = 'error'
         raise
     finally:
+        if chunks is not None:
+            chunks.close()
         runtime.operations.release()
         ACTIVE_REQUESTS.dec()
         _observe_request('pcm', outcome, started, output_bytes, sample_rate)
+        if pipeline:
+            PIPELINE_REQUESTS.labels(transport='http', outcome=outcome).inc()
+            LOGGER.info(
+                'TTS HTTP pipeline finished',
+                extra={
+                    'event_id': 'ID_tts_pipeline_http_finished',
+                    'outcome': outcome,
+                    'audio_bytes': output_bytes,
+                },
+            )
 
 
 def _speech_response(  # noqa: C901
     runtime: TtsRuntime,
     speech_request: SpeechRequest,
+    *,
+    pipeline: bool,
 ) -> Response:
     try:
         reject_if_busy(runtime.operations, 'TTS')
@@ -730,6 +1091,7 @@ def _speech_response(  # noqa: C901
             extra={
                 'event_id': 'ID_tts_synthesis_requested',
                 'response_format': speech_request.response_format,
+                'pipeline': pipeline,
                 'characters': len(text),
                 'voice': voice,
             },
@@ -740,13 +1102,21 @@ def _speech_response(  # noqa: C901
         )
         if speech_request.response_format == 'pcm':
             response = _ClosingStreamingResponse(
-                _stream_speech(runtime, text, voice, started),
+                _stream_speech(runtime, text, voice, started, pipeline=pipeline),
                 media_type='application/octet-stream',
                 headers=runtime.pcm_headers(),
             )
             stream_response = True
             return response
-        wav = runtime.generate_wav(text, voice)
+        if pipeline:
+            wav, pcm_bytes = runtime.generate_pipeline_wav(text, voice)
+            PIPELINE_REQUESTS.labels(transport='http', outcome=outcome).inc()
+        else:
+            wav = runtime.generate_wav(text, voice)
+            with wave.open(io.BytesIO(wav), 'rb') as wav_file:
+                pcm_bytes = (
+                    wav_file.getnframes() * wav_file.getnchannels() * wav_file.getsampwidth()
+                )
         LOGGER.info(
             'Speech synthesis completed',
             extra={
@@ -755,15 +1125,15 @@ def _speech_response(  # noqa: C901
                 'audio_bytes': len(wav),
             },
         )
-        with wave.open(io.BytesIO(wav), 'rb') as wav_file:
-            sample_rate = wav_file.getframerate()
-            pcm_bytes = wav_file.getnframes() * wav_file.getnchannels() * wav_file.getsampwidth()
+        sample_rate = runtime.sample_rate()
         response = Response(wav, media_type='audio/wav')
         _observe_request('wav', outcome, started, pcm_bytes, sample_rate)
         request_observed = True
         return response  # noqa: TRY300
     except Exception:
         outcome = 'error'
+        if pipeline and speech_request.response_format == 'wav':
+            PIPELINE_REQUESTS.labels(transport='http', outcome=outcome).inc()
         raise
     finally:
         if not stream_response:
@@ -771,6 +1141,226 @@ def _speech_response(  # noqa: C901
             ACTIVE_REQUESTS.dec()
             if not request_observed:
                 _observe_request(speech_request.response_format, outcome, started, 0, 1)
+
+
+def _next_pcm_chunk(chunks: Iterator[bytes]) -> bytes | None:
+    try:
+        return next(chunks)
+    except StopIteration:
+        return None
+
+
+class _WebSocketPcmSender:
+    def __init__(self, websocket: WebSocket, sample_rate: int, started: float) -> None:
+        self.websocket = websocket
+        self.sample_rate = sample_rate
+        self.started = started
+        self.output_bytes = 0
+        self.first_audio = True
+
+    async def send(self, chunks: Generator[bytes, None, None]) -> None:
+        try:
+            while chunk := await asyncio.to_thread(_next_pcm_chunk, chunks):
+                if self.first_audio:
+                    self.first_audio = False
+                    TIME_TO_FIRST_AUDIO.observe(time.perf_counter() - self.started)
+                await self.websocket.send_bytes(chunk)
+                self.output_bytes += len(chunk)
+        finally:
+            await asyncio.to_thread(chunks.close)
+
+
+async def _receive_pipeline_text(websocket: WebSocket, timeout_seconds: float) -> str:
+    async with asyncio.timeout(timeout_seconds):
+        return await websocket.receive_text()
+
+
+async def _close_pipeline_websocket(
+    websocket: WebSocket,
+    *,
+    code: int,
+    message: str,
+) -> None:
+    if websocket.client_state != WebSocketState.CONNECTED:
+        return
+    with suppress(RuntimeError):
+        await websocket.send_json({'type': 'error', 'message': message})
+    with suppress(RuntimeError):
+        await websocket.close(code=code, reason=message)
+
+
+def _pipeline_validation_message(error: HTTPException | ValidationError) -> str:
+    if isinstance(error, HTTPException):
+        return str(error.detail)
+    return 'invalid pipeline event'
+
+
+def _raise_empty_pipeline() -> Never:
+    message = 'pipeline input is empty'
+    raise ValueError(message)
+
+
+def _enforce_pipeline_input_limit(input_characters: int, maximum: int) -> None:
+    if input_characters <= maximum:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+        detail='input exceeds TTS_MAX_INPUT_CHARACTERS',
+    )
+
+
+async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
+    websocket: WebSocket,
+    runtime: TtsRuntime,
+) -> None:
+    started = time.perf_counter()
+    outcome = 'success'
+    gate_acquired = False
+    active_request = False
+    completed = False
+    pipeline: _PcmPipeline | None = None
+    sender: _WebSocketPcmSender | None = None
+    try:
+        await websocket.accept()
+        session_raw = await _receive_pipeline_text(
+            websocket,
+            runtime.settings.pipeline_idle_timeout_seconds,
+        )
+        session = PipelineSessionRequest.model_validate_json(session_raw)
+        runtime.validate_options(session.model, session.speed)
+        await websocket.send_json(
+            {
+                'type': 'session.ready',
+                'format': 'pcm16',
+                'sample_rate': runtime.sample_rate(),
+                'sample_width': 2,
+                'channels': 1,
+            },
+        )
+        LOGGER.info(
+            'TTS pipeline WebSocket started',
+            extra={'event_id': 'ID_tts_pipeline_websocket_started'},
+        )
+
+        segmenter: _TextSegmenter | None = None
+        input_characters = 0
+        input_has_text = False
+        input_done = False
+        while not input_done:
+            raw = await _receive_pipeline_text(
+                websocket,
+                runtime.settings.pipeline_idle_timeout_seconds,
+            )
+            event = PIPELINE_INPUT_ADAPTER.validate_json(raw)
+            if isinstance(event, PipelineTextDone):
+                if segmenter is None or not input_has_text:
+                    _raise_empty_pipeline()
+                segments = segmenter.finish()
+                input_done = True
+            else:
+                input_characters += len(event.delta)
+                input_has_text = input_has_text or bool(event.delta.strip())
+                _enforce_pipeline_input_limit(
+                    input_characters,
+                    runtime.settings.maximum_input_characters,
+                )
+                if segmenter is None:
+                    if not runtime.operations.try_acquire():
+                        BUSY_REJECTIONS.inc()
+                        outcome = 'busy'
+                        await _close_pipeline_websocket(
+                            websocket,
+                            code=status.WS_1013_TRY_AGAIN_LATER,
+                            message='TTS is busy',
+                        )
+                        return
+                    gate_acquired = True
+                    ACTIVE_REQUESTS.inc()
+                    active_request = True
+                    voice = await asyncio.to_thread(runtime.prepare_voice, session.voice)
+                    segmenter = _TextSegmenter(
+                        runtime.settings.pipeline_sentence_terminators,
+                        first_segment_comma_delimiter=(
+                            runtime.settings.pipeline_first_segment_comma_delimiter
+                        ),
+                    )
+                    pipeline = _PcmPipeline(
+                        runtime,
+                        voice,
+                        capture_latest=True,
+                        transport='websocket',
+                    )
+                    sender = _WebSocketPcmSender(websocket, pipeline.sample_rate, started)
+                segments = segmenter.append(event.delta)
+
+            if pipeline is None or sender is None:
+                continue
+            for segment in segments:
+                await sender.send(pipeline.add_segment(segment))
+
+        if pipeline is None or sender is None:
+            _raise_empty_pipeline()
+        await sender.send(pipeline.finish())
+        pipeline.close(completed=True)
+        completed = True
+        await websocket.send_json({'type': 'response.audio.done'})
+        await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
+        LOGGER.info(
+            'TTS pipeline WebSocket completed',
+            extra={
+                'event_id': 'ID_tts_pipeline_websocket_completed',
+                'characters': input_characters,
+                'audio_bytes': sender.output_bytes,
+            },
+        )
+    except WebSocketDisconnect:
+        outcome = 'cancelled'
+        LOGGER.info(
+            'TTS pipeline WebSocket disconnected',
+            extra={'event_id': 'ID_tts_pipeline_websocket_disconnected'},
+        )
+    except TimeoutError:
+        outcome = 'timeout'
+        await _close_pipeline_websocket(
+            websocket,
+            code=status.WS_1008_POLICY_VIOLATION,
+            message='pipeline input timed out',
+        )
+    except (HTTPException, ValidationError) as error:
+        outcome = 'rejected'
+        await _close_pipeline_websocket(
+            websocket,
+            code=status.WS_1008_POLICY_VIOLATION,
+            message=_pipeline_validation_message(error),
+        )
+    except ValueError as error:
+        outcome = 'rejected'
+        await _close_pipeline_websocket(
+            websocket,
+            code=status.WS_1008_POLICY_VIOLATION,
+            message=str(error),
+        )
+    except Exception:
+        outcome = 'error'
+        LOGGER.exception(
+            'TTS pipeline WebSocket failed',
+            extra={'event_id': 'ID_tts_pipeline_websocket_failed'},
+        )
+        await _close_pipeline_websocket(
+            websocket,
+            code=status.WS_1011_INTERNAL_ERROR,
+            message='TTS pipeline failed',
+        )
+    finally:
+        if pipeline is not None and not completed:
+            pipeline.close(completed=False)
+        if gate_acquired:
+            runtime.operations.release()
+        if active_request:
+            ACTIVE_REQUESTS.dec()
+            output_bytes = sender.output_bytes if sender is not None else 0
+            _observe_request('pcm', outcome, started, output_bytes, runtime.sample_rate())
+        PIPELINE_REQUESTS.labels(transport='websocket', outcome=outcome).inc()
 
 
 def _save_upload_atomic(upload: UploadFile, destination: Path, maximum_bytes: int) -> None:
@@ -877,8 +1467,23 @@ async def update_configuration(
 
 
 @app.post('/v1/audio/speech')
-def speech(request: Request, speech_request: SpeechRequest) -> Response:
-    return _speech_response(_runtime(request), speech_request)
+def speech(
+    request: Request,
+    speech_request: SpeechRequest,
+    *,
+    x_pipeline: Annotated[bool, Header(alias='X-Pipeline')] = False,
+) -> Response:
+    return _speech_response(_runtime(request), speech_request, pipeline=x_pipeline)
+
+
+@app.post('/v1/audio/speech/pipeline')
+def speech_pipeline(request: Request, speech_request: SpeechRequest) -> Response:
+    return _speech_response(_runtime(request), speech_request, pipeline=True)
+
+
+@app.websocket('/v1/audio/speech/pipeline')
+async def speech_pipeline_websocket(websocket: WebSocket) -> None:
+    await _stream_pipeline_websocket(websocket, _runtime_from_websocket(websocket))
 
 
 @app.post('/v1/voices', response_model=VoiceUploadResponse, status_code=status.HTTP_201_CREATED)
@@ -907,6 +1512,7 @@ def synthesize(request: Request, speech_request: LegacySpeechRequest) -> Respons
     return _speech_response(
         runtime,
         SpeechRequest(model=runtime.settings.model_id, input=speech_request.text),
+        pipeline=False,
     )
 
 
@@ -920,6 +1526,7 @@ def synthesize_stream(request: Request, speech_request: LegacySpeechRequest) -> 
             input=speech_request.text,
             response_format='pcm',
         ),
+        pipeline=False,
     )
 
 
