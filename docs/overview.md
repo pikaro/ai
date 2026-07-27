@@ -270,11 +270,11 @@ generation is admitted and concurrent requests receive `409 Conflict` instead
 of waiting on its model lock. Relevant settings use the `TTS_` prefix; defaults
 are declared in `tts/src/main.py`.
 
-Speech requests may select a voice with the `X-Voice` header. An omitted header
-or `X-Voice: default` selects `TTS_VOICE`; a named value such as
-`X-Voice: bender` selects the corresponding uploaded voice or Pocket TTS canned
-voice. Voice states are loaded on first use and retained while the process is
-running, sharing the single base model.
+Speech requests select a voice with the OpenAI-compatible `voice` body field.
+An omitted value or `"voice": "default"` selects `TTS_VOICE`; a named value
+such as `"voice": "bender"` selects the corresponding uploaded voice or Pocket
+TTS canned voice. Voice states are loaded on first use and retained while the
+process is running, sharing the single base model.
 
 Set `TTS_SAVE_LATEST_WAV=true` to atomically overwrite the most recently
 completed synthesized recording. `TTS_LATEST_WAV_PATH` defaults to
@@ -295,7 +295,7 @@ curl -F name=foo -F file=@foo.safetensors http://localhost:8080/v1/voices
 
 Uploads are stored atomically as `<name>.safetensors` in
 `TTS_DATA_DIRECTORY`, which defaults to `/data`. `TTS_MAXIMUM_VOICE_UPLOAD_BYTES`
-limits each upload and defaults to 100 MiB. A request with `X-Voice: foo`
+limits each upload and defaults to 100 MiB. A request with `"voice": "foo"`
 selects `/data/foo.safetensors` (or the corresponding file in the configured
 data directory); setting `TTS_VOICE=foo` makes it the default. Replacing a voice
 through the upload endpoint invalidates its cached state so the next request

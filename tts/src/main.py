@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol, cast
 
 import uvicorn
-from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel, ConfigDict, Field
@@ -392,9 +392,9 @@ class TtsRuntime:
             voice_load_seconds=self.voice_load_seconds,
         )
 
-    def prepare_voice(self, selector: str | None) -> str:
+    def prepare_voice(self, requested_voice: str | None) -> str:
         """Resolve and cache a request voice before response streaming begins."""
-        voice = self._selected_voice(selector)
+        voice = self._selected_voice(requested_voice)
         model = self.model
         if model is None:
             message = 'TTS model is not loaded'
@@ -424,16 +424,16 @@ class TtsRuntime:
             )
         return voice
 
-    def _selected_voice(self, selector: str | None) -> str:
-        if selector is None:
+    def _selected_voice(self, requested_voice: str | None) -> str:
+        if requested_voice is None:
             return self.settings.voice
-        requested = selector.strip()
+        requested = requested_voice.strip()
         if not requested or requested.casefold() == 'default':
             return self.settings.voice
         if VOICE_NAME_PATTERN.fullmatch(requested) is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail='X-Voice must be "default" or a valid voice name',
+                detail='voice must be "default" or a valid voice name',
             )
         return requested
 
@@ -441,9 +441,6 @@ class TtsRuntime:
         text = request.input.strip()
         if request.model != self.settings.model_id:
             detail = f'loaded model is {self.settings.model_id}, not {request.model}'
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-        if request.voice is not None and request.voice != self.settings.voice:
-            detail = f'loaded voice is {self.settings.voice}, not {request.voice}'
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
         if request.speed != 1.0:
             raise HTTPException(
@@ -714,7 +711,6 @@ def _stream_speech(
 def _speech_response(  # noqa: C901
     runtime: TtsRuntime,
     speech_request: SpeechRequest,
-    voice_selector: str | None,
 ) -> Response:
     try:
         reject_if_busy(runtime.operations, 'TTS')
@@ -728,7 +724,7 @@ def _speech_response(  # noqa: C901
     outcome = 'success'
     try:
         text = runtime.validate_request(speech_request)
-        voice = runtime.prepare_voice(voice_selector)
+        voice = runtime.prepare_voice(speech_request.voice)
         LOGGER.info(
             'Speech synthesis requested',
             extra={
@@ -881,12 +877,8 @@ async def update_configuration(
 
 
 @app.post('/v1/audio/speech')
-def speech(
-    request: Request,
-    speech_request: SpeechRequest,
-    x_voice: Annotated[str | None, Header(alias='X-Voice')] = None,
-) -> Response:
-    return _speech_response(_runtime(request), speech_request, x_voice)
+def speech(request: Request, speech_request: SpeechRequest) -> Response:
+    return _speech_response(_runtime(request), speech_request)
 
 
 @app.post('/v1/voices', response_model=VoiceUploadResponse, status_code=status.HTTP_201_CREATED)
@@ -910,25 +902,16 @@ async def upload_voice(
 
 
 @app.post('/synthesize')
-def synthesize(
-    request: Request,
-    speech_request: LegacySpeechRequest,
-    x_voice: Annotated[str | None, Header(alias='X-Voice')] = None,
-) -> Response:
+def synthesize(request: Request, speech_request: LegacySpeechRequest) -> Response:
     runtime = _runtime(request)
     return _speech_response(
         runtime,
         SpeechRequest(model=runtime.settings.model_id, input=speech_request.text),
-        x_voice,
     )
 
 
 @app.post('/synthesize_stream')
-def synthesize_stream(
-    request: Request,
-    speech_request: LegacySpeechRequest,
-    x_voice: Annotated[str | None, Header(alias='X-Voice')] = None,
-) -> Response:
+def synthesize_stream(request: Request, speech_request: LegacySpeechRequest) -> Response:
     runtime = _runtime(request)
     return _speech_response(
         runtime,
@@ -937,7 +920,6 @@ def synthesize_stream(
             input=speech_request.text,
             response_format='pcm',
         ),
-        x_voice,
     )
 
 

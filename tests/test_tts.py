@@ -137,10 +137,9 @@ class RequestValidationTest(unittest.TestCase):
         request = SpeechRequest(model=MODEL_ID, input=' hello ', voice='alba')
         self.assertEqual(self.runtime.validate_request(request), 'hello')
 
-    def test_unknown_voice_is_rejected(self) -> None:
-        request = SpeechRequest(model=MODEL_ID, input='hello', voice='unknown')
-        with self.assertRaises(HTTPException):
-            _ = self.runtime.validate_request(request)
+    def test_named_voice_does_not_need_to_match_configured_default(self) -> None:
+        request = SpeechRequest(model=MODEL_ID, input='hello', voice='bender')
+        self.assertEqual(self.runtime.validate_request(request), 'hello')
 
     def test_unsupported_speed_is_rejected(self) -> None:
         request = SpeechRequest(model=MODEL_ID, input='hello', speed=1.5)
@@ -260,7 +259,7 @@ class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.content, b'\x01\x02')
         self.assertFalse(runtime.operations.active)
 
-    async def test_x_voice_header_selects_cached_custom_voice(self) -> None:
+    async def test_body_voice_selects_cached_custom_voice(self) -> None:
         runtime = TtsRuntime(Settings(voice='attenborough'))
         runtime.model = MagicMock(sample_rate=24_000)
         attenborough_state = object()
@@ -276,14 +275,18 @@ class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
             async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
                 response = await client.post(
                     '/v1/audio/speech',
-                    headers={'X-Voice': 'bender'},
-                    json={'model': MODEL_ID, 'input': 'hello', 'response_format': 'pcm'},
+                    json={
+                        'model': MODEL_ID,
+                        'input': 'hello',
+                        'voice': 'bender',
+                        'response_format': 'pcm',
+                    },
                 )
 
         self.assertEqual(response.status_code, 200)
         runtime.model.generate_audio_stream.assert_called_once_with(bender_state, 'hello')
 
-    async def test_unavailable_x_voice_is_rejected_before_streaming(self) -> None:
+    async def test_unavailable_body_voice_is_rejected_before_streaming(self) -> None:
         runtime = TtsRuntime(Settings())
         runtime.model = MagicMock()
         runtime.model.get_state_for_audio_prompt.side_effect = FileNotFoundError
@@ -293,8 +296,12 @@ class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
             response = await client.post(
                 '/v1/audio/speech',
-                headers={'X-Voice': 'missing'},
-                json={'model': MODEL_ID, 'input': 'hello', 'response_format': 'pcm'},
+                json={
+                    'model': MODEL_ID,
+                    'input': 'hello',
+                    'voice': 'missing',
+                    'response_format': 'pcm',
+                },
             )
 
         self.assertEqual(response.status_code, 400)
