@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import io
+import json
 import logging
 import math
 import os
@@ -14,7 +15,9 @@ import time
 import wave
 from array import array
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
+from statistics import NormalDist
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Never, Protocol, cast
 
 import uvicorn
@@ -53,6 +56,13 @@ LOGGER = logging.getLogger('tts')
 MODEL_ID: Final = 'kyutai/pocket-tts'
 READ_CHUNK_BYTES: Final = 1024 * 1024
 VOICE_NAME_PATTERN: Final = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
+SMART_CHUNK_KNOWLEDGE_VERSION: Final = 1
+SMART_CHUNK_MINIMUM_OBSERVATIONS: Final = 5
+SMART_CHUNK_DEFAULT_CHARACTERS_PER_SENTENCE: Final = 72.0
+SMART_CHUNK_DEFAULT_WORDS_PER_SENTENCE: Final = 12.0
+SMART_CHUNK_DEFAULT_AUDIO_SECONDS_PER_CHARACTER: Final = 0.055
+SMART_CHUNK_DEFAULT_AUDIO_SECONDS_PER_WORD: Final = 0.33
+SMART_CHUNK_DEFAULT_FIRST_AUDIO_SECONDS: Final = 0.12
 MODEL_READY = Gauge('tts_model_ready', 'Whether the TTS model and voice are loaded and ready')
 MODEL_LOAD_SECONDS = Gauge('tts_model_load_seconds', 'Time spent loading the TTS model')
 VOICE_LOAD_SECONDS = Gauge('tts_voice_load_seconds', 'Time spent loading the TTS voice')
@@ -203,21 +213,26 @@ class _TextSegmenter:
         self.pending = ''
         self.first_segment = True
 
-    def append(self, text: str) -> list[tuple[str, Literal['clause', 'sentence', 'input_end']]]:
+    def append(
+        self,
+        text: str,
+    ) -> list[tuple[str, Literal['clause', 'sentence', 'paragraph', 'input_end']]]:
         self.pending += text
-        segments: list[tuple[str, Literal['clause', 'sentence', 'input_end']]] = []
-        while match := self._next_boundary():
-            segment = self.pending[: match.end()].strip()
-            self.pending = self.pending[match.end() :].lstrip()
+        segments: list[tuple[str, Literal['clause', 'sentence', 'paragraph', 'input_end']]] = []
+        while boundary := self._next_boundary():
+            segment_end, consumed_end, boundary_type = boundary
+            segment = self.pending[:segment_end].strip()
+            self.pending = self.pending[consumed_end:].lstrip(' \t')
             if segment:
-                boundary: Literal['clause', 'sentence', 'input_end'] = (
-                    'clause' if match.group() == ',' else 'sentence'
-                )
-                segments.append((segment, boundary))
+                segments.append((segment, boundary_type))
                 self.first_segment = False
+            elif boundary_type == 'paragraph':
+                segments.append(('', 'paragraph'))
         return segments
 
-    def finish(self) -> list[tuple[str, Literal['clause', 'sentence', 'input_end']]]:
+    def finish(
+        self,
+    ) -> list[tuple[str, Literal['clause', 'sentence', 'paragraph', 'input_end']]]:
         segments = self.append('')
         tail = self.pending.strip()
         self.pending = ''
@@ -226,11 +241,365 @@ class _TextSegmenter:
             self.first_segment = False
         return segments
 
-    def _next_boundary(self) -> re.Match[str] | None:
+    def _next_boundary(
+        self,
+    ) -> tuple[int, int, Literal['clause', 'sentence', 'paragraph']] | None:
         terminators = self.terminators
         if self.first_segment and self.first_segment_comma_delimiter:
             terminators += ','
-        return re.search(rf'[{re.escape(terminators)}](?=\s|$)', self.pending)
+        sentence = re.search(rf'[{re.escape(terminators)}](?=\s|$)', self.pending)
+        paragraph = re.search(r'\r?\n[ \t]*\r?\n+', self.pending)
+        if paragraph is None:
+            if sentence is None:
+                return None
+            boundary: Literal['clause', 'sentence', 'paragraph'] = (
+                'clause' if sentence.group() == ',' else 'sentence'
+            )
+            return sentence.end(), sentence.end(), boundary
+
+        paragraph_content_end = len(self.pending[: paragraph.start()].rstrip())
+        if sentence is not None and sentence.end() < paragraph_content_end:
+            boundary = 'clause' if sentence.group() == ',' else 'sentence'
+            return sentence.end(), sentence.end(), boundary
+        return paragraph_content_end, paragraph.end(), 'paragraph'
+
+
+class _RunningStats:
+    """Persistable Welford running statistics."""
+
+    __slots__ = ('count', 'm2', 'mean')
+
+    def __init__(self, count: int = 0, mean: float = 0.0, m2: float = 0.0) -> None:
+        self.count = count
+        self.mean = mean
+        self.m2 = m2
+
+    @classmethod
+    def from_payload(cls, payload: object) -> _RunningStats:
+        if not isinstance(payload, dict):
+            message = 'running statistics must be an object'
+            raise TypeError(message)
+        count = payload.get('count')
+        mean = payload.get('mean')
+        m2 = payload.get('m2')
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+            or not isinstance(mean, (int, float))
+            or isinstance(mean, bool)
+            or not math.isfinite(mean)
+            or not isinstance(m2, (int, float))
+            or isinstance(m2, bool)
+            or not math.isfinite(m2)
+            or m2 < 0
+        ):
+            message = 'running statistics contain invalid values'
+            raise ValueError(message)
+        return cls(count=count, mean=float(mean), m2=float(m2))
+
+    def observe(self, value: float) -> None:
+        if not math.isfinite(value) or value < 0:
+            return
+        self.count += 1
+        delta = value - self.mean
+        self.mean += delta / self.count
+        self.m2 += delta * (value - self.mean)
+
+    def upper_bound(self, fallback: float, standard_deviations: float) -> float:
+        if self.count == 0:
+            return fallback
+        deviation = math.sqrt(self.m2 / (self.count - 1)) if self.count > 1 else 0.0
+        estimate = self.mean + standard_deviations * deviation
+        if self.count < SMART_CHUNK_MINIMUM_OBSERVATIONS:
+            estimate = max(fallback, estimate)
+        return max(0.0, estimate)
+
+    def payload(self) -> dict[str, int | float]:
+        return {'count': self.count, 'mean': self.mean, 'm2': self.m2}
+
+
+def _write_json_atomic(destination: Path, payload: dict[str, object]) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            encoding='utf-8',
+            dir=destination.parent,
+            prefix=f'.{destination.name}.',
+            suffix='.tmp',
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(payload, temporary, sort_keys=True, separators=(',', ':'))
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        _ = temporary_path.replace(destination)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink(missing_ok=True)
+
+
+class _SmartChunkKnowledge:
+    """Learn text-arrival and per-voice duration distributions on disk."""
+
+    _VOICE_KEYS: Final = (
+        'audio_seconds_per_character',
+        'audio_seconds_per_word',
+        'first_audio_seconds',
+    )
+    _LLM_KEYS: Final = (
+        'characters_per_sentence',
+        'words_per_sentence',
+        'seconds_per_character',
+        'seconds_per_word',
+    )
+
+    def __init__(self, settings: Settings, voice: str) -> None:
+        self.settings = settings
+        self.voice = voice
+        directory = settings.data_directory / '.pipeline-knowledge'
+        self.voice_path = directory / f'voice-{voice}.json'
+        self.llm_path = directory / f'llm-{settings.pipeline_smart_chunk_llm_id}.json'
+        self.voice_stats = {key: _RunningStats() for key in self._VOICE_KEYS}
+        self.llm_stats = {key: _RunningStats() for key in self._LLM_KEYS}
+        self.voice_dirty = 0
+        self.llm_dirty = 0
+        self._load(
+            self.voice_path,
+            {'model_id': settings.model_id, 'voice': voice},
+            self.voice_stats,
+        )
+        self._load(
+            self.llm_path,
+            {'llm_id': settings.pipeline_smart_chunk_llm_id},
+            self.llm_stats,
+        )
+
+    def observe_voice(
+        self,
+        text: str,
+        *,
+        audio_seconds: float,
+        first_audio_seconds: float | None,
+    ) -> None:
+        characters, words = _text_units(text)
+        if characters:
+            self.voice_stats['audio_seconds_per_character'].observe(
+                audio_seconds / characters,
+            )
+        if words:
+            self.voice_stats['audio_seconds_per_word'].observe(audio_seconds / words)
+        if first_audio_seconds is not None:
+            self.voice_stats['first_audio_seconds'].observe(first_audio_seconds)
+        self.voice_dirty += 1
+
+    def observe_llm_sentence(  # noqa: C901
+        self,
+        text: str,
+        *,
+        arrival_seconds: float | None,
+        timing_text: str,
+    ) -> None:
+        characters, words = _text_units(text)
+        timing_characters, timing_words = _text_units(timing_text)
+        if characters:
+            self.llm_stats['characters_per_sentence'].observe(float(characters))
+        if words:
+            self.llm_stats['words_per_sentence'].observe(float(words))
+        if arrival_seconds is not None:
+            if timing_characters:
+                self.llm_stats['seconds_per_character'].observe(
+                    arrival_seconds / timing_characters,
+                )
+            if timing_words:
+                self.llm_stats['seconds_per_word'].observe(arrival_seconds / timing_words)
+        self.llm_dirty += 1
+
+    def prediction(
+        self,
+        settings: Settings,
+        *,
+        queued_text: str,
+    ) -> dict[str, int | float | str]:
+        standard_deviations = NormalDist().inv_cdf(
+            settings.pipeline_smart_chunk_confidence,
+        )
+        expected_characters = self.llm_stats['characters_per_sentence'].upper_bound(
+            SMART_CHUNK_DEFAULT_CHARACTERS_PER_SENTENCE,
+            standard_deviations,
+        )
+        expected_words = self.llm_stats['words_per_sentence'].upper_bound(
+            SMART_CHUNK_DEFAULT_WORDS_PER_SENTENCE,
+            standard_deviations,
+        )
+        seconds_per_character = self.voice_stats['audio_seconds_per_character'].upper_bound(
+            SMART_CHUNK_DEFAULT_AUDIO_SECONDS_PER_CHARACTER,
+            standard_deviations,
+        )
+        seconds_per_word = self.voice_stats['audio_seconds_per_word'].upper_bound(
+            SMART_CHUNK_DEFAULT_AUDIO_SECONDS_PER_WORD,
+            standard_deviations,
+        )
+        expected_spoken_seconds = max(
+            expected_characters * seconds_per_character,
+            expected_words * seconds_per_word,
+        )
+        llm_character_timing = self.llm_stats['seconds_per_character']
+        llm_word_timing = self.llm_stats['seconds_per_word']
+        llm_seconds_per_character = llm_character_timing.upper_bound(
+            seconds_per_character / settings.pipeline_smart_chunk_cold_start_speedup,
+            standard_deviations,
+        )
+        llm_seconds_per_word = llm_word_timing.upper_bound(
+            seconds_per_word / settings.pipeline_smart_chunk_cold_start_speedup,
+            standard_deviations,
+        )
+        expected_arrival_seconds = max(
+            expected_characters * llm_seconds_per_character,
+            expected_words * llm_seconds_per_word,
+        )
+        arrival_source = (
+            'observed'
+            if llm_character_timing.count or llm_word_timing.count
+            else 'speech_speed_prior'
+        )
+
+        first_audio_seconds = self.voice_stats['first_audio_seconds'].upper_bound(
+            SMART_CHUNK_DEFAULT_FIRST_AUDIO_SECONDS,
+            standard_deviations,
+        )
+        queued_characters, queued_words = _text_units(queued_text)
+        queued_audio_seconds = max(
+            queued_characters * seconds_per_character,
+            queued_words * seconds_per_word,
+        )
+        return {
+            'confidence': settings.pipeline_smart_chunk_confidence,
+            'standard_deviations': standard_deviations,
+            'safety_seconds': settings.pipeline_smart_chunk_safety_seconds,
+            'cold_start_speedup': settings.pipeline_smart_chunk_cold_start_speedup,
+            'clause_pause_seconds': settings.pipeline_clause_pause_seconds,
+            'sentence_pause_seconds': settings.pipeline_sentence_pause_seconds,
+            'crossfade_seconds': settings.pipeline_sentence_crossfade_seconds,
+            'llm_id': settings.pipeline_smart_chunk_llm_id,
+            'arrival_estimate_source': arrival_source,
+            'expected_next_characters': expected_characters,
+            'expected_next_words': expected_words,
+            'expected_next_spoken_seconds': expected_spoken_seconds,
+            'expected_next_arrival_seconds': expected_arrival_seconds,
+            'expected_first_audio_seconds': first_audio_seconds,
+            'queued_characters': queued_characters,
+            'queued_words': queued_words,
+            'queued_audio_seconds': queued_audio_seconds,
+            'voice_seconds_per_character': seconds_per_character,
+            'voice_seconds_per_word': seconds_per_word,
+            'llm_seconds_per_character': llm_seconds_per_character,
+            'llm_seconds_per_word': llm_seconds_per_word,
+            'voice_observations': self.voice_stats['audio_seconds_per_character'].count,
+            'llm_sentence_observations': self.llm_stats['characters_per_sentence'].count,
+            'llm_timing_observations': max(
+                llm_character_timing.count,
+                llm_word_timing.count,
+            ),
+            'knowledge_directory': str(self.voice_path.parent),
+        }
+
+    def save(self, *, force: bool = False) -> None:
+        threshold = self.settings.pipeline_smart_chunk_knowledge_flush_observations
+        if (
+            self.voice_dirty
+            and (force or self.voice_dirty >= threshold)
+            and self._save(
+                self.voice_path,
+                {'model_id': self.settings.model_id, 'voice': self.voice},
+                self.voice_stats,
+            )
+        ):
+            self.voice_dirty = 0
+        if (
+            self.llm_dirty
+            and (force or self.llm_dirty >= threshold)
+            and self._save(
+                self.llm_path,
+                {'llm_id': self.settings.pipeline_smart_chunk_llm_id},
+                self.llm_stats,
+            )
+        ):
+            self.llm_dirty = 0
+
+    @staticmethod
+    def _load(  # noqa: C901
+        path: Path,
+        identity: dict[str, str],
+        statistics: dict[str, _RunningStats],
+    ) -> None:
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            if (
+                not isinstance(payload, dict)
+                or payload.get('version') != SMART_CHUNK_KNOWLEDGE_VERSION
+                or any(payload.get(key) != value for key, value in identity.items())
+            ):
+                return
+            raw_statistics = payload.get('statistics')
+            if not isinstance(raw_statistics, dict):
+                message = 'knowledge statistics must be an object'
+                raise TypeError(message)  # noqa: TRY301
+            for key in statistics:
+                if key in raw_statistics:
+                    statistics[key] = _RunningStats.from_payload(raw_statistics[key])
+        except FileNotFoundError:
+            return
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            LOGGER.warning(
+                'TTS smart chunk knowledge could not be loaded',
+                extra={
+                    'event_id': 'ID_tts_pipeline_smart_chunk_knowledge_load_failed',
+                    'path': str(path),
+                    'error_type': type(error).__name__,
+                },
+            )
+
+    @staticmethod
+    def _save(
+        path: Path,
+        identity: dict[str, str],
+        statistics: dict[str, _RunningStats],
+    ) -> bool:
+        payload: dict[str, object] = {
+            'version': SMART_CHUNK_KNOWLEDGE_VERSION,
+            **identity,
+            'statistics': {key: estimate.payload() for key, estimate in statistics.items()},
+        }
+        try:
+            _write_json_atomic(path, payload)
+        except (OSError, TypeError, ValueError) as error:
+            LOGGER.warning(
+                'TTS smart chunk knowledge could not be saved',
+                extra={
+                    'event_id': 'ID_tts_pipeline_smart_chunk_knowledge_save_failed',
+                    'path': str(path),
+                    'error_type': type(error).__name__,
+                },
+            )
+            return False
+        return True
+
+
+def _text_units(text: str) -> tuple[int, int]:
+    return len(text), len(text.split())
+
+
+@dataclass(slots=True)
+class _SmartChunkDecision:
+    made_at: float
+    flush_deadline: float
+    playback_deadline: float
+    parameters: dict[str, int | float | str]
 
 
 def _duration_frames(duration_seconds: float, sample_rate: int) -> int:
@@ -622,6 +991,19 @@ class Settings(BaseSettings):
     pipeline_speech_confirmation_seconds: float = Field(default=0.04, gt=0, le=0.25)
     pipeline_sentence_terminators: str = Field(default='.!?', min_length=1)
     pipeline_first_segment_comma_delimiter: bool = True
+    pipeline_smart_chunk_enabled: bool = True
+    pipeline_smart_chunk_confidence: float = Field(default=0.9, ge=0.5, lt=1)
+    pipeline_smart_chunk_safety_seconds: float = Field(default=0.1, ge=0, le=5)
+    pipeline_smart_chunk_cold_start_speedup: float = Field(default=3.0, ge=1, le=100)
+    pipeline_smart_chunk_knowledge_flush_observations: int = Field(
+        default=8,
+        ge=1,
+        le=10_000,
+    )
+    pipeline_smart_chunk_llm_id: str = Field(
+        default='default',
+        pattern=r'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$',
+    )
     pipeline_idle_timeout_seconds: float = Field(default=30.0, gt=0)
     save_latest_wav: bool = False
     latest_wav_path: Path = Path(tempfile.gettempdir()) / 'latest.wav'
@@ -718,6 +1100,10 @@ class TtsRuntime:
         self.load_seconds = 0.0
         self.voice_load_seconds = 0.0
         self.lock = threading.Lock()
+        self._smart_chunk_knowledge_cache: dict[
+            tuple[Path, str, str, str],
+            _SmartChunkKnowledge,
+        ] = {}
 
     @staticmethod
     def _apply_torch_threads(
@@ -844,6 +1230,8 @@ class TtsRuntime:
         return VoiceUploadResponse(name=name, filename=destination.name, replaced=replaced)
 
     def close(self) -> None:
+        for knowledge in self._smart_chunk_knowledge_cache.values():
+            knowledge.save(force=True)
         MODEL_READY.set(0)
         self.voice_states.clear()
         self.model = None
@@ -1005,7 +1393,11 @@ class TtsRuntime:
         completed = False
         try:
             for segment, boundary in segments:
-                yield from pipeline.add_segment(segment, boundary)
+                yield from pipeline.add_segment(
+                    segment,
+                    boundary,
+                    input_complete=True,
+                )
             yield from pipeline.finish()
             completed = True
         finally:
@@ -1123,6 +1515,22 @@ class TtsRuntime:
         model = self._loaded_model_only()
         return int(model.sample_rate)
 
+    def smart_chunk_knowledge(self, voice: str) -> _SmartChunkKnowledge:
+        settings = self.settings
+        key = (
+            settings.data_directory,
+            settings.model_id,
+            voice,
+            settings.pipeline_smart_chunk_llm_id,
+        )
+        knowledge = self._smart_chunk_knowledge_cache.get(key)
+        if knowledge is None:
+            knowledge = _SmartChunkKnowledge(settings, voice)
+            self._smart_chunk_knowledge_cache[key] = knowledge
+        else:
+            knowledge.settings = settings
+        return knowledge
+
     def _loaded_model_only(self) -> _SampleRateModel:
         if self.model is None:
             message = 'TTS model is not loaded'
@@ -1185,31 +1593,261 @@ class _PcmPipeline:
         self.previous_segment_had_audio = False
         self.output_bytes = 0
         self.closed = False
+        self.queued_text: list[str] = []
+        self.queued_boundary: Literal['sentence', 'input_end'] = 'sentence'
+        self.queued_sentence_count = 0
+        self.smart_waiting: _SmartChunkDecision | None = None
+        self.smart_decisions: list[_SmartChunkDecision] = []
+        self.knowledge: _SmartChunkKnowledge | None = None
+        self.sentence_prefix = ''
+        self.next_pause_seconds = 0.0
 
-    def add_segment(  # noqa: C901, PLR0912, PLR0915
+    def add_segment(  # noqa: C901
+        self,
+        text: str,
+        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
+        *,
+        input_complete: bool = False,
+        observed_at: float | None = None,
+    ) -> Generator[bytes, None, None]:
+        observed_at = time.perf_counter() if observed_at is None else observed_at
+        if boundary == 'paragraph' and not text:
+            self.sentence_prefix = ''
+            yield from self._flush_queued_text()
+            return
+        self._observe_source_boundary(text, boundary, observed_at)
+        if boundary == 'clause':
+            if self.queued_text:
+                yield from self._flush_queued_text()
+            yield from self._synthesize_chunk(
+                text,
+                'clause',
+                source_sentence_count=0,
+                smart_decision=None,
+            )
+            return
+
+        if self.smart_waiting is not None:
+            self.smart_waiting = None
+        self.queued_text.append(text)
+        self.queued_sentence_count += 1
+        self.queued_boundary = 'input_end' if boundary == 'input_end' else 'sentence'
+        if (
+            boundary in {'paragraph', 'input_end'}
+            or not self.runtime.settings.pipeline_smart_chunk_enabled
+            or (self.playback_started_at is None and self.pending is None)
+        ):
+            yield from self._flush_queued_text()
+            return
+
+        yield from self._release_pending_boundary()
+        if input_complete:
+            return
+        decision = self._smart_chunk_decision(time.perf_counter())
+        if decision is None:
+            yield from self._flush_queued_text()
+            return
+
+        self.smart_waiting = decision
+        self.smart_decisions.append(decision)
+        LOGGER.info(
+            'TTS smart chunker is holding completed text for another sentence',
+            extra={
+                'event_id': 'ID_tts_pipeline_smart_chunk_held',
+                'transport': self.transport,
+                'voice': self.voice,
+                **decision.parameters,
+            },
+        )
+
+    @property
+    def smart_flush_deadline(self) -> float | None:
+        decision = self.smart_waiting
+        return decision.flush_deadline if decision is not None else None
+
+    def flush_smart_queue(
+        self,
+        *,
+        misprediction: bool,
+        observed_at: float | None = None,
+    ) -> Generator[bytes, None, None]:
+        decision = self.smart_waiting
+        if decision is None:
+            return
+        observed_at = time.perf_counter() if observed_at is None else observed_at
+        if misprediction:
+            self._warn_smart_chunk_misprediction(
+                'next_sentence_unavailable',
+                decision,
+                observed_at,
+            )
+            self.smart_decisions.clear()
+        self.smart_waiting = None
+        yield from self._flush_queued_text()
+
+    def _flush_queued_text(self) -> Generator[bytes, None, None]:
+        if not self.queued_text:
+            return
+        text = ' '.join(self.queued_text)
+        boundary = self.queued_boundary
+        source_sentence_count = self.queued_sentence_count
+        smart_decision = self.smart_decisions[-1] if self.smart_decisions else None
+        self.queued_text.clear()
+        self.queued_boundary = 'sentence'
+        self.queued_sentence_count = 0
+        self.smart_waiting = None
+        self.smart_decisions.clear()
+        yield from self._synthesize_chunk(
+            text,
+            boundary,
+            source_sentence_count=source_sentence_count,
+            smart_decision=smart_decision,
+        )
+
+    def _smart_chunk_decision(self, observed_at: float) -> _SmartChunkDecision | None:
+        playback_deadline = self._playback_deadline(self.output_bytes // 2)
+        if playback_deadline is None or playback_deadline <= observed_at:
+            return None
+        settings = self.runtime.settings
+        prediction = self._knowledge().prediction(
+            settings,
+            queued_text=' '.join(self.queued_text),
+        )
+        required_seconds = (
+            float(prediction['expected_next_arrival_seconds'])
+            + float(prediction['expected_first_audio_seconds'])
+            + settings.pipeline_smart_chunk_safety_seconds
+        )
+        playback_buffer_seconds = playback_deadline - observed_at
+        flush_deadline = (
+            playback_deadline
+            - float(prediction['expected_first_audio_seconds'])
+            - settings.pipeline_smart_chunk_safety_seconds
+        )
+        if required_seconds >= playback_buffer_seconds or flush_deadline <= observed_at:
+            return None
+        parameters = {
+            **prediction,
+            'queued_sentences': self.queued_sentence_count,
+            'playback_buffer_seconds': playback_buffer_seconds,
+            'required_buffer_seconds': required_seconds,
+            'flush_in_seconds': flush_deadline - observed_at,
+        }
+        return _SmartChunkDecision(
+            made_at=observed_at,
+            flush_deadline=flush_deadline,
+            playback_deadline=playback_deadline,
+            parameters=parameters,
+        )
+
+    def _observe_source_boundary(
+        self,
+        text: str,
+        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
+        observed_at: float,
+    ) -> None:
+        if self.transport != 'websocket' or not self.runtime.settings.pipeline_smart_chunk_enabled:
+            return
+        if boundary == 'clause':
+            self.sentence_prefix = text
+            return
+
+        complete_sentence = (
+            f'{self.sentence_prefix} {text}'.strip() if self.sentence_prefix else text
+        )
+        arrival_seconds = (
+            observed_at - self.smart_waiting.made_at
+            if (self.smart_waiting is not None and observed_at > self.smart_waiting.made_at)
+            else None
+        )
+        self._knowledge().observe_llm_sentence(
+            complete_sentence,
+            arrival_seconds=arrival_seconds,
+            timing_text=text,
+        )
+        self.sentence_prefix = ''
+
+    def _knowledge(self) -> _SmartChunkKnowledge:
+        if self.knowledge is None:
+            self.knowledge = self.runtime.smart_chunk_knowledge(self.voice)
+        return self.knowledge
+
+    def _release_pending_boundary(self) -> Generator[bytes, None, None]:
+        pending = self.pending
+        if pending is None:
+            return
+        self.next_pause_seconds = pending.boundary_pause_frames / self.sample_rate
+        tail = pending.finish(fade_out=True)
+        self.previous_segment_had_audio = pending.seen_voice
+        self.pending = None
+        if tail:
+            yield self._capture(tail)
+        if self.pending_stitch_deadline is None and self.playback_started_at is not None:
+            self.pending_stitch_deadline = self.playback_started_at + self.output_bytes / (
+                self.sample_rate * 2
+            )
+
+    def _warn_smart_chunk_misprediction(
+        self,
+        reason: str,
+        decision: _SmartChunkDecision,
+        observed_at: float,
+    ) -> None:
+        LOGGER.warning(
+            'TTS smart chunk prediction missed its playback budget',
+            extra={
+                'event_id': 'ID_tts_pipeline_smart_chunk_misprediction',
+                'transport': self.transport,
+                'voice': self.voice,
+                'reason': reason,
+                'decision_age_seconds': max(0.0, observed_at - decision.made_at),
+                'flush_deadline_overrun_seconds': max(
+                    0.0,
+                    observed_at - decision.flush_deadline,
+                ),
+                'playback_deadline_overrun_seconds': max(
+                    0.0,
+                    observed_at - decision.playback_deadline,
+                ),
+                'playback_seconds_remaining': max(
+                    0.0,
+                    decision.playback_deadline - observed_at,
+                ),
+                **decision.parameters,
+            },
+        )
+
+    def _synthesize_chunk(  # noqa: C901, PLR0912, PLR0915
         self,
         text: str,
         boundary: Literal['clause', 'sentence', 'input_end'],
+        *,
+        source_sentence_count: int,
+        smart_decision: _SmartChunkDecision | None,
     ) -> Generator[bytes, None, None]:
-        next_audio_deadline = self.pending_stitch_deadline
         lookahead_warning_logged = False
-        pause_seconds = 0.0
+        pause_seconds = self.next_pause_seconds
         if self.pending is not None:
-            pause_seconds = self.pending.boundary_pause_frames / self.sample_rate
-            if next_audio_deadline is not None and time.perf_counter() > next_audio_deadline:
-                self._warn_lookahead('next_segment_unavailable', next_audio_deadline)
-                lookahead_warning_logged = True
-            tail = self.pending.finish(fade_out=True)
-            self.previous_segment_had_audio = self.pending.seen_voice
-            self.pending = None
-            self.pending_stitch_deadline = None
-            if tail:
-                captured = self._capture(tail)
-                if next_audio_deadline is None and self.playback_started_at is not None:
-                    next_audio_deadline = self.playback_started_at + self.output_bytes / (
-                        self.sample_rate * 2
-                    )
-                yield captured
+            yield from self._release_pending_boundary()
+            pause_seconds = self.next_pause_seconds
+        next_audio_deadline = self.pending_stitch_deadline
+        self.pending_stitch_deadline = None
+        self.next_pause_seconds = 0.0
+        observed_at = time.perf_counter()
+        if next_audio_deadline is not None and observed_at > next_audio_deadline:
+            if smart_decision is not None:
+                self._warn_smart_chunk_misprediction(
+                    'next_sentence_arrived_late',
+                    smart_decision,
+                    observed_at,
+                )
+            else:
+                self._warn_lookahead(
+                    'next_segment_unavailable',
+                    next_audio_deadline,
+                    observed_at=observed_at,
+                )
+            lookahead_warning_logged = True
 
         PIPELINE_SEGMENTS.labels(transport=self.transport).inc()
         LOGGER.info(
@@ -1220,6 +1858,8 @@ class _PcmPipeline:
                 'characters': len(text),
                 'boundary': boundary,
                 'pause_before_seconds': pause_seconds,
+                'source_sentences': source_sentence_count,
+                'smart_chunked': source_sentence_count > 1,
             },
         )
         LOGGER.debug(
@@ -1235,6 +1875,7 @@ class _PcmPipeline:
         first_voice_checked = False
         segment_base_output_frames = self.output_bytes // 2
         sample_end_warning_logged = False
+        synthesis_started_at = time.perf_counter()
 
         def should_speculatively_clip(output_frames: int) -> bool:
             nonlocal sample_end_warning_logged
@@ -1273,7 +1914,18 @@ class _PcmPipeline:
                     and next_audio_deadline is not None
                     and segment.first_voice_at > next_audio_deadline
                 ):
-                    self._warn_lookahead('next_audio_unavailable', next_audio_deadline)
+                    if smart_decision is not None:
+                        self._warn_smart_chunk_misprediction(
+                            'first_audio_late',
+                            smart_decision,
+                            segment.first_voice_at,
+                        )
+                    else:
+                        self._warn_lookahead(
+                            'next_audio_unavailable',
+                            next_audio_deadline,
+                            observed_at=segment.first_voice_at,
+                        )
                     lookahead_warning_logged = True
             if output:
                 yield self._capture(output)
@@ -1316,8 +1968,29 @@ class _PcmPipeline:
                     and next_audio_deadline is not None
                     and segment.first_voice_at > next_audio_deadline
                 ):
-                    self._warn_lookahead('next_audio_unavailable', next_audio_deadline)
+                    if smart_decision is not None:
+                        self._warn_smart_chunk_misprediction(
+                            'first_audio_late',
+                            smart_decision,
+                            segment.first_voice_at,
+                        )
+                    else:
+                        self._warn_lookahead(
+                            'next_audio_unavailable',
+                            next_audio_deadline,
+                            observed_at=segment.first_voice_at,
+                        )
                     lookahead_warning_logged = True
+            if self.runtime.settings.pipeline_smart_chunk_enabled:
+                self._knowledge().observe_voice(
+                    text,
+                    audio_seconds=segment.generated_frames / self.sample_rate,
+                    first_audio_seconds=(
+                        max(0.0, segment.first_voice_at - synthesis_started_at)
+                        if segment.first_voice_at is not None
+                        else None
+                    ),
+                )
             if output:
                 yield self._capture(output)
         if (
@@ -1330,22 +2003,33 @@ class _PcmPipeline:
                 if segment is not None and segment.model_finished_at is not None
                 else time.perf_counter()
             )
-            self._warn_lookahead(
-                'next_audio_unavailable',
-                next_audio_deadline,
-                observed_at=observed_at,
-            )
+            if smart_decision is not None:
+                self._warn_smart_chunk_misprediction(
+                    'first_audio_unavailable',
+                    smart_decision,
+                    observed_at,
+                )
+            else:
+                self._warn_lookahead(
+                    'next_audio_unavailable',
+                    next_audio_deadline,
+                    observed_at=observed_at,
+                )
         self.pending = segment
         if segment is not None:
             self.pending_stitch_deadline = self._projected_playback_deadline(segment)
 
     def finish(self) -> Generator[bytes, None, None]:
+        if self.queued_text:
+            yield from self._flush_queued_text()
+        self.smart_waiting = None
+        self.smart_decisions.clear()
         if self.pending is None:
             return
         output = self.pending.finish(fade_out=False)
+        self.previous_segment_had_audio = self.pending.seen_voice
         self.pending = None
         self.pending_stitch_deadline = None
-        self.previous_segment_had_audio = True
         if output:
             yield self._capture(output)
 
@@ -1359,6 +2043,8 @@ class _PcmPipeline:
             pcm_bytes=self.output_bytes,
         )
         self.capture = None
+        if self.knowledge is not None:
+            self.knowledge.save()
 
     def _capture(self, pcm: bytes) -> bytes:
         if pcm and self.playback_started_at is None:
@@ -1682,10 +2368,50 @@ async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
         input_has_text = False
         input_done = False
         while not input_done:
-            raw = await _receive_pipeline_text(
-                websocket,
-                runtime.settings.pipeline_idle_timeout_seconds,
-            )
+            receive_timeout_seconds = runtime.settings.pipeline_idle_timeout_seconds
+            smart_deadline = pipeline.smart_flush_deadline if pipeline is not None else None
+            smart_timeout = False
+            if smart_deadline is not None:
+                remaining_seconds = smart_deadline - time.perf_counter()
+                if remaining_seconds <= 0:
+                    if pipeline is None or sender is None:
+                        message = 'smart chunk pipeline sender is unavailable'
+                        raise RuntimeError(message)  # noqa: TRY301
+                    await sender.send(
+                        pipeline.flush_smart_queue(
+                            misprediction=True,
+                            observed_at=time.perf_counter(),
+                        ),
+                    )
+                    continue
+                if remaining_seconds <= receive_timeout_seconds:
+                    receive_timeout_seconds = remaining_seconds
+                    smart_timeout = True
+            try:
+                raw = await _receive_pipeline_text(
+                    websocket,
+                    receive_timeout_seconds,
+                )
+            except TimeoutError:
+                if not smart_timeout or pipeline is None or sender is None:
+                    raise
+                await sender.send(
+                    pipeline.flush_smart_queue(
+                        misprediction=True,
+                        observed_at=time.perf_counter(),
+                    ),
+                )
+                continue
+            event_observed_at = time.perf_counter()
+            if pipeline is not None and sender is not None:
+                smart_deadline = pipeline.smart_flush_deadline
+                if smart_deadline is not None and event_observed_at >= smart_deadline:
+                    await sender.send(
+                        pipeline.flush_smart_queue(
+                            misprediction=True,
+                            observed_at=event_observed_at,
+                        ),
+                    )
             event = PIPELINE_INPUT_ADAPTER.validate_json(raw)
             if isinstance(event, PipelineTextDone):
                 if segmenter is None or not input_has_text:
@@ -1731,7 +2457,13 @@ async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
             if pipeline is None or sender is None:
                 continue
             for segment, boundary in segments:
-                await sender.send(pipeline.add_segment(segment, boundary))
+                await sender.send(
+                    pipeline.add_segment(
+                        segment,
+                        boundary,
+                        observed_at=event_observed_at,
+                    ),
+                )
 
         if pipeline is None or sender is None:
             _raise_empty_pipeline()

@@ -311,7 +311,44 @@ Pipeline text normally splits on `.!?`. Configure this with
 `pipeline_sentence_terminators`. With
 `pipeline_first_segment_comma_delimiter=true`, the default, a comma may
 additionally finish only the first segment so audio can begin with the opening
-clause. `pipeline_clause_pause_seconds` (40 ms by default) and
+clause. A blank line is a paragraph boundary.
+
+Smart chunking keeps the first available clause or sentence immediate for low
+time-to-first-audio. After playback has started, it may hold later completed
+sentences as text and synthesize several together, preserving Pocket TTS
+context and natural cadence across their sentence boundaries. A prediction is
+accepted only when the remaining emitted-PCM playback reserve covers the
+estimated arrival of another sentence, TTS first-audio latency, and a safety
+margin. Because TTS generation is assumed to remain faster than playback, the
+budget covers first audio rather than completion of the whole queued chunk;
+queued words and predicted audio duration remain part of the decision
+telemetry. Paragraph boundaries always flush the held text. The WebSocket
+receiver uses an absolute forced-flush deadline, so an incomplete next sentence
+cannot turn the held text into an unbounded queue or wait past its playback budget.
+The complete HTTP pipeline already knows which text is available, so after its
+immediate first segment it groups the rest of each paragraph without a
+prediction wait.
+
+The predictor persists Welford running distributions beneath
+`TTS_DATA_DIRECTORY/.pipeline-knowledge`. `voice-<voice>.json` records audio
+seconds per character and word plus first-audio latency for the selected model
+and voice. `llm-<id>.json` records characters and words per sentence plus
+observed sentence-arrival rates. Writes are atomic and occur after eight new
+observations by default, with a final write during clean shutdown. Configure
+the source identity with `pipeline_smart_chunk_llm_id`. Until arrival timing has
+been observed, `pipeline_smart_chunk_cold_start_speedup` assumes text is
+generated three times faster than it is spoken.
+
+`pipeline_smart_chunk_enabled` controls the behavior.
+`pipeline_smart_chunk_confidence` selects the upper statistical estimate
+(90 percent by default), and `pipeline_smart_chunk_safety_seconds` reserves an
+additional 100 ms. `pipeline_smart_chunk_knowledge_flush_observations` controls
+disk-write cadence. A missed forced-flush or first-audio prediction logs
+`ID_tts_pipeline_smart_chunk_misprediction` with all effective estimates,
+learned-observation counts, queued text size, playback reserve, and tuning
+settings.
+
+`pipeline_clause_pause_seconds` (40 ms by default) and
 `pipeline_sentence_pause_seconds` (120 ms by default) specify the target total
 silence at each join. Model-generated trailing silence counts toward that
 target; excess trailing silence and leading silence from the next segment are
