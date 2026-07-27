@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import io
 import logging
+import math
 import os
 import re
 import sys
@@ -44,7 +45,7 @@ from runtime_config import (
 from service_logging import configure_logging
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Generator, Iterator
+    from collections.abc import AsyncGenerator, Callable, Generator, Iterator
 
     from starlette.types import Receive, Scope, Send
 
@@ -264,22 +265,220 @@ def _linear_fade_pcm16(  # noqa: C901
     return samples.tobytes()
 
 
-class _SentencePcmBuffer:
-    """Stream a segment while retaining only the tail needed for its boundary fade."""
+def _pcm16_peak(pcm: bytes) -> int:
+    if len(pcm) % 2:
+        message = 'TTS returned a partial PCM16 frame'
+        raise RuntimeError(message)
+    samples = array('h')
+    samples.frombytes(pcm)
+    if sys.byteorder == 'big':
+        samples.byteswap()
+    return max((abs(sample) for sample in samples), default=0)
 
-    def __init__(
+
+class _SentencePcmBuffer:
+    """Stream speech while normalizing model silence at a stitched boundary."""
+
+    def __init__(  # noqa: PLR0913
         self,
         sample_rate: int,
-        crossfade_seconds: float,
+        settings: Settings,
         *,
+        boundary: Literal['clause', 'sentence', 'input_end'],
         fade_in: bool,
+        transport: str,
+        on_tail_clipped: Callable[[int], None],
+        on_false_tail: Callable[[], None],
     ) -> None:
-        self.crossfade_frames = _duration_frames(crossfade_seconds, sample_rate)
+        self.sample_rate = sample_rate
+        self.boundary = boundary
+        self.transport = transport
+        self.crossfade_frames = _duration_frames(
+            settings.pipeline_sentence_crossfade_seconds,
+            sample_rate,
+        )
+        boundary_pause_seconds = (
+            settings.pipeline_clause_pause_seconds
+            if boundary == 'clause'
+            else settings.pipeline_sentence_pause_seconds
+        )
+        self.boundary_pause_frames = _duration_frames(boundary_pause_seconds, sample_rate)
+        self.silence_confirmation_frames = max(
+            1,
+            _duration_frames(settings.pipeline_silence_confirmation_seconds, sample_rate),
+        )
+        self.silence_threshold = round(
+            32_767 * math.pow(10, settings.pipeline_silence_threshold_dbfs / 20),
+        )
+        self.analysis_frame_bytes = max(2, _duration_frames(0.01, sample_rate) * 2)
         self.fade_in = fade_in
         self.frames_emitted = 0
         self.buffer = bytearray()
+        self.boundary_silence = bytearray()
+        self.analysis_buffer = bytearray()
+        self.silence_candidate = bytearray()
+        self.generated_frames = 0
+        self.trailing_silence_frames = 0
+        self.emitted_trailing_silence_frames = 0
+        self.clipped_silence_frames = 0
+        self.leading_silence_frames = 0
+        self.seen_voice = False
+        self.silence_confirmed = False
+        self.first_voice_at: float | None = None
+        self.model_finished_at: float | None = None
+        self.on_tail_clipped = on_tail_clipped
+        self.on_false_tail = on_false_tail
 
     def append(self, pcm: bytes) -> bytes:
+        if len(pcm) % 2:
+            message = 'TTS returned a partial PCM16 frame'
+            raise RuntimeError(message)
+        self.generated_frames += len(pcm) // 2
+        self.analysis_buffer.extend(pcm)
+        output = bytearray()
+        while len(self.analysis_buffer) >= self.analysis_frame_bytes:
+            frame = bytes(self.analysis_buffer[: self.analysis_frame_bytes])
+            del self.analysis_buffer[: self.analysis_frame_bytes]
+            output.extend(self._process_frame(frame))
+        if (
+            self.analysis_buffer
+            and _pcm16_peak(bytes(self.analysis_buffer)) > self.silence_threshold
+        ):
+            frame = bytes(self.analysis_buffer)
+            self.analysis_buffer.clear()
+            output.extend(self._process_voice(frame))
+        return bytes(output)
+
+    def end_model(self) -> bytes:
+        output = bytearray()
+        if self.analysis_buffer:
+            frame = bytes(self.analysis_buffer)
+            self.analysis_buffer.clear()
+            output.extend(self._process_frame(frame))
+        output.extend(
+            self._finish_silence_candidate(fade_out=self.boundary != 'input_end'),
+        )
+        self.model_finished_at = time.perf_counter()
+        return bytes(output)
+
+    @property
+    def pending_stitch_frames(self) -> int:
+        return (
+            len(self.buffer) // 2
+            + len(self.boundary_silence) // 2
+            + max(
+                0,
+                self.boundary_pause_frames - self.emitted_trailing_silence_frames,
+            )
+        )
+
+    def finish(self, *, fade_out: bool) -> bytes:
+        if self.model_finished_at is None:
+            _ = self.end_model()
+
+        output = bytearray(self._finish_silence_candidate(fade_out=fade_out))
+
+        buffered = self._apply_fade_in(bytes(self.buffer))
+        self.buffer.clear()
+        if fade_out:
+            buffered = _linear_fade_pcm16(
+                buffered,
+                start_frame=0,
+                fade_frames=len(buffered) // 2,
+                fade_in=False,
+            )
+        output.extend(buffered)
+        output.extend(self.boundary_silence)
+        self.boundary_silence.clear()
+        if fade_out:
+            missing_pause_frames = max(
+                0,
+                self.boundary_pause_frames - self.emitted_trailing_silence_frames,
+            )
+            if missing_pause_frames:
+                output.extend(b'\0' * (missing_pause_frames * 2))
+        return bytes(output)
+
+    def _finish_silence_candidate(self, *, fade_out: bool) -> bytes:
+        if not self.silence_candidate:
+            return b''
+        if fade_out:
+            self.silence_confirmed = True
+            return self._consume_silence_candidate()
+
+        output = self._append_output(bytes(self.silence_candidate))
+        self.emitted_trailing_silence_frames += len(self.silence_candidate) // 2
+        self.silence_candidate.clear()
+        return output
+
+    def _process_frame(self, pcm: bytes) -> bytes:
+        if _pcm16_peak(pcm) <= self.silence_threshold:
+            return self._process_silence(pcm)
+        return self._process_voice(pcm)
+
+    def _process_silence(self, pcm: bytes) -> bytes:
+        frames = len(pcm) // 2
+        if not self.seen_voice:
+            self.leading_silence_frames += frames
+            return b''
+
+        self.trailing_silence_frames += frames
+        self.silence_candidate.extend(pcm)
+        if (
+            not self.silence_confirmed
+            and self.trailing_silence_frames < self.silence_confirmation_frames
+        ):
+            return b''
+        self.silence_confirmed = True
+        return self._consume_silence_candidate()
+
+    def _process_voice(self, pcm: bytes) -> bytes:
+        output = bytearray()
+        if not self.seen_voice:
+            self.seen_voice = True
+            self.first_voice_at = time.perf_counter()
+        elif self.trailing_silence_frames:
+            if not self.silence_confirmed:
+                output.extend(self._append_output(bytes(self.silence_candidate)))
+            else:
+                output.extend(self._append_output(bytes(self.boundary_silence)))
+                if self.clipped_silence_frames:
+                    self.on_false_tail()
+                    LOGGER.error(
+                        'TTS stitcher found voiced audio after clipped silence',
+                        extra={
+                            'event_id': 'ID_tts_pipeline_stitch_false_tail',
+                            'transport': self.transport,
+                            'boundary': self.boundary,
+                            'clipped_seconds': self.clipped_silence_frames / self.sample_rate,
+                            'generated_seconds': self.generated_frames / self.sample_rate,
+                        },
+                    )
+            self._reset_silence()
+        output.extend(self._append_output(pcm))
+        return bytes(output)
+
+    def _consume_silence_candidate(self) -> bytes:
+        tail_was_already_clipped = self.clipped_silence_frames > 0
+        candidate_frames = len(self.silence_candidate) // 2
+        allowed_frames = min(
+            candidate_frames,
+            max(
+                0,
+                self.boundary_pause_frames - self.emitted_trailing_silence_frames,
+            ),
+        )
+        allowed_bytes = allowed_frames * 2
+        self.boundary_silence.extend(self.silence_candidate[:allowed_bytes])
+        clipped_frames = candidate_frames - allowed_frames
+        self.clipped_silence_frames += clipped_frames
+        self.emitted_trailing_silence_frames += allowed_frames
+        self.silence_candidate.clear()
+        if clipped_frames and not tail_was_already_clipped:
+            self.on_tail_clipped(self.frames_emitted + self.pending_stitch_frames)
+        return b''
+
+    def _append_output(self, pcm: bytes) -> bytes:
         self.buffer.extend(pcm)
         emit_bytes = max(0, len(self.buffer) - self.crossfade_frames * 2)
         emit_bytes -= emit_bytes % 2
@@ -288,21 +487,6 @@ class _SentencePcmBuffer:
         output = bytes(self.buffer[:emit_bytes])
         del self.buffer[:emit_bytes]
         return self._apply_fade_in(output)
-
-    def finish(self, *, fade_out: bool) -> bytes:
-        if len(self.buffer) % 2:
-            message = 'TTS returned a partial PCM16 frame'
-            raise RuntimeError(message)
-        output = self._apply_fade_in(bytes(self.buffer))
-        self.buffer.clear()
-        if not fade_out:
-            return output
-        return _linear_fade_pcm16(
-            output,
-            start_frame=0,
-            fade_frames=len(output) // 2,
-            fade_in=False,
-        )
 
     def _apply_fade_in(self, pcm: bytes) -> bytes:
         output = pcm
@@ -315,6 +499,14 @@ class _SentencePcmBuffer:
             )
         self.frames_emitted += len(pcm) // 2
         return output
+
+    def _reset_silence(self) -> None:
+        self.silence_candidate.clear()
+        self.boundary_silence.clear()
+        self.trailing_silence_frames = 0
+        self.emitted_trailing_silence_frames = 0
+        self.clipped_silence_frames = 0
+        self.silence_confirmed = False
 
 
 class Settings(BaseSettings):
@@ -340,6 +532,8 @@ class Settings(BaseSettings):
     pipeline_clause_pause_seconds: float = Field(default=0.04, ge=0, le=2)
     pipeline_sentence_pause_seconds: float = Field(default=0.12, ge=0, le=2)
     pipeline_sentence_crossfade_seconds: float = Field(default=0.01, ge=0, le=0.25)
+    pipeline_silence_confirmation_seconds: float = Field(default=0.02, gt=0, le=0.1)
+    pipeline_silence_threshold_dbfs: float = Field(default=-50.0, ge=-100, le=0)
     pipeline_sentence_terminators: str = Field(default='.!?', min_length=1)
     pipeline_first_segment_comma_delimiter: bool = True
     pipeline_idle_timeout_seconds: float = Field(default=30.0, gt=0)
@@ -900,30 +1094,37 @@ class _PcmPipeline:
         self.capture_attempted = False
         self.capture: _AtomicWavWriter | None = None
         self.pending: _SentencePcmBuffer | None = None
-        self.last_audio_boundary: Literal['clause', 'sentence', 'input_end'] | None = None
+        self.pending_stitch_deadline: float | None = None
+        self.playback_started_at: float | None = None
         self.previous_segment_had_audio = False
         self.output_bytes = 0
         self.closed = False
 
-    def add_segment(  # noqa: C901
+    def add_segment(  # noqa: C901, PLR0912, PLR0915
         self,
         text: str,
         boundary: Literal['clause', 'sentence', 'input_end'],
     ) -> Generator[bytes, None, None]:
-        if self.pending is not None:
-            tail = self.pending.finish(fade_out=True)
-            self.pending = None
-            self.previous_segment_had_audio = True
-            if tail:
-                yield self._capture(tail)
-
+        next_audio_deadline = self.pending_stitch_deadline
+        lookahead_warning_logged = False
         pause_seconds = 0.0
-        if self.previous_segment_had_audio:
-            pause_seconds = (
-                self.runtime.settings.pipeline_clause_pause_seconds
-                if self.last_audio_boundary == 'clause'
-                else self.runtime.settings.pipeline_sentence_pause_seconds
-            )
+        if self.pending is not None:
+            pause_seconds = self.pending.boundary_pause_frames / self.sample_rate
+            if next_audio_deadline is not None and time.perf_counter() > next_audio_deadline:
+                self._warn_lookahead('next_segment_unavailable', next_audio_deadline)
+                lookahead_warning_logged = True
+            tail = self.pending.finish(fade_out=True)
+            self.previous_segment_had_audio = self.pending.seen_voice
+            self.pending = None
+            self.pending_stitch_deadline = None
+            if tail:
+                captured = self._capture(tail)
+                if next_audio_deadline is None and self.playback_started_at is not None:
+                    next_audio_deadline = self.playback_started_at + self.output_bytes / (
+                        self.sample_rate * 2
+                    )
+                yield captured
+
         PIPELINE_SEGMENTS.labels(transport=self.transport).inc()
         LOGGER.info(
             'TTS pipeline segment requested',
@@ -945,32 +1146,120 @@ class _PcmPipeline:
         )
 
         segment: _SentencePcmBuffer | None = None
+        first_voice_checked = False
+        segment_base_output_frames = self.output_bytes // 2
+        active_clip_output_frames: int | None = None
+        sample_end_warning_logged = False
+
+        def warn_if_sample_end_late(observed_at: float) -> None:
+            nonlocal sample_end_warning_logged
+            if active_clip_output_frames is None or sample_end_warning_logged:
+                return
+            deadline = self._playback_deadline(
+                segment_base_output_frames + active_clip_output_frames,
+            )
+            if deadline is not None and observed_at > deadline:
+                self._warn_lookahead(
+                    'sample_end_unavailable',
+                    deadline,
+                    observed_at=observed_at,
+                )
+                sample_end_warning_logged = True
+
+        def on_tail_clipped(output_frames: int) -> None:
+            nonlocal active_clip_output_frames
+            active_clip_output_frames = output_frames
+            warn_if_sample_end_late(time.perf_counter())
+
+        def on_false_tail() -> None:
+            nonlocal active_clip_output_frames
+            warn_if_sample_end_late(time.perf_counter())
+            active_clip_output_frames = None
+
         for chunk in self.runtime.stream_model_pcm(text, self.voice):
             if segment is None:
                 segment = _SentencePcmBuffer(
                     self.sample_rate,
-                    self.runtime.settings.pipeline_sentence_crossfade_seconds,
+                    self.runtime.settings,
+                    boundary=boundary,
                     fade_in=self.previous_segment_had_audio,
+                    transport=self.transport,
+                    on_tail_clipped=on_tail_clipped,
+                    on_false_tail=on_false_tail,
                 )
-                if self.previous_segment_had_audio:
-                    pause_frames = _duration_frames(
-                        pause_seconds,
-                        self.sample_rate,
-                    )
-                    if pause_frames:
-                        yield self._capture(b'\0' * (pause_frames * 2))
             output = segment.append(chunk)
+            if segment.first_voice_at is not None and not first_voice_checked:
+                first_voice_checked = True
+                if (
+                    not lookahead_warning_logged
+                    and next_audio_deadline is not None
+                    and segment.first_voice_at > next_audio_deadline
+                ):
+                    self._warn_lookahead('next_audio_unavailable', next_audio_deadline)
+                    lookahead_warning_logged = True
+            if output:
+                captured = self._capture(output)
+                warn_if_sample_end_late(time.perf_counter())
+                yield captured
+        if segment is not None:
+            output = segment.end_model()
+            if segment.model_finished_at is not None:
+                warn_if_sample_end_late(segment.model_finished_at)
+            if segment.leading_silence_frames or segment.clipped_silence_frames:
+                LOGGER.info(
+                    'TTS pipeline segment silence normalized',
+                    extra={
+                        'event_id': 'ID_tts_pipeline_segment_silence_normalized',
+                        'transport': self.transport,
+                        'boundary': boundary,
+                        'generated_seconds': segment.generated_frames / self.sample_rate,
+                        'leading_silence_removed_seconds': (
+                            segment.leading_silence_frames / self.sample_rate
+                        ),
+                        'trailing_silence_detected_seconds': (
+                            segment.trailing_silence_frames / self.sample_rate
+                        ),
+                        'trailing_silence_clipped_seconds': (
+                            segment.clipped_silence_frames / self.sample_rate
+                        ),
+                    },
+                )
+            if segment.first_voice_at is not None and not first_voice_checked:
+                first_voice_checked = True
+                if (
+                    not lookahead_warning_logged
+                    and next_audio_deadline is not None
+                    and segment.first_voice_at > next_audio_deadline
+                ):
+                    self._warn_lookahead('next_audio_unavailable', next_audio_deadline)
+                    lookahead_warning_logged = True
             if output:
                 yield self._capture(output)
+        if (
+            not lookahead_warning_logged
+            and next_audio_deadline is not None
+            and (segment is None or segment.first_voice_at is None)
+        ):
+            observed_at = (
+                segment.model_finished_at
+                if segment is not None and segment.model_finished_at is not None
+                else time.perf_counter()
+            )
+            self._warn_lookahead(
+                'next_audio_unavailable',
+                next_audio_deadline,
+                observed_at=observed_at,
+            )
         self.pending = segment
         if segment is not None:
-            self.last_audio_boundary = boundary
+            self.pending_stitch_deadline = self._projected_playback_deadline(segment)
 
     def finish(self) -> Generator[bytes, None, None]:
         if self.pending is None:
             return
         output = self.pending.finish(fade_out=False)
         self.pending = None
+        self.pending_stitch_deadline = None
         self.previous_segment_had_audio = True
         if output:
             yield self._capture(output)
@@ -987,12 +1276,44 @@ class _PcmPipeline:
         self.capture = None
 
     def _capture(self, pcm: bytes) -> bytes:
+        if pcm and self.playback_started_at is None:
+            self.playback_started_at = time.perf_counter()
         if self.capture_latest and not self.capture_attempted:
             self.capture_attempted = True
             self.capture = self.runtime.open_latest_wav_capture(self.sample_rate)
         self.capture = self.runtime.write_latest_wav_chunk(self.capture, pcm)
         self.output_bytes += len(pcm)
         return pcm
+
+    def _projected_playback_deadline(
+        self,
+        segment: _SentencePcmBuffer,
+    ) -> float | None:
+        projected_bytes = self.output_bytes + segment.pending_stitch_frames * 2
+        return self._playback_deadline(projected_bytes // 2)
+
+    def _playback_deadline(self, output_frames: int) -> float | None:
+        if self.playback_started_at is None:
+            return None
+        return self.playback_started_at + output_frames / self.sample_rate
+
+    def _warn_lookahead(
+        self,
+        reason: str,
+        deadline: float | None,
+        *,
+        observed_at: float | None = None,
+    ) -> None:
+        now = time.perf_counter() if observed_at is None else observed_at
+        LOGGER.warning(
+            'TTS stitching lookahead invariant was not met',
+            extra={
+                'event_id': 'ID_tts_pipeline_stitch_lookahead_warning',
+                'transport': self.transport,
+                'reason': reason,
+                'deadline_overrun_seconds': max(0.0, now - deadline) if deadline else None,
+            },
+        )
 
 
 SETTINGS = Settings()

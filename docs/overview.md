@@ -311,10 +311,20 @@ Pipeline text normally splits on `.!?`. Configure this with
 `pipeline_sentence_terminators`. With
 `pipeline_first_segment_comma_delimiter=true`, the default, a comma may
 additionally finish only the first segment so audio can begin with the opening
-clause. TTS inserts separate short silences after a clause and after a sentence;
-configure these with `pipeline_clause_pause_seconds` (40 ms by default) and
-`pipeline_sentence_pause_seconds` (120 ms by default). Linear boundary fades are
-configured with `pipeline_sentence_crossfade_seconds`. The corresponding
+clause. `pipeline_clause_pause_seconds` (40 ms by default) and
+`pipeline_sentence_pause_seconds` (120 ms by default) specify the target total
+silence at each join. Model-generated trailing silence counts toward that
+target; excess trailing silence and leading silence from the next segment are
+removed while voiced PCM continues streaming immediately. Silence is detected
+in short frames using `pipeline_silence_threshold_dbfs`; configure how long a
+candidate must remain silent with `pipeline_silence_confirmation_seconds`.
+Linear boundary fades are configured with
+`pipeline_sentence_crossfade_seconds`.
+
+The stitcher assumes synthesis stays ahead of playback. It logs a warning when
+the current sample end, next segment, or next voiced frame misses the projected
+playback deadline. Voiced audio after silence clipping logs an error because
+the candidate tail was actually an internal pause. The corresponding
 environment variables are prefixed with `TTS_`, for example
 `TTS_PIPELINE_FIRST_SEGMENT_COMMA_DELIMITER=false`. Set any transition duration
 to zero to disable that component.
@@ -325,10 +335,10 @@ completed synthesized recording. `TTS_LATEST_WAV_PATH` defaults to
 after a pod replacement. A WAV response is saved verbatim. For a PCM response,
 the saved WAV frame data is the exact concatenation of the PCM chunks emitted to
 the TTS client; synthesis is not repeated. Pipeline requests save one stitched
-recording containing all segment fades and inserted silence, rather than
-overwriting the file for each internal segment. An interrupted stream does not
-replace the previous recording, and capture failures are logged without failing
-the speech request.
+recording containing all segment fades and normalized boundary silence, rather
+than overwriting the file for each internal segment. An interrupted stream does
+not replace the previous recording, and capture failures are logged without
+failing the speech request.
 
 Deploy a pipeline-capable TTS image before an assistant image that uses the
 incremental endpoint; the services roll independently and the assistant does
