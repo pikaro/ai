@@ -97,7 +97,10 @@ logs; failed health checks and all other requests remain visible.
 
 One WebSocket carries one utterance. It accepts the same `session.update`,
 `input_audio_buffer.append`, and `input_audio_buffer.commit` events as STT. It
-forwards STT transcription events and then emits:
+also accepts an optional `session.voice` in `session.update`; the value is
+forwarded to TTS for the complete response. Omitting it uses the TTS service
+default, while `"voice": "default"` explicitly selects that default. The
+assistant forwards STT transcription events and then emits:
 
 - `response.created`
 - `response.text.delta` and `response.text.done`
@@ -293,11 +296,12 @@ be returned.
 
 The incremental `WS /v1/audio/speech/pipeline` interface preserves overlap with
 a text generator such as the assistant LLM. The client first sends a
-`session.start` JSON event, followed by `input_text.delta` events and one
-`input_text.done`. TTS replies with `session.ready`, streams raw PCM as binary
-frames, and finishes with `response.audio.done`. While one segment is being
-synthesized the server deliberately stops reading more text; WebSocket/TCP flow
-control therefore propagates backpressure to the producer without another
+`session.start` JSON event with an optional `voice`, followed by
+`input_text.delta` events and one `input_text.done`. TTS replies with
+`session.ready`, streams raw PCM as binary frames, and finishes with
+`response.audio.done`. While one segment is being synthesized the server
+deliberately stops reading more text; WebSocket/TCP flow control therefore
+propagates backpressure to the producer without another
 unbounded application queue. The exclusive TTS gate is acquired on the first
 text delta and retained through completion. An incomplete client has
 `pipeline_idle_timeout_seconds` to provide the next delta before its session is

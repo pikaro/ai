@@ -363,9 +363,11 @@ class TtsClient:
         self.client = client
         self.settings = settings
 
-    async def stream(  # noqa: C901
+    async def stream(  # noqa: C901, PLR0912
         self,
         text_stream: AsyncIterator[str],
+        *,
+        voice: str | None = None,
     ) -> AsyncGenerator[tuple[bytes, AudioFormat]]:
         started = time.perf_counter()
         outcome = 'success'
@@ -381,12 +383,15 @@ class TtsClient:
                 max_size=self.settings.maximum_websocket_message_bytes,
                 max_queue=2,
             ) as websocket:
+                session_start: dict[str, object] = {
+                    'type': 'session.start',
+                    'model': self.settings.tts_model,
+                }
+                if voice is not None:
+                    session_start['voice'] = voice
                 await websocket.send(
                     json.dumps(
-                        {
-                            'type': 'session.start',
-                            'model': self.settings.tts_model,
-                        },
+                        session_start,
                         separators=(',', ':'),
                     ),
                 )

@@ -200,6 +200,8 @@ class TtsProtocol(Protocol):
     def stream(
         self,
         text_stream: AsyncIterator[str],
+        *,
+        voice: str | None = None,
     ) -> AsyncIterator[tuple[bytes, AudioFormat]]: ...
 
 
@@ -318,6 +320,7 @@ class AssistantUtterance:
         self.first_audio_at: float | None = None
         self.first_delta_at: float | None = None
         self.final_transcript_at: float | None = None
+        self.voice: str | None = None
         self.slot: int | None = None
         self.last_warmed_prompt: str | None = None
         self.last_tool_names: tuple[str, ...] = ()
@@ -328,6 +331,16 @@ class AssistantUtterance:
         self._warm_worker: asyncio.Task[None] | None = None
         self._warm_worker_state = 'idle'
         self._cache_finalizing = False
+
+    def select_voice(self, voice: str) -> None:
+        self.voice = voice
+        LOGGER.info(
+            'Assistant voice selected',
+            extra={
+                'event_id': 'ID_assistant_voice_selected',
+                'voice': voice,
+            },
+        )
 
     def note_audio(self, byte_count: int) -> None:
         if self.first_audio_at is None:
@@ -750,7 +763,7 @@ class AssistantUtterance:
     ) -> None:
         expected_format: AudioFormat | None = None
         first_audio = True
-        async for chunk, audio_format in self.tts.stream(text_stream):
+        async for chunk, audio_format in self.tts.stream(text_stream, voice=self.voice):
             if expected_format is None:
                 expected_format = audio_format
             elif audio_format != expected_format:

@@ -116,6 +116,14 @@ class RealtimeEventTest(unittest.TestCase):
                 {'type': 'input_audio_buffer.commit', 'unexpected': True},
             )
 
+    def test_session_voice_is_accepted(self) -> None:
+        event = RealtimeEvent.model_validate(
+            {'type': 'session.update', 'session': {'voice': 'bender'}},
+        )
+
+        self.assertIsNotNone(event.session)
+        self.assertEqual(getattr(event.session, 'voice', None), 'bender')
+
 
 class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
     async def test_patch_rebuilds_runtime_with_ephemeral_validated_settings(self) -> None:
@@ -875,7 +883,7 @@ class TtsPipelineClientTest(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient() as client:
             tts = TtsClient(client, settings)
             with patch('assistant.src.upstream.connect', return_value=connection):
-                chunks = [item async for item in tts.stream(text_stream())]
+                chunks = [item async for item in tts.stream(text_stream(), voice='bender')]
 
         self.assertEqual(
             chunks,
@@ -884,6 +892,7 @@ class TtsPipelineClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tts.pipeline_websocket_url, 'ws://tts.test/v1/audio/speech/pipeline')
         sent_events = [json.loads(message) for message in connection.sent]
         self.assertEqual(sent_events[0]['type'], 'session.start')
+        self.assertEqual(sent_events[0]['voice'], 'bender')
         self.assertEqual(
             [event['type'] for event in sent_events[1:]],
             ['input_text.delta', 'input_text.delta', 'input_text.done'],
@@ -1052,11 +1061,15 @@ class FakeLlm:
 class FakeTts:
     def __init__(self) -> None:
         self.requests: list[str] = []
+        self.voices: list[str | None] = []
 
     async def stream(
         self,
         text_stream: AsyncIterator[str],
+        *,
+        voice: str | None = None,
     ) -> AsyncIterator[tuple[bytes, AudioFormat]]:
+        self.voices.append(voice)
         self.requests.append(''.join([delta async for delta in text_stream]))
         yield (
             struct.pack('<hhhh', 1_000, 1_000, 1_000, 1_000),
@@ -1243,6 +1256,16 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
         samples = struct.unpack(f'<{len(pcm) // 2}h', pcm)
         self.assertEqual(samples, (1_000, 1_000, 1_000, 1_000))
 
+    async def test_selected_voice_is_forwarded_to_tts_pipeline(self) -> None:
+        self.utterance.select_voice('bender')
+
+        async def send(_event: dict[str, object]) -> None:
+            return
+
+        await self.utterance.generate('hello', [], send)
+
+        self.assertEqual(self.tts.voices, ['bender'])
+
     async def test_tool_aware_answer_reaches_tts_before_llm_stream_finishes(  # noqa: C901
         self,
     ) -> None:
@@ -1267,7 +1290,10 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
             async def stream(
                 self,
                 text_stream: AsyncIterator[str],
+                *,
+                voice: str | None = None,
             ) -> AsyncIterator[tuple[bytes, AudioFormat]]:
+                self.voices.append(voice)
                 parts: list[str] = []
                 first_audio = True
                 async for text in text_stream:

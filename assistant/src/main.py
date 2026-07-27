@@ -70,6 +70,7 @@ class SessionOptions(BaseModel):
 
     input_audio_sample_rate: int | None = Field(default=None, ge=8_000)
     input_audio_channels: int | None = Field(default=None, ge=1, le=2)
+    voice: str | None = Field(default=None, min_length=1)
 
 
 class RealtimeEvent(BaseModel):
@@ -684,6 +685,12 @@ async def _forward_client_audio(  # noqa: C901
                 {'type': 'error', 'message': f'invalid event: {error.errors(include_url=False)}'},
             )
             continue
+        if (
+            event.type == 'session.update'
+            and event.session is not None
+            and event.session.voice is not None
+        ):
+            utterance.select_voice(event.session.voice)
         await stt.send(event.model_dump_json(exclude_none=True))
         if event.type == 'input_audio_buffer.append' and event.audio:
             padding = len(event.audio) - len(event.audio.rstrip('='))
