@@ -485,6 +485,7 @@ class _SmartChunkKnowledge:
             'clause_pause_seconds': settings.pipeline_clause_pause_seconds,
             'sentence_pause_seconds': settings.pipeline_sentence_pause_seconds,
             'paragraph_pause_seconds': settings.pipeline_paragraph_pause_seconds,
+            'speaker_switch_pause_seconds': (settings.pipeline_speaker_switch_pause_seconds),
             'crossfade_seconds': settings.pipeline_sentence_crossfade_seconds,
             'llm_id': settings.pipeline_smart_chunk_llm_id,
             'arrival_estimate_source': arrival_source,
@@ -605,6 +606,13 @@ class _SmartChunkDecision:
     parameters: dict[str, int | float | str]
 
 
+@dataclass(frozen=True, slots=True)
+class _SpeakerTurn:
+    speaker: str
+    voice: str
+    text: str
+
+
 def _duration_frames(duration_seconds: float, sample_rate: int) -> int:
     return int(duration_seconds * sample_rate + 0.5)
 
@@ -658,7 +666,13 @@ class _SentencePcmBuffer:
         sample_rate: int,
         settings: Settings,
         *,
-        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
+        boundary: Literal[
+            'clause',
+            'sentence',
+            'paragraph',
+            'speaker_switch',
+            'input_end',
+        ],
         fade_in: bool,
         transport: str,
         should_speculatively_clip: Callable[[int], bool],
@@ -716,7 +730,13 @@ class _SentencePcmBuffer:
 
     def set_boundary(
         self,
-        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
+        boundary: Literal[
+            'clause',
+            'sentence',
+            'paragraph',
+            'speaker_switch',
+            'input_end',
+        ],
         settings: Settings,
     ) -> None:
         """Set the target pause, including a paragraph revealed by a later delta."""
@@ -725,6 +745,8 @@ class _SentencePcmBuffer:
             pause_seconds = settings.pipeline_clause_pause_seconds
         elif boundary == 'paragraph':
             pause_seconds = settings.pipeline_paragraph_pause_seconds
+        elif boundary == 'speaker_switch':
+            pause_seconds = settings.pipeline_speaker_switch_pause_seconds
         else:
             pause_seconds = settings.pipeline_sentence_pause_seconds
         self.boundary_pause_frames = _duration_frames(pause_seconds, self.sample_rate)
@@ -999,6 +1021,7 @@ class Settings(BaseSettings):
     pipeline_clause_pause_seconds: float = Field(default=0.04, ge=0, le=2)
     pipeline_sentence_pause_seconds: float = Field(default=0.12, ge=0, le=2)
     pipeline_paragraph_pause_seconds: float = Field(default=0.24, ge=0, le=2)
+    pipeline_speaker_switch_pause_seconds: float = Field(default=0.2, ge=0, le=2)
     pipeline_sentence_crossfade_seconds: float = Field(default=0.01, ge=0, le=0.25)
     pipeline_silence_confirmation_seconds: float = Field(default=0.02, gt=0, le=0.1)
     pipeline_silence_threshold_dbfs: float = Field(default=-43.0, ge=-100, le=0)
@@ -1038,6 +1061,9 @@ class HealthResponse(BaseModel):
     streaming: Literal[True] = True
     stream_endpoint: Literal['/v1/audio/speech'] = '/v1/audio/speech'
     pipeline_endpoint: Literal['/v1/audio/speech/pipeline'] = '/v1/audio/speech/pipeline'
+    multi_speaker_endpoint: Literal['/v1/audio/speech/multi-speaker'] = (
+        '/v1/audio/speech/multi-speaker'
+    )
     sample_rate: int
     load_seconds: float
     voice_load_seconds: float
@@ -1049,6 +1075,35 @@ class SpeechRequest(BaseModel):
     model: str = MODEL_ID
     input: str = Field(min_length=1)
     voice: str | None = None
+    response_format: Literal['pcm', 'wav'] = 'wav'
+    speed: float = Field(default=1.0, gt=0)
+
+
+class SpeakerDefinition(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    voice: str = Field(min_length=1)
+
+
+class SpeakerSegment(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    speaker: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+
+
+class MultiSpeakerInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    speakers: dict[str, SpeakerDefinition] = Field(min_length=1)
+    segments: list[SpeakerSegment] = Field(min_length=1)
+
+
+class MultiSpeakerSpeechRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    model: str = MODEL_ID
+    input: MultiSpeakerInput
     response_format: Literal['pcm', 'wav'] = 'wav'
     speed: float = Field(default=1.0, gt=0)
 
@@ -1324,6 +1379,50 @@ class TtsRuntime:
             )
         return text
 
+    def prepare_multi_speaker_turns(  # noqa: C901
+        self,
+        request: MultiSpeakerSpeechRequest,
+    ) -> list[_SpeakerTurn]:
+        """Validate structured input and preload every voice before streaming."""
+        self.validate_options(request.model, request.speed)
+        normalized_segments: list[tuple[str, str]] = []
+        total_characters = 0
+        for segment in request.input.segments:
+            text = segment.text.strip()
+            if not text:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail='segment text must contain non-whitespace text',
+                )
+            if segment.speaker not in request.input.speakers:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f'speaker {segment.speaker!r} is not defined',
+                )
+            same_speaker = bool(
+                normalized_segments and normalized_segments[-1][0] == segment.speaker,
+            )
+            separator_characters = int(same_speaker)
+            total_characters += len(text) + separator_characters
+            if total_characters > self.settings.maximum_input_characters:
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail='input exceeds TTS_MAX_INPUT_CHARACTERS',
+                )
+            if same_speaker:
+                speaker, previous_text = normalized_segments[-1]
+                normalized_segments[-1] = (speaker, f'{previous_text} {text}')
+            else:
+                normalized_segments.append((segment.speaker, text))
+
+        voices = {
+            speaker: self.prepare_voice(definition.voice)
+            for speaker, definition in request.input.speakers.items()
+        }
+        return [
+            _SpeakerTurn(speaker, voices[speaker], text) for speaker, text in normalized_segments
+        ]
+
     def validate_options(self, model: str, speed: float) -> None:
         if model != self.settings.model_id:
             detail = f'loaded model is {self.settings.model_id}, not {model}'
@@ -1386,6 +1485,16 @@ class TtsRuntime:
             self._save_latest_wav_response(wav)
         return wav, len(pcm)
 
+    def generate_multi_speaker_wav(
+        self,
+        turns: list[_SpeakerTurn],
+    ) -> tuple[bytes, int]:
+        pcm = b''.join(self.stream_multi_speaker_pcm(turns, capture_latest=False))
+        wav = self._wav_from_pcm(self.sample_rate(), pcm)
+        if self.settings.save_latest_wav:
+            self._save_latest_wav_response(wav)
+        return wav, len(pcm)
+
     def stream_pipeline_pcm(
         self,
         text: str,
@@ -1413,6 +1522,59 @@ class TtsRuntime:
                     boundary,
                     input_complete=True,
                 )
+            yield from pipeline.finish()
+            completed = True
+        finally:
+            pipeline.close(completed=completed)
+
+    def stream_multi_speaker_pcm(
+        self,
+        turns: list[_SpeakerTurn],
+        *,
+        capture_latest: bool = True,
+    ) -> Generator[bytes, None, None]:
+        pipeline = _PcmPipeline(
+            self,
+            turns[0].voice,
+            capture_latest=capture_latest,
+            transport='http_multi_speaker',
+        )
+        completed = False
+        try:
+            for turn_index, turn in enumerate(turns):
+                pipeline.select_voice(turn.voice)
+                segmenter = _TextSegmenter(
+                    self.settings.pipeline_sentence_terminators,
+                    first_segment_comma_delimiter=(
+                        self.settings.pipeline_first_segment_comma_delimiter
+                    ),
+                )
+                segments = [*segmenter.append(turn.text), *segmenter.finish()]
+                LOGGER.info(
+                    'TTS multi-speaker turn started',
+                    extra={
+                        'event_id': 'ID_tts_multi_speaker_turn_started',
+                        'turn_index': turn_index,
+                        'speaker': turn.speaker,
+                        'voice': turn.voice,
+                        'characters': len(turn.text),
+                    },
+                )
+                for segment_index, (segment, boundary) in enumerate(segments):
+                    pipeline_boundary: Literal[
+                        'clause',
+                        'sentence',
+                        'paragraph',
+                        'speaker_switch',
+                        'input_end',
+                    ] = boundary
+                    if turn_index < len(turns) - 1 and segment_index == len(segments) - 1:
+                        pipeline_boundary = 'speaker_switch'
+                    yield from pipeline.add_segment(
+                        segment,
+                        pipeline_boundary,
+                        input_complete=True,
+                    )
             yield from pipeline.finish()
             completed = True
         finally:
@@ -1609,7 +1771,12 @@ class _PcmPipeline:
         self.output_bytes = 0
         self.closed = False
         self.queued_text: list[str] = []
-        self.queued_boundary: Literal['sentence', 'paragraph', 'input_end'] = 'sentence'
+        self.queued_boundary: Literal[
+            'sentence',
+            'paragraph',
+            'speaker_switch',
+            'input_end',
+        ] = 'sentence'
         self.queued_sentence_count = 0
         self.smart_waiting: _SmartChunkDecision | None = None
         self.smart_decisions: list[_SmartChunkDecision] = []
@@ -1618,10 +1785,29 @@ class _PcmPipeline:
         self.sentence_prefix = ''
         self.next_pause_seconds = 0.0
 
+    def select_voice(self, voice: str) -> None:
+        """Select the next turn's preloaded voice without releasing pending audio."""
+        if voice == self.voice:
+            return
+        if self.queued_text or self.smart_waiting is not None:
+            message = 'cannot switch TTS voice while text is queued'
+            raise RuntimeError(message)
+        if self.knowledge is not None:
+            self.knowledge.save()
+        self.voice = voice
+        self.knowledge = None
+        self.sentence_prefix = ''
+
     def add_segment(  # noqa: C901, PLR0911, PLR0912
         self,
         text: str,
-        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
+        boundary: Literal[
+            'clause',
+            'sentence',
+            'paragraph',
+            'speaker_switch',
+            'input_end',
+        ],
         *,
         input_complete: bool = False,
         observed_at: float | None = None,
@@ -1664,6 +1850,15 @@ class _PcmPipeline:
             self._log_smart_chunk_decision(
                 'flush',
                 'paragraph_boundary',
+                boundary,
+                input_complete=input_complete,
+            )
+            yield from self._flush_queued_text()
+            return
+        if boundary == 'speaker_switch':
+            self._log_smart_chunk_decision(
+                'flush',
+                'speaker_switch',
                 boundary,
                 input_complete=input_complete,
             )
@@ -1840,7 +2035,13 @@ class _PcmPipeline:
     def _observe_source_boundary(
         self,
         text: str,
-        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
+        boundary: Literal[
+            'clause',
+            'sentence',
+            'paragraph',
+            'speaker_switch',
+            'input_end',
+        ],
         observed_at: float,
     ) -> None:
         if self.transport != 'websocket' or not self.runtime.settings.pipeline_smart_chunk_enabled:
@@ -1873,7 +2074,7 @@ class _PcmPipeline:
         self,
         decision: Literal['queue', 'flush'],
         reason: str,
-        boundary: Literal['sentence', 'paragraph', 'input_end'],
+        boundary: Literal['sentence', 'paragraph', 'speaker_switch', 'input_end'],
         *,
         input_complete: bool,
         parameters: dict[str, int | float | str] | None = None,
@@ -1904,7 +2105,13 @@ class _PcmPipeline:
     def _log_conservative_misprediction(
         self,
         text: str,
-        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
+        boundary: Literal[
+            'clause',
+            'sentence',
+            'paragraph',
+            'speaker_switch',
+            'input_end',
+        ],
         observed_at: float,
     ) -> None:
         decision = self.smart_flushed
@@ -1987,7 +2194,13 @@ class _PcmPipeline:
     def _synthesize_chunk(  # noqa: C901, PLR0912, PLR0915
         self,
         text: str,
-        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
+        boundary: Literal[
+            'clause',
+            'sentence',
+            'paragraph',
+            'speaker_switch',
+            'input_end',
+        ],
         *,
         source_sentence_count: int,
         smart_decision: _SmartChunkDecision | None,
@@ -2022,6 +2235,7 @@ class _PcmPipeline:
             extra={
                 'event_id': 'ID_tts_pipeline_segment_requested',
                 'transport': self.transport,
+                'voice': self.voice,
                 'characters': len(text),
                 'boundary': boundary,
                 'pause_before_seconds': pause_seconds,
@@ -2034,6 +2248,7 @@ class _PcmPipeline:
             extra={
                 'event_id': 'ID_tts_pipeline_segment',
                 'transport': self.transport,
+                'voice': self.voice,
                 'text': text,
             },
         )
@@ -2249,7 +2464,14 @@ class _PcmPipeline:
         deadline: float | None,
         *,
         observed_at: float | None = None,
-        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'] | None = None,
+        boundary: Literal[
+            'clause',
+            'sentence',
+            'paragraph',
+            'speaker_switch',
+            'input_end',
+        ]
+        | None = None,
         speculative_tail_cut: bool = False,
     ) -> None:
         now = time.perf_counter() if observed_at is None else observed_at
@@ -2363,6 +2585,53 @@ def _stream_speech(  # noqa: C901
             )
 
 
+def _stream_multi_speaker_speech(  # noqa: C901
+    runtime: TtsRuntime,
+    turns: list[_SpeakerTurn],
+    started: float,
+) -> Generator[bytes, None, None]:
+    outcome = 'success'
+    output_bytes = 0
+    first_audio = True
+    sample_rate = 0
+    chunks: Generator[bytes, None, None] | None = None
+    try:
+        sample_rate = runtime.sample_rate()
+        chunks = runtime.stream_multi_speaker_pcm(turns)
+        for chunk in chunks:
+            if first_audio:
+                first_audio = False
+                TIME_TO_FIRST_AUDIO.observe(time.perf_counter() - started)
+            output_bytes += len(chunk)
+            yield chunk
+    except GeneratorExit:
+        outcome = 'cancelled'
+        raise
+    except Exception:
+        outcome = 'error'
+        raise
+    finally:
+        if chunks is not None:
+            chunks.close()
+        runtime.operations.release()
+        ACTIVE_REQUESTS.dec()
+        _observe_request('pcm', outcome, started, output_bytes, sample_rate)
+        PIPELINE_REQUESTS.labels(
+            transport='http_multi_speaker',
+            outcome=outcome,
+        ).inc()
+        LOGGER.info(
+            'TTS multi-speaker stream finished',
+            extra={
+                'event_id': 'ID_tts_multi_speaker_finished',
+                'response_format': 'pcm',
+                'outcome': outcome,
+                'audio_bytes': output_bytes,
+                'turns': len(turns),
+            },
+        )
+
+
 def _speech_response(  # noqa: C901
     runtime: TtsRuntime,
     speech_request: SpeechRequest,
@@ -2430,6 +2699,95 @@ def _speech_response(  # noqa: C901
         outcome = 'error'
         if pipeline and speech_request.response_format == 'wav':
             PIPELINE_REQUESTS.labels(transport='http', outcome=outcome).inc()
+        raise
+    finally:
+        if not stream_response:
+            runtime.operations.release()
+            ACTIVE_REQUESTS.dec()
+            if not request_observed:
+                _observe_request(speech_request.response_format, outcome, started, 0, 1)
+
+
+def _multi_speaker_response(  # noqa: C901
+    runtime: TtsRuntime,
+    speech_request: MultiSpeakerSpeechRequest,
+) -> Response:
+    try:
+        reject_if_busy(runtime.operations, 'TTS')
+    except HTTPException:
+        BUSY_REJECTIONS.inc()
+        raise
+    started = time.perf_counter()
+    ACTIVE_REQUESTS.inc()
+    stream_response = False
+    request_observed = False
+    outcome = 'success'
+    try:
+        turns = runtime.prepare_multi_speaker_turns(speech_request)
+        LOGGER.info(
+            'Multi-speaker speech synthesis requested',
+            extra={
+                'event_id': 'ID_tts_multi_speaker_requested',
+                'response_format': speech_request.response_format,
+                'characters': sum(len(turn.text) for turn in turns),
+                'speakers': len({turn.speaker for turn in turns}),
+                'turns': len(turns),
+                'voices': sorted({turn.voice for turn in turns}),
+                'speaker_switch_pause_seconds': (
+                    runtime.settings.pipeline_speaker_switch_pause_seconds
+                ),
+            },
+        )
+        LOGGER.debug(
+            'Multi-speaker speech synthesis input',
+            extra={
+                'event_id': 'ID_tts_multi_speaker_input',
+                'turns': [
+                    {
+                        'speaker': turn.speaker,
+                        'voice': turn.voice,
+                        'text': turn.text,
+                    }
+                    for turn in turns
+                ],
+            },
+        )
+        if speech_request.response_format == 'pcm':
+            response = _ClosingStreamingResponse(
+                _stream_multi_speaker_speech(runtime, turns, started),
+                media_type='application/octet-stream',
+                headers=runtime.pcm_headers(),
+            )
+            stream_response = True
+            return response
+
+        wav, pcm_bytes = runtime.generate_multi_speaker_wav(turns)
+        PIPELINE_REQUESTS.labels(
+            transport='http_multi_speaker',
+            outcome=outcome,
+        ).inc()
+        LOGGER.info(
+            'TTS multi-speaker synthesis completed',
+            extra={
+                'event_id': 'ID_tts_multi_speaker_finished',
+                'response_format': 'wav',
+                'outcome': outcome,
+                'audio_bytes': len(wav),
+                'turns': len(turns),
+            },
+        )
+        sample_rate = runtime.sample_rate()
+        response = Response(wav, media_type='audio/wav')
+        _observe_request('wav', outcome, started, pcm_bytes, sample_rate)
+        request_observed = True
+        return response  # noqa: TRY300
+    except Exception:
+        outcome = 'error'
+        if speech_request.response_format == 'wav':
+            PIPELINE_REQUESTS.labels(
+                transport='http_multi_speaker',
+                outcome=outcome,
+            ).inc()
         raise
     finally:
         if not stream_response:
@@ -2821,6 +3179,14 @@ def speech(
 @app.post('/v1/audio/speech/pipeline')
 def speech_pipeline(request: Request, speech_request: SpeechRequest) -> Response:
     return _speech_response(_runtime(request), speech_request, pipeline=True)
+
+
+@app.post('/v1/audio/speech/multi-speaker')
+def multi_speaker_speech(
+    request: Request,
+    speech_request: MultiSpeakerSpeechRequest,
+) -> Response:
+    return _multi_speaker_response(_runtime(request), speech_request)
 
 
 @app.websocket('/v1/audio/speech/pipeline')

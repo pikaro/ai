@@ -56,6 +56,7 @@ class SettingsTest(unittest.TestCase):
             'TTS_PIPELINE_SMART_CHUNK_KNOWLEDGE_FLUSH_OBSERVATIONS': '3',
             'TTS_PIPELINE_SMART_CHUNK_LLM_ID': 'qwen',
             'TTS_PIPELINE_SMART_CHUNK_SAFETY_SECONDS': '0.2',
+            'TTS_PIPELINE_SPEAKER_SWITCH_PAUSE_SECONDS': '0.25',
             'TTS_PIPELINE_SPEECH_CONFIRMATION_SECONDS': '0.03',
             'TTS_PIPELINE_SPEECH_HYSTERESIS_DB': '8',
             'TTS_SAVE_LATEST_WAV': 'true',
@@ -85,6 +86,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.pipeline_smart_chunk_knowledge_flush_observations, 3)
         self.assertEqual(settings.pipeline_smart_chunk_llm_id, 'qwen')
         self.assertEqual(settings.pipeline_smart_chunk_safety_seconds, 0.2)
+        self.assertEqual(settings.pipeline_speaker_switch_pause_seconds, 0.25)
         self.assertEqual(settings.pipeline_speech_confirmation_seconds, 0.03)
         self.assertEqual(settings.pipeline_speech_hysteresis_db, 8)
         self.assertTrue(settings.save_latest_wav)
@@ -1206,6 +1208,187 @@ class PipelineEndpointTest(unittest.IsolatedAsyncioTestCase):
             for call in cast('MagicMock', runtime.model).generate_audio_stream.call_args_list
         ]
         self.assertEqual(requested_text, ['First sentence.', 'Second sentence.'])
+
+
+class MultiSpeakerEndpointTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def runtime(settings: Settings | None = None) -> tuple[TtsRuntime, object, object]:
+        runtime = TtsRuntime(settings or Settings(voice='attenborough'))
+        runtime.model = MagicMock(sample_rate=24_000)
+        attenborough_state = object()
+        bender_state = object()
+        runtime.voice_states = {
+            'attenborough': attenborough_state,
+            'bender': bender_state,
+        }
+
+        def generate(voice_state: object, _text: str) -> object:
+            value = 1_000 if voice_state is attenborough_state else 2_000
+            return iter([struct.pack('<4h', *([value] * 4))])
+
+        runtime.model.generate_audio_stream.side_effect = generate
+        return runtime, attenborough_state, bender_state
+
+    @staticmethod
+    def payload() -> dict[str, object]:
+        return {
+            'model': MODEL_ID,
+            'input': {
+                'speakers': {
+                    'narrator': {'voice': 'attenborough'},
+                    'bandit': {'voice': 'bender'},
+                },
+                'segments': [
+                    {'speaker': 'narrator', 'text': 'First'},
+                    {'speaker': 'narrator', 'text': 'continues.'},
+                    {'speaker': 'bandit', 'text': 'Reply.'},
+                    {'speaker': 'narrator', 'text': 'Done.'},
+                ],
+            },
+            'response_format': 'pcm',
+        }
+
+    async def _request(
+        self,
+        runtime: TtsRuntime,
+        payload: dict[str, object],
+    ) -> httpx.Response:
+        app.state.runtime = runtime
+        transport = httpx.ASGITransport(app=app)
+        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+                return await client.post(
+                    '/v1/audio/speech/multi-speaker',
+                    json=payload,
+                )
+
+    async def test_streams_all_voices_as_one_pcm_response_and_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'latest.wav'
+            runtime, attenborough_state, bender_state = self.runtime(
+                Settings(
+                    voice='attenborough',
+                    save_latest_wav=True,
+                    latest_wav_path=destination,
+                    pipeline_first_segment_comma_delimiter=False,
+                    pipeline_sentence_crossfade_seconds=0,
+                    pipeline_smart_chunk_enabled=False,
+                    pipeline_speaker_switch_pause_seconds=3 / 24_000,
+                ),
+            )
+
+            response = await self._request(runtime, self.payload())
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers['X-Audio-Format'], 'pcm_s16le')
+            self.assertEqual(
+                struct.unpack(f'<{len(response.content) // 2}h', response.content),
+                (
+                    *([1_000] * 4),
+                    *([0] * 3),
+                    *([2_000] * 4),
+                    *([0] * 3),
+                    *([1_000] * 4),
+                ),
+            )
+            calls = cast('MagicMock', runtime.model).generate_audio_stream.call_args_list
+            self.assertEqual(
+                [(call.args[0], call.args[1]) for call in calls],
+                [
+                    (attenborough_state, 'First continues.'),
+                    (bender_state, 'Reply.'),
+                    (attenborough_state, 'Done.'),
+                ],
+            )
+            with wave.open(str(destination), 'rb') as wav_file:
+                saved_pcm = wav_file.readframes(wav_file.getnframes())
+            self.assertEqual(saved_pcm, response.content)
+            self.assertFalse(runtime.operations.active)
+
+    async def test_returns_all_turns_in_one_wav_response(self) -> None:
+        runtime, _, _ = self.runtime(
+            Settings(
+                voice='attenborough',
+                pipeline_first_segment_comma_delimiter=False,
+                pipeline_sentence_crossfade_seconds=0,
+                pipeline_smart_chunk_enabled=False,
+                pipeline_speaker_switch_pause_seconds=0,
+            ),
+        )
+        payload = self.payload()
+        payload['response_format'] = 'wav'
+
+        response = await self._request(runtime, payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers['content-type'], 'audio/wav')
+        with wave.open(io.BytesIO(response.content), 'rb') as wav_file:
+            pcm = wav_file.readframes(wav_file.getnframes())
+        self.assertEqual(
+            struct.unpack(f'<{len(pcm) // 2}h', pcm),
+            (*([1_000] * 4), *([2_000] * 4), *([1_000] * 4)),
+        )
+        self.assertFalse(runtime.operations.active)
+
+    async def test_rejects_undefined_speaker_before_streaming(self) -> None:
+        runtime, _, _ = self.runtime()
+        payload = self.payload()
+        cast('dict[str, object]', payload['input'])['segments'] = [
+            {'speaker': 'missing', 'text': 'No voice.'},
+        ]
+
+        response = await self._request(runtime, payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {'detail': "speaker 'missing' is not defined"})
+        cast('MagicMock', runtime.model).generate_audio_stream.assert_not_called()
+        self.assertFalse(runtime.operations.active)
+
+    async def test_preloads_every_declared_voice_before_streaming(self) -> None:
+        runtime = TtsRuntime(Settings(voice='attenborough'))
+        runtime.model = MagicMock(sample_rate=24_000)
+        runtime.voice_states = {'attenborough': object()}
+        runtime.model.get_state_for_audio_prompt.side_effect = FileNotFoundError
+        payload = self.payload()
+        cast('dict[str, object]', payload['input'])['segments'] = [
+            {'speaker': 'narrator', 'text': 'Only the valid voice is referenced.'},
+        ]
+
+        response = await self._request(runtime, payload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {'detail': "voice 'bender' is not available"})
+        runtime.model.generate_audio_stream.assert_not_called()
+        self.assertFalse(runtime.operations.active)
+
+    async def test_updates_each_selected_voice_knowledge_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_directory = Path(directory)
+            runtime, _, _ = self.runtime(
+                Settings(
+                    voice='attenborough',
+                    data_directory=data_directory,
+                    pipeline_first_segment_comma_delimiter=False,
+                    pipeline_sentence_crossfade_seconds=0,
+                    pipeline_smart_chunk_knowledge_flush_observations=1,
+                    pipeline_speaker_switch_pause_seconds=0,
+                ),
+            )
+
+            response = await self._request(runtime, self.payload())
+
+            self.assertEqual(response.status_code, 200)
+            knowledge_directory = data_directory / '.pipeline-knowledge'
+            for voice in ('attenborough', 'bender'):
+                payload = json.loads(
+                    (knowledge_directory / f'voice-{voice}.json').read_text(
+                        encoding='utf-8',
+                    ),
+                )
+                self.assertGreater(
+                    payload['statistics']['audio_seconds_per_character']['count'],
+                    0,
+                )
 
 
 class PipelineWebSocketTest(unittest.IsolatedAsyncioTestCase):

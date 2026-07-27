@@ -271,6 +271,7 @@ and serves:
 - `POST /v1/voices`
 - `POST /v1/audio/speech`
 - `POST /v1/audio/speech/pipeline`
+- `POST /v1/audio/speech/multi-speaker`
 - `WS /v1/audio/speech/pipeline`
 - compatibility endpoints `POST /synthesize` and `POST /synthesize_stream`
 
@@ -293,6 +294,34 @@ unchanged. A complete paragraph is split inside TTS, so a PCM response can begin
 with the first completed segment without sender-managed sentence requests. WAV
 responses use the same synthesis path but are buffered until a complete WAV can
 be returned.
+
+The structured `POST /v1/audio/speech/multi-speaker` endpoint maps speaker names
+to existing voices and streams all segments as one pipeline response:
+
+```json
+{
+  "model": "kyutai/pocket-tts",
+  "input": {
+    "speakers": {
+      "narrator": {"voice": "attenborough"},
+      "bandit": {"voice": "bender"}
+    },
+    "segments": [
+      {"speaker": "narrator", "text": "The story begins."},
+      {"speaker": "bandit", "text": "Not so fast."}
+    ]
+  },
+  "response_format": "pcm"
+}
+```
+
+All declared voices are resolved before response streaming begins, so a missing
+voice fails before any audio bytes are sent. Adjacent segments assigned to the
+same speaker are joined before sentence segmentation. Voice changes reuse the
+same request gate, pipeline, backpressure path, and latest-recording capture;
+PCM streams continuously and WAV buffers the same combined PCM. The structured
+input is also suitable as the internal representation for a future speaker
+markup parser.
 
 The incremental `WS /v1/audio/speech/pipeline` interface preserves overlap with
 a text generator such as the assistant LLM. The client first sends a
@@ -360,8 +389,11 @@ the same event ID is logged at INFO with the counterfactual playback margin.
 `pipeline_clause_pause_seconds` (40 ms by default),
 `pipeline_sentence_pause_seconds` (120 ms by default), and
 `pipeline_paragraph_pause_seconds` (240 ms by default) specify the target total
-silence at their respective joins. Model-generated trailing silence counts
-toward that target; excess trailing silence and leading silence from the next
+silence at their respective joins.
+`pipeline_speaker_switch_pause_seconds` (200 ms by default) does the same when a
+multi-speaker request changes speaker. It replaces rather than adds to the
+ordinary sentence-boundary target. Model-generated trailing silence counts
+toward each target; excess trailing silence and leading silence from the next
 segment are removed while voiced PCM continues streaming immediately. A
 paragraph marker received in a later WebSocket delta upgrades the still-pending
 sentence tail to the paragraph target. Detection uses short-frame RMS rather
@@ -382,8 +414,9 @@ warning and continued sustained speech then logs an error. The stitcher also
 warns when the next segment or its first voiced frame misses the projected
 playback deadline. Detection and confirmation buffers do not add PCM silence,
 so setting clause pause, sentence pause, paragraph pause, and crossfade to zero
-produces no configured transition floor. The corresponding environment
-variables are prefixed with `TTS_`, for example
+produces no configured transition floor. Speaker-switch pause can likewise be
+set to zero for multi-speaker requests. The corresponding environment variables
+are prefixed with `TTS_`, for example
 `TTS_PIPELINE_FIRST_SEGMENT_COMMA_DELIMITER=false`. Set any transition duration
 to zero to disable that component.
 
@@ -394,9 +427,9 @@ after a pod replacement. A WAV response is saved verbatim. For a PCM response,
 the saved WAV frame data is the exact concatenation of the PCM chunks emitted to
 the TTS client; synthesis is not repeated. Pipeline requests save one stitched
 recording containing all segment fades and normalized boundary silence, rather
-than overwriting the file for each internal segment. An interrupted stream does
-not replace the previous recording, and capture failures are logged without
-failing the speech request.
+than overwriting the file for each internal segment or speaker turn. An
+interrupted stream does not replace the previous recording, and capture failures
+are logged without failing the speech request.
 
 Deploy a pipeline-capable TTS image before an assistant image that uses the
 incremental endpoint; the services roll independently and the assistant does
