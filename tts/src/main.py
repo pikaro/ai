@@ -484,6 +484,7 @@ class _SmartChunkKnowledge:
             'cold_start_speedup': settings.pipeline_smart_chunk_cold_start_speedup,
             'clause_pause_seconds': settings.pipeline_clause_pause_seconds,
             'sentence_pause_seconds': settings.pipeline_sentence_pause_seconds,
+            'paragraph_pause_seconds': settings.pipeline_paragraph_pause_seconds,
             'crossfade_seconds': settings.pipeline_sentence_crossfade_seconds,
             'llm_id': settings.pipeline_smart_chunk_llm_id,
             'arrival_estimate_source': arrival_source,
@@ -599,6 +600,8 @@ class _SmartChunkDecision:
     made_at: float
     flush_deadline: float
     playback_deadline: float
+    should_queue: bool
+    reason: str
     parameters: dict[str, int | float | str]
 
 
@@ -655,24 +658,20 @@ class _SentencePcmBuffer:
         sample_rate: int,
         settings: Settings,
         *,
-        boundary: Literal['clause', 'sentence', 'input_end'],
+        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
         fade_in: bool,
         transport: str,
         should_speculatively_clip: Callable[[int], bool],
     ) -> None:
         self.sample_rate = sample_rate
         self.boundary = boundary
+        self.boundary_pause_frames = 0
         self.transport = transport
         self.crossfade_frames = _duration_frames(
             settings.pipeline_sentence_crossfade_seconds,
             sample_rate,
         )
-        boundary_pause_seconds = (
-            settings.pipeline_clause_pause_seconds
-            if boundary == 'clause'
-            else settings.pipeline_sentence_pause_seconds
-        )
-        self.boundary_pause_frames = _duration_frames(boundary_pause_seconds, sample_rate)
+        self.set_boundary(boundary, settings)
         self.silence_confirmation_frames = max(
             1,
             _duration_frames(settings.pipeline_silence_confirmation_seconds, sample_rate),
@@ -714,6 +713,21 @@ class _SentencePcmBuffer:
         self.first_voice_at: float | None = None
         self.model_finished_at: float | None = None
         self.should_speculatively_clip = should_speculatively_clip
+
+    def set_boundary(
+        self,
+        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
+        settings: Settings,
+    ) -> None:
+        """Set the target pause, including a paragraph revealed by a later delta."""
+        self.boundary = boundary
+        if boundary == 'clause':
+            pause_seconds = settings.pipeline_clause_pause_seconds
+        elif boundary == 'paragraph':
+            pause_seconds = settings.pipeline_paragraph_pause_seconds
+        else:
+            pause_seconds = settings.pipeline_sentence_pause_seconds
+        self.boundary_pause_frames = _duration_frames(pause_seconds, self.sample_rate)
 
     def append(self, pcm: bytes) -> bytes:
         if len(pcm) % 2:
@@ -984,6 +998,7 @@ class Settings(BaseSettings):
     maximum_voice_upload_bytes: int = Field(default=100 * 1024**2, ge=1)
     pipeline_clause_pause_seconds: float = Field(default=0.04, ge=0, le=2)
     pipeline_sentence_pause_seconds: float = Field(default=0.12, ge=0, le=2)
+    pipeline_paragraph_pause_seconds: float = Field(default=0.24, ge=0, le=2)
     pipeline_sentence_crossfade_seconds: float = Field(default=0.01, ge=0, le=0.25)
     pipeline_silence_confirmation_seconds: float = Field(default=0.02, gt=0, le=0.1)
     pipeline_silence_threshold_dbfs: float = Field(default=-43.0, ge=-100, le=0)
@@ -1594,15 +1609,16 @@ class _PcmPipeline:
         self.output_bytes = 0
         self.closed = False
         self.queued_text: list[str] = []
-        self.queued_boundary: Literal['sentence', 'input_end'] = 'sentence'
+        self.queued_boundary: Literal['sentence', 'paragraph', 'input_end'] = 'sentence'
         self.queued_sentence_count = 0
         self.smart_waiting: _SmartChunkDecision | None = None
         self.smart_decisions: list[_SmartChunkDecision] = []
+        self.smart_flushed: _SmartChunkDecision | None = None
         self.knowledge: _SmartChunkKnowledge | None = None
         self.sentence_prefix = ''
         self.next_pause_seconds = 0.0
 
-    def add_segment(  # noqa: C901
+    def add_segment(  # noqa: C901, PLR0911, PLR0912
         self,
         text: str,
         boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
@@ -1611,8 +1627,20 @@ class _PcmPipeline:
         observed_at: float | None = None,
     ) -> Generator[bytes, None, None]:
         observed_at = time.perf_counter() if observed_at is None else observed_at
+        self._log_conservative_misprediction(text, boundary, observed_at)
         if boundary == 'paragraph' and not text:
             self.sentence_prefix = ''
+            if self.queued_text:
+                self.queued_boundary = 'paragraph'
+                self._log_smart_chunk_decision(
+                    'flush',
+                    'paragraph_boundary',
+                    boundary,
+                    input_complete=input_complete,
+                )
+            elif self.pending is not None:
+                self.pending.set_boundary('paragraph', self.runtime.settings)
+                self.pending_stitch_deadline = self._projected_playback_deadline(self.pending)
             yield from self._flush_queued_text()
             return
         self._observe_source_boundary(text, boundary, observed_at)
@@ -1631,20 +1659,73 @@ class _PcmPipeline:
             self.smart_waiting = None
         self.queued_text.append(text)
         self.queued_sentence_count += 1
-        self.queued_boundary = 'input_end' if boundary == 'input_end' else 'sentence'
-        if (
-            boundary in {'paragraph', 'input_end'}
-            or not self.runtime.settings.pipeline_smart_chunk_enabled
-            or (self.playback_started_at is None and self.pending is None)
-        ):
+        self.queued_boundary = boundary
+        if boundary == 'paragraph':
+            self._log_smart_chunk_decision(
+                'flush',
+                'paragraph_boundary',
+                boundary,
+                input_complete=input_complete,
+            )
+            yield from self._flush_queued_text()
+            return
+        if boundary == 'input_end':
+            self._log_smart_chunk_decision(
+                'flush',
+                'input_end',
+                boundary,
+                input_complete=input_complete,
+            )
+            yield from self._flush_queued_text()
+            return
+        if not self.runtime.settings.pipeline_smart_chunk_enabled:
+            self._log_smart_chunk_decision(
+                'flush',
+                'smart_chunk_disabled',
+                boundary,
+                input_complete=input_complete,
+            )
+            yield from self._flush_queued_text()
+            return
+        if self.playback_started_at is None and self.pending is None:
+            self._log_smart_chunk_decision(
+                'flush',
+                'first_segment_immediate',
+                boundary,
+                input_complete=input_complete,
+            )
             yield from self._flush_queued_text()
             return
 
         yield from self._release_pending_boundary()
         if input_complete:
+            self._log_smart_chunk_decision(
+                'queue',
+                'complete_input_available',
+                boundary,
+                input_complete=True,
+            )
             return
         decision = self._smart_chunk_decision(time.perf_counter())
         if decision is None:
+            self._log_smart_chunk_decision(
+                'flush',
+                'playback_buffer_unavailable',
+                boundary,
+                input_complete=False,
+            )
+            yield from self._flush_queued_text()
+            return
+
+        self._log_smart_chunk_decision(
+            'queue' if decision.should_queue else 'flush',
+            decision.reason,
+            boundary,
+            input_complete=False,
+            parameters=decision.parameters,
+        )
+        if not decision.should_queue:
+            self.smart_flushed = decision if decision.flush_deadline > decision.made_at else None
             yield from self._flush_queued_text()
             return
 
@@ -1682,6 +1763,12 @@ class _PcmPipeline:
                 observed_at,
             )
             self.smart_decisions.clear()
+        self._log_smart_chunk_decision(
+            'flush',
+            'forced_flush_deadline' if misprediction else 'smart_queue_flush',
+            self.queued_boundary,
+            input_complete=False,
+        )
         self.smart_waiting = None
         yield from self._flush_queued_text()
 
@@ -1724,8 +1811,16 @@ class _PcmPipeline:
             - float(prediction['expected_first_audio_seconds'])
             - settings.pipeline_smart_chunk_safety_seconds
         )
-        if required_seconds >= playback_buffer_seconds or flush_deadline <= observed_at:
-            return None
+        should_queue = required_seconds < playback_buffer_seconds and flush_deadline > observed_at
+        reason = (
+            'prediction_fits_playback_buffer'
+            if should_queue
+            else (
+                'synthesis_start_deadline_reached'
+                if flush_deadline <= observed_at
+                else 'predicted_next_sentence_misses_playback_buffer'
+            )
+        )
         parameters = {
             **prediction,
             'queued_sentences': self.queued_sentence_count,
@@ -1737,6 +1832,8 @@ class _PcmPipeline:
             made_at=observed_at,
             flush_deadline=flush_deadline,
             playback_deadline=playback_deadline,
+            should_queue=should_queue,
+            reason=reason,
             parameters=parameters,
         )
 
@@ -1771,6 +1868,76 @@ class _PcmPipeline:
         if self.knowledge is None:
             self.knowledge = self.runtime.smart_chunk_knowledge(self.voice)
         return self.knowledge
+
+    def _log_smart_chunk_decision(
+        self,
+        decision: Literal['queue', 'flush'],
+        reason: str,
+        boundary: Literal['sentence', 'paragraph', 'input_end'],
+        *,
+        input_complete: bool,
+        parameters: dict[str, int | float | str] | None = None,
+    ) -> None:
+        if not LOGGER.isEnabledFor(logging.DEBUG):
+            return
+        queued_characters, queued_words = _text_units(' '.join(self.queued_text))
+        LOGGER.debug(
+            'TTS smart chunk decision',
+            extra={
+                'event_id': 'ID_tts_pipeline_smart_chunk_decision',
+                'transport': self.transport,
+                'voice': self.voice,
+                'decision': decision,
+                'reason': reason,
+                'boundary': boundary,
+                'input_complete': input_complete,
+                'smart_chunk_enabled': self.runtime.settings.pipeline_smart_chunk_enabled,
+                'queued_sentences': self.queued_sentence_count,
+                'queued_characters': queued_characters,
+                'queued_words': queued_words,
+                'playback_started': self.playback_started_at is not None,
+                'pending_audio': self.pending is not None,
+                **(parameters or {}),
+            },
+        )
+
+    def _log_conservative_misprediction(
+        self,
+        text: str,
+        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
+        observed_at: float,
+    ) -> None:
+        decision = self.smart_flushed
+        self.smart_flushed = None
+        if decision is None or not text or boundary == 'clause':
+            return
+        if observed_at >= decision.flush_deadline:
+            return
+        expected_first_audio_seconds = float(
+            decision.parameters['expected_first_audio_seconds'],
+        )
+        safety_seconds = float(decision.parameters['safety_seconds'])
+        required_seconds = expected_first_audio_seconds + safety_seconds
+        playback_seconds_remaining = decision.playback_deadline - observed_at
+        margin_seconds = playback_seconds_remaining - required_seconds
+        if margin_seconds <= 0:
+            return
+        LOGGER.info(
+            'TTS smart chunker could have queued the next sentence',
+            extra={
+                'event_id': 'ID_tts_pipeline_smart_chunk_misprediction',
+                'transport': self.transport,
+                'voice': self.voice,
+                'reason': 'next_sentence_could_have_been_queued',
+                'original_decision_reason': decision.reason,
+                'next_boundary': boundary,
+                'decision_age_seconds': max(0.0, observed_at - decision.made_at),
+                'playback_seconds_remaining': playback_seconds_remaining,
+                'counterfactual_required_seconds': required_seconds,
+                'counterfactual_margin_seconds': margin_seconds,
+                **decision.parameters,
+            },
+        )
 
     def _release_pending_boundary(self) -> Generator[bytes, None, None]:
         pending = self.pending
@@ -1820,7 +1987,7 @@ class _PcmPipeline:
     def _synthesize_chunk(  # noqa: C901, PLR0912, PLR0915
         self,
         text: str,
-        boundary: Literal['clause', 'sentence', 'input_end'],
+        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'],
         *,
         source_sentence_count: int,
         smart_decision: _SmartChunkDecision | None,
@@ -2021,9 +2188,17 @@ class _PcmPipeline:
 
     def finish(self) -> Generator[bytes, None, None]:
         if self.queued_text:
+            self.queued_boundary = 'input_end'
+            self._log_smart_chunk_decision(
+                'flush',
+                'input_end',
+                'input_end',
+                input_complete=True,
+            )
             yield from self._flush_queued_text()
         self.smart_waiting = None
         self.smart_decisions.clear()
+        self.smart_flushed = None
         if self.pending is None:
             return
         output = self.pending.finish(fade_out=False)
@@ -2074,7 +2249,7 @@ class _PcmPipeline:
         deadline: float | None,
         *,
         observed_at: float | None = None,
-        boundary: Literal['clause', 'sentence', 'input_end'] | None = None,
+        boundary: Literal['clause', 'sentence', 'paragraph', 'input_end'] | None = None,
         speculative_tail_cut: bool = False,
     ) -> None:
         now = time.perf_counter() if observed_at is None else observed_at

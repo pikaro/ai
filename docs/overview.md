@@ -348,13 +348,25 @@ disk-write cadence. A missed forced-flush or first-audio prediction logs
 learned-observation counts, queued text size, playback reserve, and tuning
 settings.
 
-`pipeline_clause_pause_seconds` (40 ms by default) and
-`pipeline_sentence_pause_seconds` (120 ms by default) specify the target total
-silence at each join. Model-generated trailing silence counts toward that
-target; excess trailing silence and leading silence from the next segment are
-removed while voiced PCM continues streaming immediately. Detection uses
-short-frame RMS rather than peak amplitude. `pipeline_silence_threshold_dbfs`
-defaults to -43 dBFS and is the configurable voice/noise-floor boundary.
+Every completed sentence logs `ID_tts_pipeline_smart_chunk_decision` at DEBUG
+with its `queue` or `flush` decision, the reason, queued text size, and the
+effective prediction values when the statistical predictor was consulted. This
+also covers deterministic complete-input, paragraph, input-end, first-segment,
+and disabled-smart-chunk paths. Optimistic prediction misses log
+`ID_tts_pipeline_smart_chunk_misprediction` at WARNING. When a sentence arrives
+early enough to prove that a conservative flush could instead have queued it,
+the same event ID is logged at INFO with the counterfactual playback margin.
+
+`pipeline_clause_pause_seconds` (40 ms by default),
+`pipeline_sentence_pause_seconds` (120 ms by default), and
+`pipeline_paragraph_pause_seconds` (240 ms by default) specify the target total
+silence at their respective joins. Model-generated trailing silence counts
+toward that target; excess trailing silence and leading silence from the next
+segment are removed while voiced PCM continues streaming immediately. A
+paragraph marker received in a later WebSocket delta upgrades the still-pending
+sentence tail to the paragraph target. Detection uses short-frame RMS rather
+than peak amplitude. `pipeline_silence_threshold_dbfs` defaults to -43 dBFS and
+is the configurable voice/noise-floor boundary.
 `pipeline_speech_hysteresis_db` (6 dB by default) places the speech-resume
 threshold above it, and `pipeline_speech_confirmation_seconds` (40 ms by
 default) requires sustained speech before leaving silence.
@@ -369,9 +381,9 @@ when playback reaches the candidate before EOF is available. The latter logs a
 warning and continued sustained speech then logs an error. The stitcher also
 warns when the next segment or its first voiced frame misses the projected
 playback deadline. Detection and confirmation buffers do not add PCM silence,
-so setting clause pause, sentence pause, and crossfade to zero produces no
-configured transition floor. The corresponding environment variables are
-prefixed with `TTS_`, for example
+so setting clause pause, sentence pause, paragraph pause, and crossfade to zero
+produces no configured transition floor. The corresponding environment
+variables are prefixed with `TTS_`, for example
 `TTS_PIPELINE_FIRST_SEGMENT_COMMA_DELIMITER=false`. Set any transition duration
 to zero to disable that component.
 

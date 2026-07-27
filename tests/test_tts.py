@@ -44,6 +44,7 @@ class SettingsTest(unittest.TestCase):
             'TTS_PIPELINE_CLAUSE_PAUSE_SECONDS': '0.04',
             'TTS_PIPELINE_FIRST_SEGMENT_COMMA_DELIMITER': 'false',
             'TTS_PIPELINE_IDLE_TIMEOUT_SECONDS': '15',
+            'TTS_PIPELINE_PARAGRAPH_PAUSE_SECONDS': '0.3',
             'TTS_PIPELINE_SENTENCE_CROSSFADE_SECONDS': '0.02',
             'TTS_PIPELINE_SENTENCE_PAUSE_SECONDS': '0.2',
             'TTS_PIPELINE_SENTENCE_TERMINATORS': '.!?;',
@@ -72,6 +73,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.pipeline_clause_pause_seconds, 0.04)
         self.assertFalse(settings.pipeline_first_segment_comma_delimiter)
         self.assertEqual(settings.pipeline_idle_timeout_seconds, 15)
+        self.assertEqual(settings.pipeline_paragraph_pause_seconds, 0.3)
         self.assertEqual(settings.pipeline_sentence_crossfade_seconds, 0.02)
         self.assertEqual(settings.pipeline_sentence_pause_seconds, 0.2)
         self.assertEqual(settings.pipeline_sentence_terminators, '.!?;')
@@ -261,10 +263,11 @@ class PipelineTest(unittest.TestCase):
             ['First clause,', 'rest of sentence. Second clause, remains intact.'],
         )
 
-    def test_clause_and_sentence_boundaries_use_separate_pauses(self) -> None:
+    def test_clause_sentence_and_paragraph_boundaries_use_separate_pauses(self) -> None:
         runtime = self.runtime(
             Settings(
                 pipeline_clause_pause_seconds=1 / 24_000,
+                pipeline_paragraph_pause_seconds=3 / 24_000,
                 pipeline_sentence_pause_seconds=2 / 24_000,
                 pipeline_sentence_crossfade_seconds=0,
                 pipeline_smart_chunk_enabled=False,
@@ -273,7 +276,7 @@ class PipelineTest(unittest.TestCase):
         with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             pcm = b''.join(
                 runtime.stream_pipeline_pcm(
-                    'Yes, I can hear you. How can I help?',
+                    'Yes, I can hear you. Still there.\n\nHow can I help?',
                     'alba',
                 ),
             )
@@ -290,6 +293,55 @@ class PipelineTest(unittest.TestCase):
                 1_000,
                 1_000,
                 1_000,
+                0,
+                0,
+                1_000,
+                1_000,
+                1_000,
+                1_000,
+                0,
+                0,
+                0,
+                1_000,
+                1_000,
+                1_000,
+                1_000,
+            ),
+        )
+
+    def test_late_paragraph_marker_upgrades_pending_sentence_pause(self) -> None:
+        runtime = self.runtime(
+            Settings(
+                pipeline_paragraph_pause_seconds=3 / 24_000,
+                pipeline_sentence_crossfade_seconds=0,
+                pipeline_sentence_pause_seconds=1 / 24_000,
+                pipeline_smart_chunk_enabled=False,
+            ),
+        )
+        pipeline = _PcmPipeline(
+            runtime,
+            'alba',
+            capture_latest=False,
+            transport='websocket',
+        )
+        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            pcm = b''.join(
+                (
+                    *pipeline.add_segment('First.', 'sentence'),
+                    *pipeline.add_segment('', 'paragraph'),
+                    *pipeline.add_segment('Second.', 'input_end'),
+                    *pipeline.finish(),
+                ),
+            )
+
+        self.assertEqual(
+            struct.unpack(f'<{len(pcm) // 2}h', pcm),
+            (
+                1_000,
+                1_000,
+                1_000,
+                1_000,
+                0,
                 0,
                 0,
                 1_000,
@@ -772,6 +824,79 @@ class SmartChunkTest(unittest.TestCase):
 
         self.assertEqual(segmenter.append('First.'), [('First.', 'sentence')])
         self.assertEqual(segmenter.append('\n\n'), [('', 'paragraph')])
+
+    def test_complete_input_logs_queue_and_flush_reasons(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            runtime = self.runtime(Path(temporary_directory))
+            with (
+                patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+                patch('tts.src.main.time.perf_counter', return_value=0.0),
+                self.assertLogs('tts', level='DEBUG') as captured,
+            ):
+                _ = b''.join(
+                    runtime.stream_pipeline_pcm(
+                        'First. Second. Third.\n\nFourth.',
+                        'alba',
+                    ),
+                )
+
+        decisions = [
+            (getattr(record, 'decision', None), getattr(record, 'reason', None))
+            for record in captured.records
+            if getattr(record, 'event_id', None) == 'ID_tts_pipeline_smart_chunk_decision'
+        ]
+        self.assertEqual(
+            decisions,
+            [
+                ('flush', 'first_segment_immediate'),
+                ('queue', 'complete_input_available'),
+                ('flush', 'paragraph_boundary'),
+                ('queue', 'complete_input_available'),
+                ('flush', 'input_end'),
+            ],
+        )
+
+    def test_early_next_sentence_logs_conservative_misprediction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            runtime = self.runtime(Path(temporary_directory))
+            audio = struct.pack('<150h', *([1_000] * 150))
+            cast('MagicMock', runtime.model).generate_audio_stream.side_effect = (
+                lambda _voice, _text: iter([audio])
+            )
+            pipeline = _PcmPipeline(
+                runtime,
+                'alba',
+                capture_latest=False,
+                transport='websocket',
+            )
+            with (
+                patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+                patch('tts.src.main.time.perf_counter', return_value=0.0),
+            ):
+                _ = b''.join(pipeline.add_segment('First.', 'sentence'))
+                _ = b''.join(pipeline.add_segment('Second.', 'sentence'))
+
+            with (
+                patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+                patch('tts.src.main.time.perf_counter', return_value=0.01),
+                self.assertLogs('tts', level='INFO') as captured,
+            ):
+                _ = b''.join(pipeline.add_segment('Third.', 'input_end'))
+
+        records = [
+            record
+            for record in captured.records
+            if getattr(record, 'event_id', None) == 'ID_tts_pipeline_smart_chunk_misprediction'
+            and getattr(record, 'reason', None) == 'next_sentence_could_have_been_queued'
+        ]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(
+            getattr(record, 'original_decision_reason', None),
+            'predicted_next_sentence_misses_playback_buffer',
+        )
+        self.assertGreater(getattr(record, 'counterfactual_margin_seconds', 0), 0)
+        self.assertEqual(getattr(record, 'paragraph_pause_seconds', None), 0.24)
 
     def test_misprediction_warning_contains_effective_tuning_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
