@@ -19,16 +19,8 @@ from pydantic import SecretStr, ValidationError
 from starlette.datastructures import Headers
 from starlette.websockets import WebSocketState
 
+from assistant.src.api import app as assistant_app, lifespan, prometheus_metrics
 from assistant.src.config import MCPConfig, Settings
-from assistant.src.main import (
-    AssistantRuntime,
-    RealtimeEvent,
-    app as assistant_app,
-    lifespan,
-    log_request_correlation,
-    prometheus_metrics,
-    realtime,
-)
 from assistant.src.pipeline import (
     BASE_SYSTEM_PROMPT,
     AssistantUtterance,
@@ -37,6 +29,9 @@ from assistant.src.pipeline import (
     build_prompt_prefix,
     parse_tool_response,
 )
+from assistant.src.realtime import log_request_correlation, realtime
+from assistant.src.runtime import AssistantRuntime
+from assistant.src.schemas import RealtimeEvent
 from assistant.src.tooling import ToolDefinition, ToolRegistry, discover_local_tools
 from assistant.src.tools.time import rough_time
 from assistant.src.upstream import AudioFormat, LlmClient, SlotPool, TtsClient, upstream_health
@@ -370,7 +365,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             pcm = bytes(range(256)) * 257
             transport = httpx.ASGITransport(app=assistant_app)
             try:
-                with patch('assistant.src.main.connect', return_value=stt) as connect_stt:
+                with patch('assistant.src.dashboard.connect', return_value=stt) as connect_stt:
                     async with httpx.AsyncClient(
                         transport=transport,
                         base_url='http://test',
@@ -629,11 +624,11 @@ class RealtimeWebSocketTest(unittest.IsolatedAsyncioTestCase):
         websocket = FakeWebSocket()
         with (
             patch(
-                'assistant.src.main._runtime_from_websocket',
+                'assistant.src.realtime.runtime_from_websocket',
                 return_value=runtime,
             ),
             patch(
-                'assistant.src.main._run_realtime_session',
+                'assistant.src.realtime._run_realtime_session',
                 side_effect=WebSocketException(
                     code=status.WS_1008_POLICY_VIOLATION,
                     reason=reason,
@@ -679,7 +674,7 @@ class RealtimeWebSocketTest(unittest.IsolatedAsyncioTestCase):
                 self.close_code = code
 
         websocket = FakeWebSocket()
-        with patch('assistant.src.main._runtime_from_websocket', return_value=BusyRuntime()):
+        with patch('assistant.src.realtime.runtime_from_websocket', return_value=BusyRuntime()):
             await realtime(cast('WebSocket', websocket))
 
         self.assertEqual(websocket.close_code, status.WS_1013_TRY_AGAIN_LATER)
@@ -707,7 +702,7 @@ class RequestCorrelationLoggingTest(unittest.TestCase):
         self.assertEqual(record.__dict__['request_timestamp'], '1784060717068')
 
     def test_absent_headers_do_not_add_a_log_record(self) -> None:
-        with patch('assistant.src.main.LOGGER.info') as info:
+        with patch('assistant.src.realtime.LOGGER.info') as info:
             log_request_correlation(Headers())
 
         info.assert_not_called()
@@ -753,7 +748,7 @@ class UpstreamHealthTest(unittest.IsolatedAsyncioTestCase):
     def test_client_expires_connections_before_upstream_idle_timeout(self) -> None:
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch('assistant.src.main.httpx.AsyncClient') as client_type,
+            patch('assistant.src.runtime.httpx.AsyncClient') as client_type,
         ):
             settings = Settings(system_prompt_path=Path(directory) / 'system-prompt')
             _ = AssistantRuntime(settings)
@@ -850,9 +845,11 @@ class TtsPipelineClientTest(unittest.IsolatedAsyncioTestCase):
             def __init__(self) -> None:
                 self.sent: list[str] = []
                 self.incoming: list[str | bytes] = [
+                    '{"type":"future.pipeline.metadata","ignored":true}',
                     (
                         '{"type":"session.ready","format":"pcm16",'
-                        '"sample_rate":24000,"sample_width":2,"channels":1}'
+                        '"sample_rate":24000,"sample_width":2,"channels":1,'
+                        '"future_field":"ignored"}'
                     ),
                     b'\x01\x02',
                     '{"type":"response.audio.done"}',
@@ -1104,7 +1101,7 @@ class StartupWarmTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_lifespan_waits_for_startup_warm_before_serving(self) -> None:
         runtime = AsyncMock(spec=AssistantRuntime)
-        with patch('assistant.src.main.AssistantRuntime', return_value=runtime):
+        with patch('assistant.src.api.AssistantRuntime', return_value=runtime):
             async with lifespan(assistant_app):
                 runtime.start.assert_awaited_once_with()
                 runtime.close.assert_not_awaited()

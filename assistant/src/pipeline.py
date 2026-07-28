@@ -591,7 +591,6 @@ class AssistantUtterance:
                         'event_id': 'ID_assistant_tool_call_failed',
                         'tool': tool.name,
                         'source': tool.source,
-                        'arguments': arguments,
                     },
                 )
                 result = json.dumps({'error': 'tool execution failed'})

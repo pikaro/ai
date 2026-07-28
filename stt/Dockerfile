@@ -57,7 +57,9 @@ WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
 
-COPY --chown=app:app stt/src/ ./
+COPY --chown=app:app stt/__init__.py stt/__init__.py
+COPY --chown=app:app stt/src/ stt/src/
+COPY --chown=app:app service_contracts/ service_contracts/
 COPY --chown=app:app runtime_config.py runtime_config.py
 COPY --chown=app:app service_logging.py service_logging.py
 
@@ -65,7 +67,7 @@ FROM runtime AS verification
 
 USER 65532:65532
 
-RUN python -c "import importlib.util; from pathlib import Path; import librosa.filters; import nemo.collections.asr; import main; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None; Path('/tmp/runtime-verified').touch()"
+RUN python -c "import importlib.util; from pathlib import Path; import librosa.filters; import nemo.collections.asr; import stt.src.main; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None; Path('/tmp/runtime-verified').touch()"
 
 FROM runtime
 
@@ -77,4 +79,4 @@ EXPOSE 8080
 
 ENTRYPOINT ["dumb-init", "--"]
 
-CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"$LISTEN_PORT\" --workers 1"]
+CMD ["sh", "-c", "exec uvicorn stt.src.main:app --host 0.0.0.0 --port \"$LISTEN_PORT\" --workers 1"]

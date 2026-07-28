@@ -9,26 +9,41 @@ import unittest
 import wave
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock, patch
 
 import httpx
-from fastapi import HTTPException, UploadFile, WebSocket
+from pydantic import ValidationError
 from starlette.websockets import WebSocketState
 
+from service_contracts.tts import MODEL_ID, PipelineSessionRequest
 from service_logging import SuccessfulHealthCheckFilter
-from tts.src.main import (
-    MODEL_ID,
-    Settings,
-    SpeechRequest,
-    TtsRuntime,
-    _PcmPipeline,  # pyright: ignore[reportPrivateUsage]
-    _SmartChunkKnowledge,  # pyright: ignore[reportPrivateUsage]
-    _TextSegmenter,  # pyright: ignore[reportPrivateUsage]
-    app,
-    metrics,
-    speech_pipeline_websocket,
+from tts.src.api import app, metrics, speech_pipeline_websocket
+from tts.src.config import Settings
+from tts.src.domain import (
+    InputTooLongError,
+    InvalidVoiceNameError,
+    InvalidVoiceSelectorError,
+    SpeechCommand,
+    UnsupportedSpeedError,
+    VoiceUploadTooLargeError,
 )
+from tts.src.pipeline import (
+    PcmPipeline,
+    SmartChunkKnowledge,
+    TextSegmenter,
+)
+from tts.src.runtime import TtsRuntime
+from tts.src.schemas import SpeechRequest
+
+if TYPE_CHECKING:
+    from fastapi import WebSocket
+
+
+class PipelineContractTest(unittest.TestCase):
+    def test_session_event_type_remains_required(self) -> None:
+        with self.assertRaises(ValidationError):
+            _ = PipelineSessionRequest.model_validate({'model': MODEL_ID})
 
 
 class SettingsTest(unittest.TestCase):
@@ -105,7 +120,7 @@ class VoiceStorageTest(unittest.TestCase):
             pocket_tts.TTSModel.load_model.return_value = model
             torch = MagicMock()
 
-            with patch('tts.src.main.importlib.import_module') as import_module:
+            with patch('tts.src.engine.importlib.import_module') as import_module:
                 import_module.side_effect = lambda name: torch if name == 'torch' else pocket_tts
                 runtime.load()
 
@@ -115,13 +130,13 @@ class VoiceStorageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             runtime = TtsRuntime(Settings(data_directory=Path(temporary_directory), voice='alba'))
 
-            self.assertEqual(runtime.voice_source('alba'), 'alba')
+            self.assertEqual(runtime.engine.voice_source('alba'), 'alba')
 
     def test_voice_upload_endpoint_writes_requested_name_without_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             data_directory = Path(temporary_directory)
             runtime = TtsRuntime(Settings(data_directory=data_directory))
-            runtime.voice_states['foo'] = object()
+            runtime.engine.voice_states['foo'] = object()
             app.state.runtime = runtime
 
             async def upload_voice() -> httpx.Response:
@@ -144,15 +159,18 @@ class VoiceStorageTest(unittest.TestCase):
                 response.json(),
                 {'name': 'foo', 'filename': 'foo.safetensors', 'replaced': False},
             )
-            self.assertNotIn('foo', runtime.voice_states)
+            self.assertNotIn('foo', runtime.engine.voice_states)
 
     def test_invalid_voice_name_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             runtime = TtsRuntime(Settings(data_directory=Path(temporary_directory)))
-            upload = UploadFile(filename='source.safetensors', file=io.BytesIO(b'voice state'))
 
-            with self.assertRaises(HTTPException):
-                _ = runtime.save_voice('../foo', upload)
+            with self.assertRaises(InvalidVoiceNameError):
+                _ = runtime.save_voice(
+                    '../foo',
+                    'source.safetensors',
+                    io.BytesIO(b'voice state'),
+                )
 
     def test_oversized_upload_does_not_replace_existing_voice(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -164,10 +182,12 @@ class VoiceStorageTest(unittest.TestCase):
                     maximum_voice_upload_bytes=4,
                 ),
             )
-            upload = UploadFile(filename='source.safetensors', file=io.BytesIO(b'too large'))
-
-            with self.assertRaises(HTTPException):
-                _ = runtime.save_voice('foo', upload)
+            with self.assertRaises(VoiceUploadTooLargeError):
+                _ = runtime.save_voice(
+                    'foo',
+                    'source.safetensors',
+                    io.BytesIO(b'too large'),
+                )
 
             self.assertEqual(voice_path.read_bytes(), b'original')
 
@@ -178,32 +198,41 @@ class RequestValidationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.runtime = TtsRuntime(Settings(maximum_input_characters=10, voice='alba'))
 
+    @staticmethod
+    def command(request: SpeechRequest) -> SpeechCommand:
+        return SpeechCommand(
+            model=request.model,
+            text=request.input,
+            voice=request.voice,
+            speed=request.speed,
+        )
+
     def test_valid_request_is_normalized(self) -> None:
         request = SpeechRequest(model=MODEL_ID, input=' hello ', voice='alba')
-        self.assertEqual(self.runtime.validate_request(request), 'hello')
+        self.assertEqual(self.runtime.validate_speech(self.command(request)), 'hello')
 
     def test_named_voice_does_not_need_to_match_configured_default(self) -> None:
         request = SpeechRequest(model=MODEL_ID, input='hello', voice='bender')
-        self.assertEqual(self.runtime.validate_request(request), 'hello')
+        self.assertEqual(self.runtime.validate_speech(self.command(request)), 'hello')
 
     def test_unsupported_speed_is_rejected(self) -> None:
         request = SpeechRequest(model=MODEL_ID, input='hello', speed=1.5)
-        with self.assertRaises(HTTPException):
-            _ = self.runtime.validate_request(request)
+        with self.assertRaises(UnsupportedSpeedError):
+            _ = self.runtime.validate_speech(self.command(request))
 
     def test_input_limit_is_enforced(self) -> None:
         request = SpeechRequest(model=MODEL_ID, input='a' * 11)
-        with self.assertRaises(HTTPException):
-            _ = self.runtime.validate_request(request)
+        with self.assertRaises(InputTooLongError):
+            _ = self.runtime.validate_speech(self.command(request))
 
 
 class PipelineTest(unittest.TestCase):
     @staticmethod
     def runtime(settings: Settings | None = None) -> TtsRuntime:
         runtime = TtsRuntime(settings or Settings())
-        runtime.model = MagicMock(sample_rate=24_000)
-        runtime.voice_states = {'alba': object()}
-        runtime.model.generate_audio_stream.side_effect = lambda _voice, _text: iter(
+        runtime.engine.model = MagicMock(sample_rate=24_000)
+        runtime.engine.voice_states = {'alba': object()}
+        runtime.engine.model.generate_audio_stream.side_effect = lambda _voice, _text: iter(
             [struct.pack('<hhhh', 1_000, 1_000, 1_000, 1_000)],
         )
         return runtime
@@ -217,7 +246,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_sentence_crossfade_seconds=2 / 24_000,
             ),
         )
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             pcm = b''.join(
                 runtime.stream_pipeline_pcm(
                     'First sentence. Second! Third?',
@@ -227,7 +256,7 @@ class PipelineTest(unittest.TestCase):
 
         requested_text = [
             call.args[1]
-            for call in cast('MagicMock', runtime.model).generate_audio_stream.call_args_list
+            for call in cast('MagicMock', runtime.engine.model).generate_audio_stream.call_args_list
         ]
         self.assertEqual(requested_text, ['First sentence.', 'Second! Third?'])
         self.assertEqual(
@@ -248,7 +277,7 @@ class PipelineTest(unittest.TestCase):
 
     def test_comma_delimits_only_the_first_pipeline_segment(self) -> None:
         runtime = self.runtime()
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             _ = b''.join(
                 runtime.stream_pipeline_pcm(
                     'First clause, rest of sentence. Second clause, remains intact.',
@@ -258,7 +287,7 @@ class PipelineTest(unittest.TestCase):
 
         requested_text = [
             call.args[1]
-            for call in cast('MagicMock', runtime.model).generate_audio_stream.call_args_list
+            for call in cast('MagicMock', runtime.engine.model).generate_audio_stream.call_args_list
         ]
         self.assertEqual(
             requested_text,
@@ -275,7 +304,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_smart_chunk_enabled=False,
             ),
         )
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             pcm = b''.join(
                 runtime.stream_pipeline_pcm(
                     'Yes, I can hear you. Still there.\n\nHow can I help?',
@@ -320,13 +349,13 @@ class PipelineTest(unittest.TestCase):
                 pipeline_smart_chunk_enabled=False,
             ),
         )
-        pipeline = _PcmPipeline(
+        pipeline = PcmPipeline(
             runtime,
             'alba',
             capture_latest=False,
             transport='websocket',
         )
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             pcm = b''.join(
                 (
                     *pipeline.add_segment('First.', 'sentence'),
@@ -364,7 +393,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_speech_confirmation_seconds=0.01,
             ),
         )
-        cast('MagicMock', runtime.model).sample_rate = 1_000
+        cast('MagicMock', runtime.engine.model).sample_rate = 1_000
 
         def generate(_voice: object, text: str) -> object:
             if text == 'Yes,':
@@ -379,8 +408,8 @@ class PipelineTest(unittest.TestCase):
                 ],
             )
 
-        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = generate
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = generate
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             pcm = b''.join(runtime.stream_pipeline_pcm('Yes, Next.', 'alba'))
 
         self.assertEqual(
@@ -397,7 +426,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_speech_confirmation_seconds=0.01,
             ),
         )
-        cast('MagicMock', runtime.model).sample_rate = 1_000
+        cast('MagicMock', runtime.engine.model).sample_rate = 1_000
 
         def generate(_voice: object, text: str) -> object:
             if text == 'Yes,':
@@ -408,8 +437,8 @@ class PipelineTest(unittest.TestCase):
                 )
             return iter([struct.pack('<20h', *([2_000] * 20))])
 
-        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = generate
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = generate
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             pcm = b''.join(runtime.stream_pipeline_pcm('Yes, Next.', 'alba'))
 
         self.assertEqual(
@@ -427,7 +456,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_speech_confirmation_seconds=0.02,
             ),
         )
-        cast('MagicMock', runtime.model).sample_rate = 1_000
+        cast('MagicMock', runtime.engine.model).sample_rate = 1_000
 
         def generate(_voice: object, text: str) -> object:
             if text == 'Yes,':
@@ -442,10 +471,10 @@ class PipelineTest(unittest.TestCase):
                 ],
             )
 
-        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = generate
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = generate
         with (
-            patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-            patch('tts.src.main.time.perf_counter', return_value=0.0),
+            patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+            patch('tts.src.pipeline.time.perf_counter', return_value=0.0),
             self.assertNoLogs('tts', level='WARNING'),
         ):
             pcm = b''.join(runtime.stream_pipeline_pcm('Yes, Next.', 'alba'))
@@ -470,11 +499,11 @@ class PipelineTest(unittest.TestCase):
                     pipeline_speech_confirmation_seconds=0.02,
                 ),
             )
-            cast('MagicMock', runtime.model).sample_rate = 1_000
-            cast('MagicMock', runtime.model).generate_audio_stream.side_effect = (
+            cast('MagicMock', runtime.engine.model).sample_rate = 1_000
+            cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = (
                 lambda _voice, _text: iter([audio])
             )
-            with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
                 pcm = b''.join(runtime.stream_pipeline_pcm('Yes.', 'alba'))
             return struct.unpack(f'<{len(pcm) // 2}h', pcm)
 
@@ -493,9 +522,9 @@ class PipelineTest(unittest.TestCase):
                 pipeline_speech_confirmation_seconds=0.02,
             ),
         )
-        cast('MagicMock', runtime.model).sample_rate = 1_000
-        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = lambda _voice, _text: (
-            iter(
+        cast('MagicMock', runtime.engine.model).sample_rate = 1_000
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = (
+            lambda _voice, _text: iter(
                 [
                     struct.pack('<30h', *([1_000] * 30))
                     + struct.pack('<20h', *([0] * 20))
@@ -506,8 +535,8 @@ class PipelineTest(unittest.TestCase):
         )
 
         with (
-            patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-            patch('tts.src.main.time.perf_counter', return_value=0.0),
+            patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+            patch('tts.src.pipeline.time.perf_counter', return_value=0.0),
             self.assertNoLogs('tts', level='WARNING'),
         ):
             pcm = b''.join(runtime.stream_pipeline_pcm('Yes.', 'alba'))
@@ -524,9 +553,9 @@ class PipelineTest(unittest.TestCase):
                 pipeline_speech_confirmation_seconds=0.02,
             ),
         )
-        cast('MagicMock', runtime.model).sample_rate = 1_000
-        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = lambda _voice, _text: (
-            iter(
+        cast('MagicMock', runtime.engine.model).sample_rate = 1_000
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = (
+            lambda _voice, _text: iter(
                 [
                     struct.pack('<10h', *([1_000] * 10))
                     + struct.pack('<500h', *([0] * 500))
@@ -535,7 +564,7 @@ class PipelineTest(unittest.TestCase):
             )
         )
 
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             pcm = b''.join(runtime.stream_pipeline_pcm('Yes.', 'alba'))
 
         self.assertEqual(
@@ -552,7 +581,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_speech_confirmation_seconds=0.01,
             ),
         )
-        cast('MagicMock', runtime.model).sample_rate = 1_000
+        cast('MagicMock', runtime.engine.model).sample_rate = 1_000
         clock = [0.0]
 
         def generate(_voice: object, text: str) -> object:
@@ -566,10 +595,10 @@ class PipelineTest(unittest.TestCase):
                 return
             yield struct.pack('<20h', *([2_000] * 20))
 
-        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = generate
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = generate
         with (
-            patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-            patch('tts.src.main.time.perf_counter', side_effect=lambda: clock[0]),
+            patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+            patch('tts.src.pipeline.time.perf_counter', side_effect=lambda: clock[0]),
             self.assertLogs('tts', level='WARNING') as captured,
         ):
             _ = b''.join(runtime.stream_pipeline_pcm('Foobar yes, Next.', 'alba'))
@@ -595,7 +624,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_speech_confirmation_seconds=0.01,
             ),
         )
-        cast('MagicMock', runtime.model).sample_rate = 1_000
+        cast('MagicMock', runtime.engine.model).sample_rate = 1_000
 
         def generate(_voice: object, text: str) -> object:
             if text == 'Foobar yes,':
@@ -608,10 +637,10 @@ class PipelineTest(unittest.TestCase):
                 )
             return iter([struct.pack('<20h', *([2_000] * 20))])
 
-        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = generate
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = generate
         with (
-            patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-            patch('tts.src.main.time.perf_counter', return_value=0.0),
+            patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+            patch('tts.src.pipeline.time.perf_counter', return_value=0.0),
             self.assertNoLogs('tts', level='WARNING'),
         ):
             pcm = b''.join(runtime.stream_pipeline_pcm('Foobar yes, Next.', 'alba'))
@@ -630,7 +659,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_speech_confirmation_seconds=0.01,
             ),
         )
-        cast('MagicMock', runtime.model).sample_rate = 1_000
+        cast('MagicMock', runtime.engine.model).sample_rate = 1_000
 
         def generate(_voice: object, text: str) -> object:
             if text == 'Yes,':
@@ -641,10 +670,10 @@ class PipelineTest(unittest.TestCase):
                 )
             return iter([struct.pack('<20h', *([2_000] * 20))])
 
-        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = generate
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = generate
         with (
-            patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-            patch('tts.src.main.time.perf_counter', return_value=0.0),
+            patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+            patch('tts.src.pipeline.time.perf_counter', return_value=0.0),
             self.assertNoLogs('tts', level='WARNING'),
         ):
             _ = b''.join(runtime.stream_pipeline_pcm('Yes, Next.', 'alba'))
@@ -658,7 +687,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_speech_confirmation_seconds=0.01,
             ),
         )
-        cast('MagicMock', runtime.model).sample_rate = 1_000
+        cast('MagicMock', runtime.engine.model).sample_rate = 1_000
         clock = [0.0]
 
         def generate(_voice: object, text: str) -> object:
@@ -671,10 +700,10 @@ class PipelineTest(unittest.TestCase):
                 return
             yield struct.pack('<20h', *([2_000] * 20))
 
-        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = generate
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = generate
         with (
-            patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-            patch('tts.src.main.time.perf_counter', side_effect=lambda: clock[0]),
+            patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+            patch('tts.src.pipeline.time.perf_counter', side_effect=lambda: clock[0]),
             self.assertLogs('tts', level='WARNING') as captured,
         ):
             _ = b''.join(runtime.stream_pipeline_pcm('Yes, Next.', 'alba'))
@@ -689,7 +718,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_sentence_crossfade_seconds=0,
             ),
         )
-        cast('MagicMock', runtime.model).sample_rate = 1_000
+        cast('MagicMock', runtime.engine.model).sample_rate = 1_000
         clock = [0.0]
 
         def generate(_voice: object, text: str) -> object:
@@ -697,10 +726,10 @@ class PipelineTest(unittest.TestCase):
             if text == 'Yes,':
                 clock[0] = 1.0
 
-        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = generate
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = generate
         with (
-            patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-            patch('tts.src.main.time.perf_counter', side_effect=lambda: clock[0]),
+            patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+            patch('tts.src.pipeline.time.perf_counter', side_effect=lambda: clock[0]),
             self.assertLogs('tts', level='WARNING') as captured,
         ):
             _ = b''.join(runtime.stream_pipeline_pcm('Yes, Next.', 'alba'))
@@ -715,7 +744,7 @@ class PipelineTest(unittest.TestCase):
                 pipeline_sentence_crossfade_seconds=0,
             ),
         )
-        cast('MagicMock', runtime.model).sample_rate = 1_000
+        cast('MagicMock', runtime.engine.model).sample_rate = 1_000
         clock = [0.0]
 
         def generate(_voice: object, text: str) -> object:
@@ -723,10 +752,10 @@ class PipelineTest(unittest.TestCase):
                 clock[0] = 1.0
             yield struct.pack('<100h', *([1_000] * 100))
 
-        cast('MagicMock', runtime.model).generate_audio_stream.side_effect = generate
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = generate
         with (
-            patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-            patch('tts.src.main.time.perf_counter', side_effect=lambda: clock[0]),
+            patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+            patch('tts.src.pipeline.time.perf_counter', side_effect=lambda: clock[0]),
             self.assertLogs('tts', level='WARNING') as captured,
         ):
             _ = b''.join(runtime.stream_pipeline_pcm('Yes, Next.', 'alba'))
@@ -736,7 +765,7 @@ class PipelineTest(unittest.TestCase):
 
     def test_first_comma_delimiter_can_be_disabled(self) -> None:
         runtime = self.runtime(Settings(pipeline_first_segment_comma_delimiter=False))
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             _ = b''.join(
                 runtime.stream_pipeline_pcm(
                     'First clause, rest of sentence.',
@@ -744,8 +773,8 @@ class PipelineTest(unittest.TestCase):
                 ),
             )
 
-        cast('MagicMock', runtime.model).generate_audio_stream.assert_called_once_with(
-            runtime.voice_states['alba'],
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.assert_called_once_with(
+            runtime.engine.voice_states['alba'],
             'First clause, rest of sentence.',
         )
 
@@ -766,18 +795,18 @@ class SmartChunkTest(unittest.TestCase):
                 pipeline_speech_confirmation_seconds=0.01,
             ),
         )
-        runtime.model = MagicMock(sample_rate=1_000)
-        runtime.voice_states = {'alba': object()}
+        runtime.engine.model = MagicMock(sample_rate=1_000)
+        runtime.engine.voice_states = {'alba': object()}
         audio = struct.pack('<5000h', *([1_000] * 5_000))
-        runtime.model.generate_audio_stream.side_effect = lambda _voice, _text: iter([audio])
+        runtime.engine.model.generate_audio_stream.side_effect = lambda _voice, _text: iter([audio])
         return runtime
 
     def test_later_sentences_are_synthesized_together_when_they_fit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             runtime = self.runtime(Path(temporary_directory))
             with (
-                patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-                patch('tts.src.main.time.perf_counter', return_value=0.0),
+                patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+                patch('tts.src.pipeline.time.perf_counter', return_value=0.0),
                 self.assertNoLogs('tts', level='WARNING'),
             ):
                 _ = b''.join(
@@ -787,7 +816,7 @@ class SmartChunkTest(unittest.TestCase):
                     ),
                 )
 
-        model = cast('MagicMock', runtime.model)
+        model = cast('MagicMock', runtime.engine.model)
         requested_text = [call.args[1] for call in model.generate_audio_stream.call_args_list]
         self.assertEqual(
             requested_text,
@@ -800,8 +829,8 @@ class SmartChunkTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             runtime = self.runtime(Path(temporary_directory))
             with (
-                patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-                patch('tts.src.main.time.perf_counter', return_value=0.0),
+                patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+                patch('tts.src.pipeline.time.perf_counter', return_value=0.0),
             ):
                 _ = b''.join(
                     runtime.stream_pipeline_pcm(
@@ -810,7 +839,7 @@ class SmartChunkTest(unittest.TestCase):
                     ),
                 )
 
-        model = cast('MagicMock', runtime.model)
+        model = cast('MagicMock', runtime.engine.model)
         requested_text = [call.args[1] for call in model.generate_audio_stream.call_args_list]
         self.assertEqual(
             requested_text,
@@ -822,7 +851,7 @@ class SmartChunkTest(unittest.TestCase):
         )
 
     def test_incremental_blank_line_emits_a_paragraph_flush(self) -> None:
-        segmenter = _TextSegmenter('.!?', first_segment_comma_delimiter=False)
+        segmenter = TextSegmenter('.!?', first_segment_comma_delimiter=False)
 
         self.assertEqual(segmenter.append('First.'), [('First.', 'sentence')])
         self.assertEqual(segmenter.append('\n\n'), [('', 'paragraph')])
@@ -831,8 +860,8 @@ class SmartChunkTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             runtime = self.runtime(Path(temporary_directory))
             with (
-                patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-                patch('tts.src.main.time.perf_counter', return_value=0.0),
+                patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+                patch('tts.src.pipeline.time.perf_counter', return_value=0.0),
                 self.assertLogs('tts', level='DEBUG') as captured,
             ):
                 _ = b''.join(
@@ -862,25 +891,25 @@ class SmartChunkTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             runtime = self.runtime(Path(temporary_directory))
             audio = struct.pack('<150h', *([1_000] * 150))
-            cast('MagicMock', runtime.model).generate_audio_stream.side_effect = (
+            cast('MagicMock', runtime.engine.model).generate_audio_stream.side_effect = (
                 lambda _voice, _text: iter([audio])
             )
-            pipeline = _PcmPipeline(
+            pipeline = PcmPipeline(
                 runtime,
                 'alba',
                 capture_latest=False,
                 transport='websocket',
             )
             with (
-                patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-                patch('tts.src.main.time.perf_counter', return_value=0.0),
+                patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+                patch('tts.src.pipeline.time.perf_counter', return_value=0.0),
             ):
                 _ = b''.join(pipeline.add_segment('First.', 'sentence'))
                 _ = b''.join(pipeline.add_segment('Second.', 'sentence'))
 
             with (
-                patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-                patch('tts.src.main.time.perf_counter', return_value=0.01),
+                patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+                patch('tts.src.pipeline.time.perf_counter', return_value=0.01),
                 self.assertLogs('tts', level='INFO') as captured,
             ):
                 _ = b''.join(pipeline.add_segment('Third.', 'input_end'))
@@ -903,15 +932,15 @@ class SmartChunkTest(unittest.TestCase):
     def test_misprediction_warning_contains_effective_tuning_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             runtime = self.runtime(Path(temporary_directory))
-            pipeline = _PcmPipeline(
+            pipeline = PcmPipeline(
                 runtime,
                 'alba',
                 capture_latest=False,
                 transport='websocket',
             )
             with (
-                patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-                patch('tts.src.main.time.perf_counter', return_value=0.0),
+                patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+                patch('tts.src.pipeline.time.perf_counter', return_value=0.0),
             ):
                 _ = b''.join(pipeline.add_segment('First.', 'sentence'))
                 _ = b''.join(pipeline.add_segment('Second.', 'sentence'))
@@ -919,8 +948,8 @@ class SmartChunkTest(unittest.TestCase):
 
             observed_at = flush_deadline + 0.001
             with (
-                patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk),
-                patch('tts.src.main.time.perf_counter', return_value=observed_at),
+                patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
+                patch('tts.src.pipeline.time.perf_counter', return_value=observed_at),
                 self.assertLogs('tts', level='WARNING') as captured,
             ):
                 _ = b''.join(
@@ -951,7 +980,7 @@ class SmartChunkTest(unittest.TestCase):
                 pipeline_smart_chunk_knowledge_flush_observations=1,
                 pipeline_smart_chunk_llm_id='qwen',
             )
-            knowledge = _SmartChunkKnowledge(settings, 'alba')
+            knowledge = SmartChunkKnowledge(settings, 'alba')
             knowledge.observe_voice(
                 'A measured sentence.',
                 audio_seconds=2.0,
@@ -968,7 +997,7 @@ class SmartChunkTest(unittest.TestCase):
             llm_path = Path(temporary_directory) / '.pipeline-knowledge' / 'llm-qwen.json'
             voice_payload = json.loads(voice_path.read_text(encoding='utf-8'))
             llm_payload = json.loads(llm_path.read_text(encoding='utf-8'))
-            reloaded = _SmartChunkKnowledge(settings, 'alba')
+            reloaded = SmartChunkKnowledge(settings, 'alba')
             prediction = reloaded.prediction(settings, queued_text='Queued sentence.')
 
         self.assertEqual(voice_payload['voice'], 'alba')
@@ -985,48 +1014,49 @@ class VoiceSelectionTest(unittest.TestCase):
             bender_path = data_directory / 'bender.safetensors'
             _ = bender_path.write_bytes(b'voice state')
             runtime = TtsRuntime(Settings(data_directory=data_directory, voice='alba'))
-            runtime.model = MagicMock()
+            runtime.engine.model = MagicMock()
             default_state = object()
             bender_state = object()
-            runtime.voice_states = {'alba': default_state}
-            runtime.model.get_state_for_audio_prompt.return_value = bender_state
+            runtime.engine.voice_states = {'alba': default_state}
+            runtime.engine.model.get_state_for_audio_prompt.return_value = bender_state
 
             self.assertEqual(runtime.prepare_voice('bender'), 'bender')
             self.assertEqual(runtime.prepare_voice('bender'), 'bender')
 
-            self.assertIs(runtime.voice_states['bender'], bender_state)
-            runtime.model.get_state_for_audio_prompt.assert_called_once_with(str(bender_path))
+            self.assertIs(runtime.engine.voice_states['bender'], bender_state)
+            runtime.engine.model.get_state_for_audio_prompt.assert_called_once_with(
+                str(bender_path)
+            )
 
     def test_missing_or_default_selector_uses_configured_voice(self) -> None:
         runtime = TtsRuntime(Settings(voice='attenborough'))
-        runtime.model = MagicMock()
+        runtime.engine.model = MagicMock()
         default_state = object()
-        runtime.voice_states = {'attenborough': default_state}
+        runtime.engine.voice_states = {'attenborough': default_state}
 
         self.assertEqual(runtime.prepare_voice(None), 'attenborough')
         self.assertEqual(runtime.prepare_voice('default'), 'attenborough')
         self.assertEqual(runtime.prepare_voice(' DEFAULT '), 'attenborough')
-        runtime.model.get_state_for_audio_prompt.assert_not_called()
+        runtime.engine.model.get_state_for_audio_prompt.assert_not_called()
 
     def test_invalid_selector_is_rejected(self) -> None:
         runtime = TtsRuntime(Settings())
-        runtime.model = MagicMock()
-        runtime.voice_states = {'alba': object()}
+        runtime.engine.model = MagicMock()
+        runtime.engine.voice_states = {'alba': object()}
 
-        with self.assertRaises(HTTPException) as raised:
+        with self.assertRaises(InvalidVoiceSelectorError):
             _ = runtime.prepare_voice('../bender')
 
-        self.assertEqual(raised.exception.status_code, 400)
-        runtime.model.get_state_for_audio_prompt.assert_not_called()
+        runtime.engine.model.get_state_for_audio_prompt.assert_not_called()
 
 
 class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
     async def test_patch_updates_limits_and_reloads_selected_voice(self) -> None:
         runtime = TtsRuntime(Settings(voice='alba'))
-        runtime.model = MagicMock()
+        runtime.engine.model = MagicMock()
         replacement_voice = object()
-        runtime.model.get_state_for_audio_prompt.return_value = replacement_voice
-        runtime.voice_states = {'alba': object()}
+        runtime.engine.model.get_state_for_audio_prompt.return_value = replacement_voice
+        runtime.engine.voice_states = {'alba': object()}
         app.state.runtime = runtime
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
@@ -1038,8 +1068,8 @@ class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(runtime.settings.maximum_input_characters, 200)
         self.assertEqual(runtime.settings.voice, 'attenborough')
-        self.assertIs(runtime.voice_states['attenborough'], replacement_voice)
-        runtime.model.get_state_for_audio_prompt.assert_called_once_with('attenborough')
+        self.assertIs(runtime.engine.voice_states['attenborough'], replacement_voice)
+        runtime.engine.model.get_state_for_audio_prompt.assert_called_once_with('attenborough')
 
     async def test_language_change_reports_restart_required(self) -> None:
         runtime = TtsRuntime(Settings())
@@ -1069,12 +1099,12 @@ class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_completed_pcm_stream_releases_exclusive_operation(self) -> None:
         runtime = TtsRuntime(Settings())
-        runtime.model = MagicMock(sample_rate=24_000)
-        runtime.model.generate_audio_stream.return_value = iter([b'\x01\x02'])
-        runtime.voice_states = {'alba': object()}
+        runtime.engine.model = MagicMock(sample_rate=24_000)
+        runtime.engine.model.generate_audio_stream.return_value = iter([b'\x01\x02'])
+        runtime.engine.voice_states = {'alba': object()}
         app.state.runtime = runtime
         transport = httpx.ASGITransport(app=app)
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
                 response = await client.post(
                     '/v1/audio/speech',
@@ -1087,17 +1117,17 @@ class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_body_voice_selects_cached_custom_voice(self) -> None:
         runtime = TtsRuntime(Settings(voice='attenborough'))
-        runtime.model = MagicMock(sample_rate=24_000)
+        runtime.engine.model = MagicMock(sample_rate=24_000)
         attenborough_state = object()
         bender_state = object()
-        runtime.voice_states = {
+        runtime.engine.voice_states = {
             'attenborough': attenborough_state,
             'bender': bender_state,
         }
-        runtime.model.generate_audio_stream.return_value = iter([b'\x01\x02'])
+        runtime.engine.model.generate_audio_stream.return_value = iter([b'\x01\x02'])
         app.state.runtime = runtime
         transport = httpx.ASGITransport(app=app)
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
                 response = await client.post(
                     '/v1/audio/speech',
@@ -1110,13 +1140,13 @@ class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(response.status_code, 200)
-        runtime.model.generate_audio_stream.assert_called_once_with(bender_state, 'hello')
+        runtime.engine.model.generate_audio_stream.assert_called_once_with(bender_state, 'hello')
 
     async def test_unavailable_body_voice_is_rejected_before_streaming(self) -> None:
         runtime = TtsRuntime(Settings())
-        runtime.model = MagicMock()
-        runtime.model.get_state_for_audio_prompt.side_effect = FileNotFoundError
-        runtime.voice_states = {'alba': object()}
+        runtime.engine.model = MagicMock()
+        runtime.engine.model.get_state_for_audio_prompt.side_effect = FileNotFoundError
+        runtime.engine.voice_states = {'alba': object()}
         app.state.runtime = runtime
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
@@ -1132,7 +1162,7 @@ class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json(), {'detail': "voice 'missing' is not available"})
-        runtime.model.generate_audio_stream.assert_not_called()
+        runtime.engine.model.generate_audio_stream.assert_not_called()
         self.assertFalse(runtime.operations.active)
 
 
@@ -1140,9 +1170,9 @@ class PipelineEndpointTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def runtime() -> TtsRuntime:
         runtime = TtsRuntime(Settings())
-        runtime.model = MagicMock(sample_rate=24_000)
-        runtime.voice_states = {'alba': object()}
-        runtime.model.generate_audio_stream.side_effect = lambda _voice, _text: iter(
+        runtime.engine.model = MagicMock(sample_rate=24_000)
+        runtime.engine.voice_states = {'alba': object()}
+        runtime.engine.model.generate_audio_stream.side_effect = lambda _voice, _text: iter(
             [b'\x01\x02\x03\x04'],
         )
         return runtime
@@ -1157,7 +1187,7 @@ class PipelineEndpointTest(unittest.IsolatedAsyncioTestCase):
         app.state.runtime = runtime
         transport = httpx.ASGITransport(app=app)
         headers = {'X-Pipeline': 'true'} if pipeline_header else None
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
                 return await client.post(
                     path,
@@ -1177,7 +1207,7 @@ class PipelineEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         requested_text = [
             call.args[1]
-            for call in cast('MagicMock', runtime.model).generate_audio_stream.call_args_list
+            for call in cast('MagicMock', runtime.engine.model).generate_audio_stream.call_args_list
         ]
         self.assertEqual(requested_text, ['First sentence. Second sentence.'])
 
@@ -1193,7 +1223,7 @@ class PipelineEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         requested_text = [
             call.args[1]
-            for call in cast('MagicMock', runtime.model).generate_audio_stream.call_args_list
+            for call in cast('MagicMock', runtime.engine.model).generate_audio_stream.call_args_list
         ]
         self.assertEqual(requested_text, ['First sentence.', 'Second sentence.'])
 
@@ -1205,7 +1235,7 @@ class PipelineEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         requested_text = [
             call.args[1]
-            for call in cast('MagicMock', runtime.model).generate_audio_stream.call_args_list
+            for call in cast('MagicMock', runtime.engine.model).generate_audio_stream.call_args_list
         ]
         self.assertEqual(requested_text, ['First sentence.', 'Second sentence.'])
 
@@ -1214,10 +1244,10 @@ class MultiSpeakerEndpointTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def runtime(settings: Settings | None = None) -> tuple[TtsRuntime, object, object]:
         runtime = TtsRuntime(settings or Settings(voice='attenborough'))
-        runtime.model = MagicMock(sample_rate=24_000)
+        runtime.engine.model = MagicMock(sample_rate=24_000)
         attenborough_state = object()
         bender_state = object()
-        runtime.voice_states = {
+        runtime.engine.voice_states = {
             'attenborough': attenborough_state,
             'bender': bender_state,
         }
@@ -1226,7 +1256,7 @@ class MultiSpeakerEndpointTest(unittest.IsolatedAsyncioTestCase):
             value = 1_000 if voice_state is attenborough_state else 2_000
             return iter([struct.pack('<4h', *([value] * 4))])
 
-        runtime.model.generate_audio_stream.side_effect = generate
+        runtime.engine.model.generate_audio_stream.side_effect = generate
         return runtime, attenborough_state, bender_state
 
     @staticmethod
@@ -1255,7 +1285,7 @@ class MultiSpeakerEndpointTest(unittest.IsolatedAsyncioTestCase):
     ) -> httpx.Response:
         app.state.runtime = runtime
         transport = httpx.ASGITransport(app=app)
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
                 return await client.post(
                     '/v1/audio/speech/multi-speaker',
@@ -1291,7 +1321,7 @@ class MultiSpeakerEndpointTest(unittest.IsolatedAsyncioTestCase):
                     *([1_000] * 4),
                 ),
             )
-            calls = cast('MagicMock', runtime.model).generate_audio_stream.call_args_list
+            calls = cast('MagicMock', runtime.engine.model).generate_audio_stream.call_args_list
             self.assertEqual(
                 [(call.args[0], call.args[1]) for call in calls],
                 [
@@ -1341,14 +1371,14 @@ class MultiSpeakerEndpointTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json(), {'detail': "speaker 'missing' is not defined"})
-        cast('MagicMock', runtime.model).generate_audio_stream.assert_not_called()
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.assert_not_called()
         self.assertFalse(runtime.operations.active)
 
     async def test_preloads_every_declared_voice_before_streaming(self) -> None:
         runtime = TtsRuntime(Settings(voice='attenborough'))
-        runtime.model = MagicMock(sample_rate=24_000)
-        runtime.voice_states = {'attenborough': object()}
-        runtime.model.get_state_for_audio_prompt.side_effect = FileNotFoundError
+        runtime.engine.model = MagicMock(sample_rate=24_000)
+        runtime.engine.voice_states = {'attenborough': object()}
+        runtime.engine.model.get_state_for_audio_prompt.side_effect = FileNotFoundError
         payload = self.payload()
         cast('dict[str, object]', payload['input'])['segments'] = [
             {'speaker': 'narrator', 'text': 'Only the valid voice is referenced.'},
@@ -1358,7 +1388,7 @@ class MultiSpeakerEndpointTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json(), {'detail': "voice 'bender' is not available"})
-        runtime.model.generate_audio_stream.assert_not_called()
+        runtime.engine.model.generate_audio_stream.assert_not_called()
         self.assertFalse(runtime.operations.active)
 
     async def test_updates_each_selected_voice_knowledge_file(self) -> None:
@@ -1400,9 +1430,9 @@ class PipelineWebSocketTest(unittest.IsolatedAsyncioTestCase):
                 pipeline_sentence_pause_seconds=0,
             ),
         )
-        runtime.model = MagicMock(sample_rate=24_000)
-        runtime.voice_states = {'alba': object()}
-        runtime.model.generate_audio_stream.side_effect = lambda _voice, _text: iter(
+        runtime.engine.model = MagicMock(sample_rate=24_000)
+        runtime.engine.voice_states = {'alba': object()}
+        runtime.engine.model.generate_audio_stream.side_effect = lambda _voice, _text: iter(
             [b'\x01\x02\x03\x04'],
         )
 
@@ -1444,13 +1474,13 @@ class PipelineWebSocketTest(unittest.IsolatedAsyncioTestCase):
                 self.client_state = WebSocketState.DISCONNECTED
 
         websocket = FakeWebSocket()
-        with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             await speech_pipeline_websocket(cast('WebSocket', websocket))
 
         self.assertLess(cast('int', websocket.first_audio_after_received), 4)
         self.assertEqual(b''.join(websocket.audio), b'\x01\x02\x03\x04\x01\x02\x03\x04')
         self.assertEqual(
-            [call.args[1] for call in runtime.model.generate_audio_stream.call_args_list],
+            [call.args[1] for call in runtime.engine.model.generate_audio_stream.call_args_list],
             ['First clause,', 'rest of sentence.'],
         )
         self.assertEqual(websocket.json_events[0]['type'], 'session.ready')
@@ -1464,11 +1494,11 @@ class LatestWavTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / 'latest.wav'
             runtime = TtsRuntime(Settings(save_latest_wav=True, latest_wav_path=destination))
-            runtime.model = MagicMock(sample_rate=24_000)
-            runtime.voice_states = {'alba': object()}
+            runtime.engine.model = MagicMock(sample_rate=24_000)
+            runtime.engine.voice_states = {'alba': object()}
             response_body = b'exact WAV response bytes'
 
-            with patch.object(runtime, '_wav_bytes', return_value=response_body):
+            with patch.object(runtime.engine, '_wav_bytes', return_value=response_body):
                 generated = runtime.generate_wav('hello', 'alba')
 
             self.assertEqual(generated, response_body)
@@ -1478,12 +1508,12 @@ class LatestWavTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / 'latest.wav'
             runtime = TtsRuntime(Settings(save_latest_wav=True, latest_wav_path=destination))
-            runtime.model = MagicMock(sample_rate=24_000)
-            runtime.voice_states = {'alba': object()}
+            runtime.engine.model = MagicMock(sample_rate=24_000)
+            runtime.engine.voice_states = {'alba': object()}
             pcm_chunks = [b'\x01\x02', b'\x03\x04\x05\x06']
-            runtime.model.generate_audio_stream.return_value = iter(pcm_chunks)
+            runtime.engine.model.generate_audio_stream.return_value = iter(pcm_chunks)
 
-            with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
                 emitted = list(runtime.stream_pcm('hello', 'alba'))
 
             self.assertEqual(emitted, pcm_chunks)
@@ -1500,11 +1530,13 @@ class LatestWavTest(unittest.TestCase):
             previous_recording = b'previous recording'
             _ = destination.write_bytes(previous_recording)
             runtime = TtsRuntime(Settings(save_latest_wav=True, latest_wav_path=destination))
-            runtime.model = MagicMock(sample_rate=24_000)
-            runtime.voice_states = {'alba': object()}
-            runtime.model.generate_audio_stream.return_value = iter([b'\x01\x02', b'\x03\x04'])
+            runtime.engine.model = MagicMock(sample_rate=24_000)
+            runtime.engine.voice_states = {'alba': object()}
+            runtime.engine.model.generate_audio_stream.return_value = iter(
+                [b'\x01\x02', b'\x03\x04']
+            )
 
-            with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
                 stream = runtime.stream_pcm('hello', 'alba')
                 self.assertEqual(next(stream), b'\x01\x02')
                 stream.close()
@@ -1522,13 +1554,13 @@ class LatestWavTest(unittest.TestCase):
                     pipeline_sentence_pause_seconds=1 / 24_000,
                 ),
             )
-            runtime.model = MagicMock(sample_rate=24_000)
-            runtime.voice_states = {'alba': object()}
-            runtime.model.generate_audio_stream.side_effect = lambda _voice, _text: iter(
+            runtime.engine.model = MagicMock(sample_rate=24_000)
+            runtime.engine.voice_states = {'alba': object()}
+            runtime.engine.model.generate_audio_stream.side_effect = lambda _voice, _text: iter(
                 [b'\x01\x02\x03\x04'],
             )
 
-            with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
                 emitted = b''.join(
                     runtime.stream_pipeline_pcm('First sentence. Second sentence.', 'alba'),
                 )
@@ -1551,13 +1583,13 @@ class LatestWavTest(unittest.TestCase):
                     pipeline_speech_confirmation_seconds=1 / 24_000,
                 ),
             )
-            runtime.model = MagicMock(sample_rate=24_000)
-            runtime.voice_states = {'alba': object()}
-            runtime.model.generate_audio_stream.side_effect = lambda _voice, _text: iter(
+            runtime.engine.model = MagicMock(sample_rate=24_000)
+            runtime.engine.voice_states = {'alba': object()}
+            runtime.engine.model.generate_audio_stream.side_effect = lambda _voice, _text: iter(
                 [b'\x01\x02', b'\x03\x04'],
             )
 
-            with patch.object(runtime, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
                 stream = runtime.stream_pipeline_pcm('First sentence. Second sentence.', 'alba')
                 self.assertEqual(next(stream), b'\x01\x02')
                 stream.close()

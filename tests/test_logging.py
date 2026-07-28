@@ -4,6 +4,7 @@ import ast
 import json
 import logging
 import re
+import sys
 import unittest
 from pathlib import Path
 from typing import TypeGuard
@@ -39,18 +40,27 @@ class JsonFormatterTest(unittest.TestCase):
         self.assertEqual(output['payload']['tools'][0]['name'], 'time')
 
     def test_uvicorn_access_data_uses_named_fields(self) -> None:
+        content_sentinel = 'private-conversation-sentinel'
         record = logging.LogRecord(
             'uvicorn.access',
             logging.INFO,
             __file__,
             1,
             '%s - "%s %s HTTP/%s" %d',
-            ('10.0.0.1:1234', 'POST', '/v1/audio/speech', '1.1', 200),
+            (
+                '10.0.0.1:1234',
+                'POST',
+                f'/v1/audio/speech?input={content_sentinel}',
+                '1.1',
+                200,
+            ),
             None,
         )
 
-        output = json.loads(JsonFormatter().format(record))
+        formatted = JsonFormatter().format(record)
+        output = json.loads(formatted)
 
+        self.assertNotIn(content_sentinel, formatted)
         self.assertEqual(output['message'], 'HTTP request')
         self.assertEqual(output['event_id'], 'ID_http_server_request')
         self.assertEqual(output['client_address'], '10.0.0.1:1234')
@@ -61,18 +71,31 @@ class JsonFormatterTest(unittest.TestCase):
         self.assertNotIn('arguments', output)
 
     def test_httpx_request_data_uses_named_fields(self) -> None:
+        content_sentinel = 'private-conversation-sentinel'
         record = logging.LogRecord(
             'httpx',
             logging.INFO,
             __file__,
             1,
             'HTTP Request: %s %s "%s %d %s"',
-            ('POST', 'http://llm/completion', 'HTTP/1.1', 200, 'OK'),
+            (
+                'POST',
+                (
+                    'http://service:'
+                    f'{content_sentinel}@llm/completion?input={content_sentinel}'
+                    f'#{content_sentinel}'
+                ),
+                'HTTP/1.1',
+                200,
+                'OK',
+            ),
             None,
         )
 
-        output = json.loads(JsonFormatter().format(record))
+        formatted = JsonFormatter().format(record)
+        output = json.loads(formatted)
 
+        self.assertNotIn(content_sentinel, formatted)
         self.assertEqual(output['message'], 'HTTP request')
         self.assertEqual(output['event_id'], 'ID_http_client_request')
         self.assertEqual(output['method'], 'POST')
@@ -83,22 +106,112 @@ class JsonFormatterTest(unittest.TestCase):
         self.assertNotIn('arguments', output)
 
     def test_uncatalogued_dependency_record_uses_fallback_event_id(self) -> None:
+        content_sentinel = 'private-conversation-sentinel'
         record = logging.makeLogRecord(
             {
                 'name': 'dependency',
                 'levelno': logging.WARNING,
                 'levelname': 'WARNING',
-                'msg': 'Dependency warning',
-                'args': (),
+                'msg': 'Dependency warning: %s',
+                'args': (content_sentinel,),
+                'body': content_sentinel,
             },
         )
 
-        output = json.loads(JsonFormatter().format(record))
+        formatted = JsonFormatter().format(record)
+        output = json.loads(formatted)
 
+        self.assertNotIn(content_sentinel, formatted)
+        self.assertEqual(output['message'], 'Dependency log')
         self.assertEqual(output['event_id'], 'ID_dependency_log')
+
+    def test_application_error_redacts_content_and_exception_message(self) -> None:
+        content_sentinel = 'private conversation and tool arguments'
+        try:
+            raise RuntimeError(content_sentinel)  # noqa: TRY301
+        except RuntimeError:
+            record = logging.LogRecord(
+                'assistant.pipeline',
+                logging.ERROR,
+                __file__,
+                1,
+                'Assistant request failed: %s',
+                (content_sentinel,),
+                sys.exc_info(),
+            )
+        record.event_id = 'ID_assistant_request_failed'
+        record.operation = 'generation'
+        record.transcript = content_sentinel
+        record.arguments = {'query': content_sentinel}
+        record.error = content_sentinel
+
+        formatted = JsonFormatter().format(record)
+        output = json.loads(formatted)
+
+        self.assertNotIn(content_sentinel, formatted)
+        self.assertEqual(output['message'], 'Assistant request failed: %s')
+        self.assertEqual(output['operation'], 'generation')
+        self.assertEqual(output['exception_type'], 'RuntimeError')
+        self.assertNotIn('arguments', output)
+        self.assertNotIn('error', output)
+        self.assertNotIn('transcript', output)
+        self.assertNotIn('exception', output)
+        self.assertGreater(len(output['traceback']), 0)
+
+    def test_application_debug_record_retains_explicit_content(self) -> None:
+        content_sentinel = 'private conversation and tool arguments'
+        try:
+            raise RuntimeError(content_sentinel)  # noqa: TRY301
+        except RuntimeError:
+            record = logging.LogRecord(
+                'assistant.pipeline',
+                logging.DEBUG,
+                __file__,
+                1,
+                'Assistant request: %s',
+                (content_sentinel,),
+                sys.exc_info(),
+            )
+        record.event_id = 'ID_assistant_request'
+        record.transcript = content_sentinel
+
+        formatted = JsonFormatter().format(record)
+        output = json.loads(formatted)
+
+        self.assertIn(content_sentinel, formatted)
+        self.assertEqual(output['message'], f'Assistant request: {content_sentinel}')
+        self.assertEqual(output['transcript'], content_sentinel)
+        self.assertIn(content_sentinel, output['exception'])
 
 
 class ProjectEventIdTest(unittest.TestCase):
+    CONTENT_FIELDS = frozenset(
+        {
+            'answer',
+            'arguments',
+            'body',
+            'content',
+            'conversation',
+            'decision',
+            'delta',
+            'error',
+            'history',
+            'input',
+            'messages',
+            'output',
+            'payload',
+            'prompt',
+            'raw_response',
+            'request_body',
+            'response',
+            'result',
+            'speaker',
+            'text',
+            'transcript',
+            'turns',
+        },
+    )
+
     def test_project_log_calls_declare_valid_event_ids(self) -> None:  # noqa: C901
         repository = Path(__file__).parents[1]
         source_roots = (
@@ -121,6 +234,42 @@ class ProjectEventIdTest(unittest.TestCase):
                         problems.append(f'{relative_path}:{node.lineno}')
 
         self.assertEqual(problems, [], f'log calls without valid event IDs: {problems}')
+
+    def test_non_debug_log_calls_use_literal_messages_without_content_fields(  # noqa: C901
+        self,
+    ) -> None:
+        repository = Path(__file__).parents[1]
+        source_roots = (
+            repository / 'assistant' / 'src',
+            repository / 'stt' / 'src',
+            repository / 'tts' / 'src',
+        )
+        problems: list[str] = []
+
+        for source_root in source_roots:
+            for path in source_root.rglob('*.py'):
+                tree = ast.parse(path.read_text(), filename=str(path))
+                for node in ast.walk(tree):
+                    if not self._is_log_call(node):
+                        continue
+                    function = node.func
+                    if not isinstance(function, ast.Attribute) or function.attr == 'debug':
+                        continue
+                    relative_path = path.relative_to(repository)
+                    location = f'{relative_path}:{node.lineno}'
+                    if (
+                        not node.args
+                        or not isinstance(node.args[0], ast.Constant)
+                        or not isinstance(node.args[0].value, str)
+                    ):
+                        problems.append(f'{location} has a dynamic message')
+                    exposed = self.CONTENT_FIELDS.intersection(self._extra_keys(node))
+                    if exposed:
+                        problems.append(
+                            f'{location} exposes content fields {sorted(exposed)}',
+                        )
+
+        self.assertEqual(problems, [], f'unsafe non-debug log calls: {problems}')
 
     @staticmethod
     def _is_log_call(node: ast.AST) -> TypeGuard[ast.Call]:
@@ -147,6 +296,17 @@ class ProjectEventIdTest(unittest.TestCase):
             ):
                 return value.value
         return None
+
+    @staticmethod
+    def _extra_keys(node: ast.Call) -> set[str]:
+        extra_keyword = next((keyword for keyword in node.keywords if keyword.arg == 'extra'), None)
+        if extra_keyword is None or not isinstance(extra_keyword.value, ast.Dict):
+            return set()
+        return {
+            key.value
+            for key in extra_keyword.value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
 
 
 class SuccessfulHealthCheckFilterTest(unittest.TestCase):

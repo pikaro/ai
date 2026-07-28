@@ -11,9 +11,18 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from pydantic import ValidationError
 from websockets.asyncio.client import ClientConnection, connect
 
 from assistant.src import metrics
+from service_contracts.tts import (
+    PIPELINE_OUTPUT_ADAPTER,
+    PipelineError,
+    PipelineSessionReady,
+    PipelineSessionRequest,
+    PipelineTextDelta,
+    PipelineTextDone,
+)
 
 LOGGER = logging.getLogger('assistant.upstream')
 
@@ -37,25 +46,52 @@ def _require_audio_format(audio_format: AudioFormat | None) -> AudioFormat:
     raise RuntimeError(message)
 
 
-def _pipeline_event(message: str) -> tuple[str | None, AudioFormat | None]:
-    event = json.loads(message)
-    if not isinstance(event, dict):
-        message = 'TTS pipeline returned an invalid event'
-        raise TypeError(message)
-    event_type = event.get('type')
+def _untyped_pipeline_event(payload: dict[object, object]) -> tuple[str | None, AudioFormat | None]:
+    event_type = payload.get('type')
     if event_type == 'session.ready':
         return (
-            event_type,
+            'session.ready',
             AudioFormat(
-                sample_rate=int(event['sample_rate']),
-                sample_width=int(event['sample_width']),
-                channels=int(event['channels']),
+                sample_rate=_integer_payload_field(payload, 'sample_rate'),
+                sample_width=_integer_payload_field(payload, 'sample_width'),
+                channels=_integer_payload_field(payload, 'channels'),
             ),
         )
     if event_type == 'error':
-        error_message = str(event.get('message') or 'TTS pipeline failed')
+        error_message = str(payload.get('message') or 'TTS pipeline failed')
         raise RuntimeError(error_message)
     return (event_type if isinstance(event_type, str) else None), None
+
+
+def _integer_payload_field(payload: dict[object, object], name: str) -> int:
+    value = payload[name]
+    if not isinstance(value, (str, int, float)):
+        message = f'pipeline event field {name!r} is not an integer'
+        raise TypeError(message)
+    return int(value)
+
+
+def _pipeline_event(message: str) -> tuple[str | None, AudioFormat | None]:
+    payload = json.loads(message)
+    if not isinstance(payload, dict):
+        error_message = 'TTS pipeline returned an invalid event'
+        raise TypeError(error_message)
+    try:
+        event = PIPELINE_OUTPUT_ADAPTER.validate_python(payload)
+    except ValidationError:
+        return _untyped_pipeline_event(payload)
+    if isinstance(event, PipelineSessionReady):
+        return (
+            event.type,
+            AudioFormat(
+                sample_rate=event.sample_rate,
+                sample_width=event.sample_width,
+                channels=event.channels,
+            ),
+        )
+    if isinstance(event, PipelineError):
+        raise RuntimeError(event.message or 'TTS pipeline failed')  # noqa: TRY004
+    return event.type, None
 
 
 class SlotPool:
@@ -363,7 +399,7 @@ class TtsClient:
         self.client = client
         self.settings = settings
 
-    async def stream(  # noqa: C901, PLR0912
+    async def stream(  # noqa: C901
         self,
         text_stream: AsyncIterator[str],
         *,
@@ -383,17 +419,12 @@ class TtsClient:
                 max_size=self.settings.maximum_websocket_message_bytes,
                 max_queue=2,
             ) as websocket:
-                session_start: dict[str, object] = {
-                    'type': 'session.start',
-                    'model': self.settings.tts_model,
-                }
-                if voice is not None:
-                    session_start['voice'] = voice
                 await websocket.send(
-                    json.dumps(
-                        session_start,
-                        separators=(',', ':'),
-                    ),
+                    PipelineSessionRequest(
+                        type='session.start',
+                        model=self.settings.tts_model,
+                        voice=voice,
+                    ).model_dump_json(exclude_none=True),
                 )
                 sender = asyncio.create_task(self._send_text(websocket, text_stream))
                 while not response_done:
@@ -452,13 +483,14 @@ class TtsClient:
             async for delta in text_stream:
                 if delta:
                     await websocket.send(
-                        json.dumps(
-                            {'type': 'input_text.delta', 'delta': delta},
-                            ensure_ascii=False,
-                            separators=(',', ':'),
-                        ),
+                        PipelineTextDelta(
+                            type='input_text.delta',
+                            delta=delta,
+                        ).model_dump_json(),
                     )
-            await websocket.send('{"type":"input_text.done"}')
+            await websocket.send(
+                PipelineTextDone(type='input_text.done').model_dump_json(),
+            )
         except BaseException:
             with suppress(Exception):
                 await websocket.close(code=1011)
@@ -512,7 +544,6 @@ async def upstream_health(
                     'event_id': 'ID_assistant_upstream_health_check_failed',
                     'service': name,
                     'error_type': type(error).__name__,
-                    'error': str(error),
                 },
             )
         metrics.UPSTREAM_READY.labels(service=name).set(int(ready))

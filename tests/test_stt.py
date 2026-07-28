@@ -10,16 +10,13 @@ from unittest.mock import patch
 import httpx
 from pydantic import ValidationError
 
+from service_contracts.stt import parse_stt_server_event
 from service_logging import SuccessfulHealthCheckFilter
-from stt.src.main import (
-    AsrRuntime,
-    RealtimeEvent,
-    Settings,
-    app,
-    metrics,
-    stable_word_prefix,
-    transcript_delta,
-)
+from stt.src.api import app, metrics
+from stt.src.config import Settings
+from stt.src.runtime import AsrRuntime
+from stt.src.schemas import RealtimeEvent
+from stt.src.transcript import stable_word_prefix, transcript_delta
 
 
 class SettingsTest(unittest.TestCase):
@@ -64,6 +61,15 @@ class RealtimeEventTest(unittest.TestCase):
             _ = RealtimeEvent.model_validate(
                 {'type': 'input_audio_buffer.commit', 'unexpected': True},
             )
+
+    def test_unknown_server_events_remain_forward_compatible(self) -> None:
+        payload, event = parse_stt_server_event(
+            '{"type":"future.stt.metadata","detail":{"version":2}}',
+        )
+
+        self.assertEqual(payload['type'], 'future.stt.metadata')
+        self.assertEqual(payload['detail'], {'version': 2})
+        self.assertIsNone(event)
 
 
 class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):

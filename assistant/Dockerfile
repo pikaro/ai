@@ -29,6 +29,7 @@ RUN uv sync --frozen --no-dev --package ai-assistant --no-install-local
 
 COPY --chown=app:app assistant/__init__.py assistant/__init__.py
 COPY --chown=app:app assistant/src/ assistant/src/
+COPY --chown=app:app service_contracts/ service_contracts/
 COPY --chown=app:app runtime_config.py runtime_config.py
 COPY --chown=app:app service_logging.py service_logging.py
 

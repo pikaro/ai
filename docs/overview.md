@@ -61,30 +61,68 @@ Project event IDs use stable, descriptive `ID_snake_case` names and can be
 found in raw logs with `\bID_[a-z_]+\b`. Uvicorn access and HTTPX
 request records use `ID_http_server_request` and `ID_http_client_request`;
 uncatalogued dependency records use `ID_dependency_log`. Uvicorn access
-records expose `client_address`, `method`, `path`, `http_version`, and
-`status_code`.
+records expose `client_address`, `method`, the query-free `path`,
+`http_version`, and `status_code`. HTTP client records likewise omit URL
+credentials, queries, and fragments.
 
-All services log operational activity and stage durations at `INFO` without
-request payloads. Set the unprefixed `LOG_LEVEL=DEBUG` environment variable to
-also log transcripts, generated responses, text sent to speech synthesis, LLM
-request payloads, tool schemas/arguments/results, and MCP request data. LLM
-request payloads contain the exact submitted prompt, including tool definitions
-and prior tool results, so DEBUG logs can contain sensitive user or MCP data.
-Authentication headers are not logged.
+All services log only allowlisted operational metadata at levels above
+`DEBUG`: counts, timing, status, operation names, configured model/voice/tool
+identifiers, exception types, and traceback locations. Exception messages,
+formatting arguments, arbitrary dependency messages, request and response
+bodies, prompts, transcripts, generated speech text, speaker labels, tool
+arguments/results, and conversation history are suppressed at those levels.
+Set the unprefixed `LOG_LEVEL=DEBUG` environment variable to emit the explicit
+application DEBUG records containing transcripts, generated responses, text
+sent to speech synthesis, LLM request payloads, tool schemas/arguments/results,
+and MCP request data. LLM request payloads contain the exact submitted prompt,
+including tool definitions and prior tool results, so DEBUG logs can contain
+sensitive user or MCP data. Authentication headers are not logged.
 
 The assistant's `WS /v1/realtime` endpoint accepts optional `X-Request-Id` and
 `X-Request-Timestamp` headers. When either is present, the assistant logs an
 `ID_assistant_request_correlation_received` record immediately on receipt with
-the verbatim values in `request_id` and `request_timestamp`. The values are for
-log correlation only; they are not validated or forwarded to upstream services.
+bounded token-like values in `request_id` and `request_timestamp`; other values
+are omitted from the record. The headers are for log correlation only and are
+not forwarded to upstream services.
 
 Successful `200` responses from `/health`, `/health/live`, and `/health/ready`
 are omitted from Uvicorn access logs and the assistant's HTTPX upstream request
 logs; failed health checks and all other requests remain visible.
 
+## Code structure
+
+Each deployable package follows the same one-way dependency direction:
+entrypoint and API transports call a transport-neutral runtime, which composes
+model engines, processors, and persistence helpers. Expected failures are typed
+in each service's `domain.py` and translated to HTTP or WebSocket behavior only
+at the API boundary. `main.py` files only expose the application and Uvicorn
+entrypoint.
+
+| Service | API transports and schemas | Application boundary | Processing and integrations |
+| --- | --- | --- | --- |
+| Assistant | `api.py`, `realtime.py`, `dashboard.py`, `configuration_api.py`, `dependencies.py`, `schemas.py` | `runtime.py` | `pipeline.py`, `upstream.py`, `tooling.py` |
+| STT | `api.py`, `schemas.py` | `runtime.py` | `engine.py`, `streaming.py`, `transcript.py`, `uploads.py`, `recording.py` |
+| TTS | `api.py`, `schemas.py` | `runtime.py` | `engine.py`, `streaming.py`, `pipeline.py`, `voices.py`, `recording.py` |
+
+Models shared across independently deployed services live in
+`service_contracts/`. This package owns the model-list, realtime audio-input,
+STT event, and incremental TTS wire contracts without depending on any service
+implementation or web framework. In particular, the assistant validates the
+same STT/TTS models the servers serialize rather than maintaining parallel
+dictionaries. Input contracts remain strict, while server-output parsing
+retains unknown fields and event envelopes so a new metadata event does not
+break an older assistant.
+
+The normal, complete-input pipeline, incremental pipeline, and multi-speaker
+TTS route adapters all delegate validation and lifecycle work to `TtsRuntime`.
+That runtime reuses one `PocketTtsEngine` and one set of direct-generator
+`PcmPipeline` primitives. This keeps API expansion independent of audio
+processing while preserving streaming flow control and avoiding additional
+queues or hot-path serialization.
+
 ## Assistant
 
-`assistant/src/main.py` combines the STT, llama.cpp, and TTS services through:
+The assistant runtime combines the STT, llama.cpp, and TTS services through:
 
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics`
@@ -226,7 +264,7 @@ configured services, operations, tools, stages, dispositions, and outcomes.
 
 ## STT
 
-`stt/src/main.py` serves NeMo FastConformer through:
+The STT API serves NeMo FastConformer through:
 
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics`
@@ -241,7 +279,7 @@ emits partial, stable delta, and completed transcription events.
 
 The model is single-worker. Concurrent HTTP or WebSocket inference is rejected
 instead of waiting behind the active session. Relevant settings use the `STT_`
-prefix; defaults are declared in `stt/src/main.py`.
+prefix; defaults are declared in `stt/src/config.py`.
 
 Set `STT_SAVE_LATEST_WAV=true` to atomically overwrite the most recently
 committed realtime input recording. `STT_LATEST_WAV_PATH` defaults to
@@ -261,8 +299,8 @@ libraries.
 
 ## TTS
 
-`tts/src/main.py` keeps one Pocket TTS model and reusable voice states in memory
-and serves:
+`TtsRuntime` keeps one Pocket TTS model and reusable voice states in memory.
+The TTS API serves:
 
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics`
@@ -279,7 +317,7 @@ and serves:
 PCM16 and includes format headers. Pocket TTS is not thread-safe, so only one
 generation is admitted and concurrent requests receive `409 Conflict` instead
 of waiting on its model lock. Relevant settings use the `TTS_` prefix; defaults
-are declared in `tts/src/main.py`.
+are declared in `tts/src/config.py`.
 
 Speech requests select a voice with the OpenAI-compatible `voice` body field.
 An omitted value or `"voice": "default"` selects `TTS_VOICE`; a named value

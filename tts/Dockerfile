@@ -34,7 +34,9 @@ COPY tts/pyproject.toml tts/pyproject.toml
 
 RUN uv sync --frozen --no-dev --package ai-tts --no-install-local
 
-COPY --chown=app:app tts/src/ ./
+COPY --chown=app:app tts/__init__.py tts/__init__.py
+COPY --chown=app:app tts/src/ tts/src/
+COPY --chown=app:app service_contracts/ service_contracts/
 COPY --chown=app:app runtime_config.py runtime_config.py
 COPY --chown=app:app service_logging.py service_logging.py
 
@@ -42,7 +44,7 @@ FROM runtime AS verification
 
 USER 65532:65532
 
-RUN python -c "import importlib.util; from pathlib import Path; import main; import pocket_tts; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None; Path('/tmp/runtime-verified').touch()"
+RUN python -c "import importlib.util; from pathlib import Path; import pocket_tts; import tts.src.main; assert importlib.util.find_spec('nv_one_logger') is None; assert importlib.util.find_spec('wandb') is None; Path('/tmp/runtime-verified').touch()"
 
 FROM runtime
 
@@ -54,4 +56,4 @@ EXPOSE 8080
 
 ENTRYPOINT ["dumb-init", "--"]
 
-CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"$LISTEN_PORT\" --workers 1"]
+CMD ["sh", "-c", "exec uvicorn tts.src.main:app --host 0.0.0.0 --port \"$LISTEN_PORT\" --workers 1"]
