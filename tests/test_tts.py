@@ -910,7 +910,7 @@ class SmartChunkTest(unittest.TestCase):
             with (
                 patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk),
                 patch('tts.src.pipeline.time.perf_counter', return_value=0.01),
-                self.assertLogs('tts', level='INFO') as captured,
+                self.assertLogs('tts', level='DEBUG') as captured,
             ):
                 _ = b''.join(pipeline.add_segment('Third.', 'input_end'))
 

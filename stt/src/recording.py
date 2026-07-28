@@ -39,7 +39,7 @@ def save_wav_atomic(destination: Path, pcm: bytes, sample_rate: int, channels: i
             extra={'event_id': 'ID_stt_latest_recording_save_failed', 'path': str(destination)},
         )
         return
-    LOGGER.info(
+    LOGGER.debug(
         'Saved latest input recording',
         extra={
             'event_id': 'ID_stt_latest_recording_saved',

@@ -10,6 +10,7 @@ from typing import Final
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 HEALTH_ENDPOINTS: Final = frozenset({'/health', '/health/live', '/health/ready'})
+ROUTINE_ENDPOINTS: Final = HEALTH_ENDPOINTS | frozenset({'/metrics'})
 DEFAULT_EVENT_ID: Final = 'ID_dependency_log'
 HTTP_SERVER_REQUEST_EVENT_ID: Final = 'ID_http_server_request'
 HTTP_CLIENT_REQUEST_EVENT_ID: Final = 'ID_http_client_request'
@@ -69,7 +70,7 @@ _OMIT: Final = object()
 
 
 class SuccessfulHealthCheckFilter(logging.Filter):
-    """Suppress successful health checks while retaining failures and other requests."""
+    """Suppress successful health and metrics polling while retaining failures."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         arguments = record.args
@@ -83,7 +84,41 @@ class SuccessfulHealthCheckFilter(logging.Filter):
             return True
         request_path = urlsplit(str(target)).path
         return not (
-            method == 'GET' and request_path in HEALTH_ENDPOINTS and status_code == 200  # noqa: PLR2004
+            method == 'GET' and request_path in ROUTINE_ENDPOINTS and status_code == 200  # noqa: PLR2004
+        )
+
+
+class SuccessfulHttpClientRequestFilter(logging.Filter):
+    """Suppress successful HTTPX access records covered by application events."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        arguments = record.args
+        if record.name != 'httpx' or not isinstance(arguments, tuple):
+            return True
+        if len(arguments) < 4:  # noqa: PLR2004
+            return True
+        status_code = arguments[3]
+        return not (
+            isinstance(status_code, int) and 200 <= status_code < 400  # noqa: PLR2004
+        )
+
+
+class UvicornWebSocketNoiseFilter(logging.Filter):
+    """Suppress protocol lifecycle records duplicated by service session logs."""
+
+    _SUPPRESSED_MESSAGES: Final = frozenset(
+        {
+            '%s - "WebSocket %s" [accepted]',
+            'connection open',
+            'connection closed',
+        },
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (
+            record.name == 'uvicorn.error'
+            and isinstance(record.msg, str)
+            and record.msg in self._SUPPRESSED_MESSAGES
         )
 
 
@@ -258,6 +293,16 @@ def _safe_url(value: str) -> str:
         return value.split('?', maxsplit=1)[0].split('#', maxsplit=1)[0]
 
 
+def _add_filter_once(
+    logger_name: str,
+    filter_type: type[logging.Filter],
+) -> logging.Logger:
+    logger = logging.getLogger(logger_name)
+    if not any(isinstance(item, filter_type) for item in logger.filters):
+        logger.addFilter(filter_type())
+    return logger
+
+
 def configure_logging(level: str, application_logger: str) -> None:
     """Configure application, dependency, and Uvicorn records as JSON."""
     handler = logging.StreamHandler()
@@ -284,7 +329,11 @@ def configure_logging(level: str, application_logger: str) -> None:
     logger.propagate = True
     logger.disabled = False
 
-    for logger_name in ('uvicorn.access', 'httpx'):
-        logger = logging.getLogger(logger_name)
-        if not any(isinstance(item, SuccessfulHealthCheckFilter) for item in logger.filters):
-            logger.addFilter(SuccessfulHealthCheckFilter())
+    _ = _add_filter_once('uvicorn.access', SuccessfulHealthCheckFilter)
+    _ = _add_filter_once('httpx', SuccessfulHealthCheckFilter)
+    _ = _add_filter_once('httpx', SuccessfulHttpClientRequestFilter)
+    _ = _add_filter_once('uvicorn.error', UvicornWebSocketNoiseFilter)
+
+    # PocketTTS emits several internal timer records for every synthesized segment.
+    # Service metrics and segment-completion events retain the useful timings.
+    logging.getLogger('pocket_tts').setLevel(logging.WARNING)

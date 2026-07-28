@@ -256,7 +256,7 @@ class TtsRuntime:
                     ),
                 )
                 segments = [*segmenter.append(turn.text), *segmenter.finish()]
-                LOGGER.info(
+                LOGGER.debug(
                     'TTS multi-speaker turn started',
                     extra={
                         'event_id': 'ID_tts_multi_speaker_turn_started',
@@ -308,7 +308,7 @@ class TtsRuntime:
                     temporary_path.unlink(missing_ok=True)
             self._log_latest_wav_failure()
             return
-        LOGGER.info(
+        LOGGER.debug(
             'Saved latest synthesized recording',
             extra={
                 'event_id': 'ID_tts_latest_recording_saved',
@@ -365,7 +365,7 @@ class TtsRuntime:
             capture.abort()
             self._log_latest_wav_failure()
             return
-        LOGGER.info(
+        LOGGER.debug(
             'Saved latest synthesized recording',
             extra={
                 'event_id': 'ID_tts_latest_recording_saved',

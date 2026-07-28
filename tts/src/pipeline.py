@@ -1039,7 +1039,7 @@ class PcmPipeline:
 
         self.smart_waiting = decision
         self.smart_decisions.append(decision)
-        LOGGER.info(
+        LOGGER.debug(
             'TTS smart chunker is holding completed text for another sentence',
             extra={
                 'event_id': 'ID_tts_pipeline_smart_chunk_held',
@@ -1242,7 +1242,7 @@ class PcmPipeline:
         margin_seconds = playback_seconds_remaining - required_seconds
         if margin_seconds <= 0:
             return
-        LOGGER.info(
+        LOGGER.debug(
             'TTS smart chunker could have queued the next sentence',
             extra={
                 'event_id': 'ID_tts_pipeline_smart_chunk_misprediction',
@@ -1343,28 +1343,6 @@ class PcmPipeline:
             lookahead_warning_logged = True
 
         PIPELINE_SEGMENTS.labels(transport=self.transport).inc()
-        LOGGER.info(
-            'TTS pipeline segment requested',
-            extra={
-                'event_id': 'ID_tts_pipeline_segment_requested',
-                'transport': self.transport,
-                'voice': self.voice,
-                'characters': len(text),
-                'boundary': boundary,
-                'pause_before_seconds': pause_seconds,
-                'source_sentences': source_sentence_count,
-                'smart_chunked': source_sentence_count > 1,
-            },
-        )
-        LOGGER.debug(
-            'TTS pipeline segment',
-            extra={
-                'event_id': 'ID_tts_pipeline_segment',
-                'transport': self.transport,
-                'voice': self.voice,
-                'text': text,
-            },
-        )
 
         segment: _SentencePcmBuffer | None = None
         first_voice_checked = False
@@ -1426,36 +1404,6 @@ class PcmPipeline:
                 yield self._capture(output)
         if segment is not None:
             output = segment.end_model()
-            if (
-                segment.leading_silence_frames
-                or segment.clipped_silence_frames
-                or segment.ignored_noise_frames
-            ):
-                LOGGER.info(
-                    'TTS pipeline segment silence normalized',
-                    extra={
-                        'event_id': 'ID_tts_pipeline_segment_silence_normalized',
-                        'transport': self.transport,
-                        'boundary': boundary,
-                        'generated_seconds': segment.generated_frames / self.sample_rate,
-                        'leading_silence_removed_seconds': (
-                            segment.leading_silence_frames / self.sample_rate
-                        ),
-                        'trailing_silence_detected_seconds': (
-                            segment.trailing_silence_frames / self.sample_rate
-                        ),
-                        'trailing_silence_clipped_seconds': (
-                            segment.clipped_silence_frames / self.sample_rate
-                        ),
-                        'internal_silence_preserved_seconds': (
-                            segment.preserved_internal_silence_frames / self.sample_rate
-                        ),
-                        'ignored_noise_seconds': (segment.ignored_noise_frames / self.sample_rate),
-                        'speculative_tail_cut': (segment.tail_was_speculatively_clipped),
-                        'silence_threshold_dbfs': segment.silence_threshold_dbfs,
-                        'speech_threshold_dbfs': segment.speech_threshold_dbfs,
-                    },
-                )
             if segment.first_voice_at is not None and not first_voice_checked:
                 first_voice_checked = True
                 if (
@@ -1488,6 +1436,55 @@ class PcmPipeline:
                 )
             if output:
                 yield self._capture(output)
+        completion_fields: dict[str, object] = {
+            'transport': self.transport,
+            'voice': self.voice,
+            'characters': len(text),
+            'boundary': boundary,
+            'pause_before_seconds': pause_seconds,
+            'source_sentences': source_sentence_count,
+            'smart_chunked': source_sentence_count > 1,
+            'duration_seconds': time.perf_counter() - synthesis_started_at,
+        }
+        if segment is not None:
+            completion_fields.update(
+                {
+                    'generated_seconds': segment.generated_frames / self.sample_rate,
+                    'first_voice_seconds': (
+                        max(0.0, segment.first_voice_at - synthesis_started_at)
+                        if segment.first_voice_at is not None
+                        else None
+                    ),
+                    'leading_silence_removed_seconds': (
+                        segment.leading_silence_frames / self.sample_rate
+                    ),
+                    'trailing_silence_detected_seconds': (
+                        segment.trailing_silence_frames / self.sample_rate
+                    ),
+                    'trailing_silence_clipped_seconds': (
+                        segment.clipped_silence_frames / self.sample_rate
+                    ),
+                    'internal_silence_preserved_seconds': (
+                        segment.preserved_internal_silence_frames / self.sample_rate
+                    ),
+                    'ignored_noise_seconds': segment.ignored_noise_frames / self.sample_rate,
+                    'speculative_tail_cut': segment.tail_was_speculatively_clipped,
+                },
+            )
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                'TTS pipeline segment completed',
+                extra={
+                    'event_id': 'ID_tts_pipeline_segment_completed',
+                    **completion_fields,
+                    'text': text,
+                },
+            )
+        else:
+            LOGGER.info(
+                'TTS pipeline segment completed',
+                extra={'event_id': 'ID_tts_pipeline_segment_completed', **completion_fields},
+            )
         if (
             not lookahead_warning_logged
             and next_audio_deadline is not None

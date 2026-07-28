@@ -319,20 +319,29 @@ def _speech_response(  # noqa: C901
         prepared = runtime.prepare_speech(_speech_command(speech_request))
         text = prepared.text
         voice = prepared.voice
-        LOGGER.info(
-            'Speech synthesis requested',
-            extra={
-                'event_id': 'ID_tts_synthesis_requested',
-                'response_format': speech_request.response_format,
-                'pipeline': pipeline,
-                'characters': len(text),
-                'voice': voice,
-            },
-        )
-        LOGGER.debug(
-            'Speech synthesis input',
-            extra={'event_id': 'ID_tts_synthesis_input', 'text': text},
-        )
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                'Speech synthesis requested',
+                extra={
+                    'event_id': 'ID_tts_synthesis_requested',
+                    'response_format': speech_request.response_format,
+                    'pipeline': pipeline,
+                    'characters': len(text),
+                    'voice': voice,
+                    'text': text,
+                },
+            )
+        else:
+            LOGGER.info(
+                'Speech synthesis requested',
+                extra={
+                    'event_id': 'ID_tts_synthesis_requested',
+                    'response_format': speech_request.response_format,
+                    'pipeline': pipeline,
+                    'characters': len(text),
+                    'voice': voice,
+                },
+            )
         if speech_request.response_format == 'pcm':
             response = _ClosingStreamingResponse(
                 _stream_speech(runtime, text, voice, started, pipeline=pipeline),
@@ -392,34 +401,40 @@ def _multi_speaker_response(  # noqa: C901
     outcome = 'success'
     try:
         turns = runtime.prepare_multi_speaker_turns(_multi_speaker_command(speech_request))
-        LOGGER.info(
-            'Multi-speaker speech synthesis requested',
-            extra={
-                'event_id': 'ID_tts_multi_speaker_requested',
-                'response_format': speech_request.response_format,
-                'characters': sum(len(turn.text) for turn in turns),
-                'speakers': len({turn.speaker for turn in turns}),
-                'turn_count': len(turns),
-                'voices': sorted({turn.voice for turn in turns}),
-                'speaker_switch_pause_seconds': (
-                    runtime.settings.pipeline_speaker_switch_pause_seconds
-                ),
-            },
-        )
-        LOGGER.debug(
-            'Multi-speaker speech synthesis input',
-            extra={
-                'event_id': 'ID_tts_multi_speaker_input',
-                'turns': [
-                    {
-                        'speaker': turn.speaker,
-                        'voice': turn.voice,
-                        'text': turn.text,
-                    }
-                    for turn in turns
-                ],
-            },
-        )
+        request_metadata = {
+            'response_format': speech_request.response_format,
+            'characters': sum(len(turn.text) for turn in turns),
+            'speakers': len({turn.speaker for turn in turns}),
+            'turn_count': len(turns),
+            'voices': sorted({turn.voice for turn in turns}),
+            'speaker_switch_pause_seconds': (
+                runtime.settings.pipeline_speaker_switch_pause_seconds
+            ),
+        }
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                'Multi-speaker speech synthesis requested',
+                extra={
+                    'event_id': 'ID_tts_multi_speaker_requested',
+                    **request_metadata,
+                    'turns': [
+                        {
+                            'speaker': turn.speaker,
+                            'voice': turn.voice,
+                            'text': turn.text,
+                        }
+                        for turn in turns
+                    ],
+                },
+            )
+        else:
+            LOGGER.info(
+                'Multi-speaker speech synthesis requested',
+                extra={
+                    'event_id': 'ID_tts_multi_speaker_requested',
+                    **request_metadata,
+                },
+            )
         if speech_request.response_format == 'pcm':
             response = _ClosingStreamingResponse(
                 _stream_multi_speaker_speech(runtime, turns, started),

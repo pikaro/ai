@@ -71,6 +71,10 @@ class CacheAwareStreamingSession:
         self.emitted_text = ''
         self.previous_transcript = ''
         self.latest_transcript = ''
+        self.last_logged_partial = ''
+        self.first_partial_observed = False
+        self.partial_event_count = 0
+        self.delta_event_count = 0
 
     def append_pcm(self, pcm: bytes) -> list[SttTranscriptEvent]:
         if len(self.raw_pcm) + len(pcm) > self.engine.settings.maximum_stream_bytes:
@@ -187,6 +191,7 @@ class CacheAwareStreamingSession:
         delta = transcript_delta(self.emitted_text, stable_transcript)
         if delta and len(delta) >= self.engine.settings.minimum_delta_characters:
             self.emitted_text = stable_transcript
+            self.delta_event_count += 1
             log_transcription('stable delta', delta)
             return [
                 TranscriptionDelta(
@@ -195,6 +200,14 @@ class CacheAwareStreamingSession:
                 ),
             ]
         if not final:
-            log_transcription('partial', transcript)
+            self.partial_event_count += 1
+            if transcript != self.last_logged_partial:
+                log_transcription(
+                    'partial',
+                    transcript,
+                    announce=not self.first_partial_observed,
+                )
+                self.last_logged_partial = transcript
+                self.first_partial_observed = True
             return [TranscriptionPartial(transcript=transcript)]
         return []

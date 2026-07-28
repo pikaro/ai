@@ -138,39 +138,30 @@ async def _consume_transcription(  # noqa: C901, PLR0912
                     metrics.PIPELINE_SECONDS.labels(stage='stt_first_delta').observe(
                         now - utterance.first_audio_at,
                     )
-            current = (
-                message.transcript
-                if isinstance(message, TranscriptionDelta)
-                else payload.get('transcript')
-            )
+            if isinstance(message, TranscriptionDelta):
+                current = message.transcript
+                delta = message.delta
+            else:
+                current = payload.get('transcript')
+                delta = payload.get('delta')
             if isinstance(current, str) and current.strip():
                 transcript = current.strip()
-            else:
-                delta = (
-                    message.delta
-                    if isinstance(message, TranscriptionDelta)
-                    else payload.get('delta')
-                )
-                if isinstance(delta, str):
-                    transcript = f'{transcript} {delta}'.strip()
+            elif isinstance(delta, str):
+                transcript = f'{transcript} {delta}'.strip()
             if transcript:
-                LOGGER.info(
-                    'STT transcription received',
+                cache_warm_disposition = utterance.schedule_cache_warm(transcript)
+                LOGGER.debug(
+                    'STT transcription delta received',
                     extra={
-                        'event_id': 'ID_assistant_stt_transcription_received',
+                        'event_id': 'ID_assistant_stt_transcription_delta_received',
                         'stage': 'update',
                         'characters': len(transcript),
-                    },
-                )
-                LOGGER.debug(
-                    'STT transcription',
-                    extra={
-                        'event_id': 'ID_assistant_stt_transcription',
-                        'stage': 'update',
+                        'delta_characters': len(delta) if isinstance(delta, str) else 0,
+                        'cache_warm_disposition': cache_warm_disposition,
+                        'delta': delta,
                         'transcript': transcript,
                     },
                 )
-                utterance.schedule_cache_warm(transcript)
         elif isinstance(message, TranscriptionCompleted) or message_type.endswith(
             'transcription.completed',
         ):
@@ -182,22 +173,25 @@ async def _consume_transcription(  # noqa: C901, PLR0912
             if isinstance(completed, str) and completed.strip():
                 transcript = completed.strip()
             if transcript:
-                LOGGER.info(
-                    'STT transcription received',
-                    extra={
-                        'event_id': 'ID_assistant_stt_transcription_received',
-                        'stage': 'completed',
-                        'characters': len(transcript),
-                    },
-                )
-                LOGGER.debug(
-                    'STT transcription',
-                    extra={
-                        'event_id': 'ID_assistant_stt_transcription',
-                        'stage': 'completed',
-                        'transcript': transcript,
-                    },
-                )
+                if LOGGER.isEnabledFor(logging.DEBUG):
+                    LOGGER.debug(
+                        'STT transcription',
+                        extra={
+                            'event_id': 'ID_assistant_stt_transcription',
+                            'stage': 'completed',
+                            'characters': len(transcript),
+                            'transcript': transcript,
+                        },
+                    )
+                else:
+                    LOGGER.info(
+                        'STT transcription received',
+                        extra={
+                            'event_id': 'ID_assistant_stt_transcription_received',
+                            'stage': 'completed',
+                            'characters': len(transcript),
+                        },
+                    )
             break
     if not transcript:
         raise SttEmptyTranscriptError

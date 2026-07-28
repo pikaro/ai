@@ -28,6 +28,7 @@ from assistant.src.pipeline import (
     build_prompt,
     build_prompt_prefix,
     parse_tool_response,
+    warm_llm_cache,
 )
 from assistant.src.realtime import log_request_correlation, realtime
 from assistant.src.runtime import AssistantRuntime
@@ -805,13 +806,28 @@ class LlmLoggingTest(unittest.IsolatedAsyncioTestCase):
                 )
 
         request_record = next(
-            record for record in captured.records if record.getMessage() == 'LLM request'
+            record for record in captured.records if record.getMessage() == 'LLM request started'
         )
         logged_payload = request_record.__dict__['payload']
         self.assertEqual(logged_payload, submitted_payloads[0])
         self.assertEqual(logged_payload['prompt'], prompt)
         self.assertIn('"name":"clock__time"', logged_payload['prompt'])
         self.assertIn('Return the time from the clock MCP server.', logged_payload['prompt'])
+
+    async def test_cache_warm_http_layer_does_not_duplicate_pipeline_telemetry(self) -> None:
+        def respond(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={'content': ''})
+
+        settings = Settings(llm_base_url='http://llm.test')
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            llm = LlmClient(client, settings)
+            with self.assertNoLogs('assistant.upstream', level='DEBUG'):
+                _ = await llm.complete(
+                    'cached prompt',
+                    0,
+                    operation='cache_warm',
+                    maximum_tokens=0,
+                )
 
     async def test_llama_cache_ratio_uses_cached_plus_evaluated_prompt_tokens(self) -> None:
         def respond(_request: httpx.Request) -> httpx.Response:
@@ -1149,14 +1165,39 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
         self.system_prompt_directory.cleanup()
 
     async def test_final_during_interval_drops_the_pending_warm(self) -> None:
-        self.utterance.schedule_cache_warm('what is the')
+        _ = self.utterance.schedule_cache_warm('what is the')
         await asyncio.sleep(0)
-        self.utterance.schedule_cache_warm('what is the time')
+        _ = self.utterance.schedule_cache_warm('what is the time')
         await asyncio.sleep(0)
         _ = await self.utterance.finalize_cache_warming('what is the time')
 
         self.assertEqual(len(self.llm.warms), 1)
         self.assertEqual(self.llm.warms[0][1], 7)
+
+    async def test_cache_warm_scheduler_reports_each_update_disposition(self) -> None:
+        self.assertEqual(self.utterance.schedule_cache_warm('first stable words'), 'scheduled')
+        self.assertEqual(
+            self.utterance.schedule_cache_warm('first stable words plus more'),
+            'coalesced',
+        )
+        self.assertEqual(
+            self.utterance.schedule_cache_warm('first stable words plus more'),
+            'too_small',
+        )
+
+    async def test_cache_warm_emits_one_debug_timing_event(self) -> None:
+        prompt = 'static prefix plus stable transcript'
+
+        with self.assertLogs('assistant.pipeline', level='DEBUG') as captured:
+            await warm_llm_cache(self.llm, prompt, 7, reason='delta')
+
+        self.assertEqual(len(captured.records), 1)
+        record = captured.records[0]
+        self.assertEqual(record.getMessage(), 'LLM cache warm completed')
+        self.assertEqual(record.__dict__['reason'], 'delta')
+        self.assertEqual(record.__dict__['slot'], 7)
+        self.assertEqual(record.__dict__['prompt_characters'], len(prompt))
+        self.assertEqual(record.__dict__['outcome'], 'success')
 
     async def test_warm_uses_reloaded_system_prompt_and_complete_tool_catalog(self) -> None:
         _ = self.settings.system_prompt_path.write_text(
@@ -1164,7 +1205,7 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
             encoding='utf-8',
         )
 
-        self.utterance.schedule_cache_warm('unrelated command')
+        _ = self.utterance.schedule_cache_warm('unrelated command')
         await asyncio.sleep(0)
         _ = await self.utterance.finalize_cache_warming('unrelated command')
 
@@ -1198,10 +1239,10 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
             self.system_prompt,
         )
         try:
-            utterance.schedule_cache_warm('first stable words')
+            _ = utterance.schedule_cache_warm('first stable words')
             _ = await llm.started.wait()
-            utterance.schedule_cache_warm('first stable words plus more')
-            utterance.schedule_cache_warm('first stable words plus newest')
+            _ = utterance.schedule_cache_warm('first stable words plus more')
+            _ = utterance.schedule_cache_warm('first stable words plus newest')
             finalizing = asyncio.create_task(
                 utterance.finalize_cache_warming('final corrected transcript'),
             )
@@ -1227,7 +1268,9 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
 
         event_types = [str(event['type']) for event in events]
         response_record = next(
-            record for record in captured.records if record.getMessage() == 'Assistant response'
+            record
+            for record in captured.records
+            if record.getMessage() == 'Assistant response generated'
         )
         self.assertEqual(response_record.__dict__['response'], 'It is three.')
         self.assertIn('response.text.delta', event_types)

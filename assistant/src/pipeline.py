@@ -177,14 +177,23 @@ class SystemPromptFile:
 
 
 def _log_generated_response(response_text: str) -> None:
-    LOGGER.info(
-        'Assistant response generated',
-        extra={'event_id': 'ID_assistant_response_generated', 'characters': len(response_text)},
-    )
-    LOGGER.debug(
-        'Assistant response',
-        extra={'event_id': 'ID_assistant_response', 'response': response_text},
-    )
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        LOGGER.debug(
+            'Assistant response generated',
+            extra={
+                'event_id': 'ID_assistant_response_generated',
+                'characters': len(response_text),
+                'response': response_text,
+            },
+        )
+    else:
+        LOGGER.info(
+            'Assistant response generated',
+            extra={
+                'event_id': 'ID_assistant_response_generated',
+                'characters': len(response_text),
+            },
+        )
 
 
 class LlmProtocol(Protocol):
@@ -238,7 +247,7 @@ async def warm_llm_cache(
         duration_seconds = time.perf_counter() - started
         metrics.CACHE_WARMS.labels(reason=reason, outcome=outcome).inc()
         metrics.CACHE_WARM_SECONDS.labels(reason=reason).observe(duration_seconds)
-        LOGGER.info(
+        LOGGER.debug(
             'LLM cache warm completed',
             extra={
                 'event_id': 'ID_assistant_llm_cache_warm_completed',
@@ -369,22 +378,25 @@ class AssistantUtterance:
                 self.final_transcript_at - self.first_audio_at,
             )
 
-    def schedule_cache_warm(self, transcript: str) -> None:
+    def schedule_cache_warm(self, transcript: str) -> str:
         """Schedule a stable transcript without queueing every intermediate revision."""
         if not self.settings.llm_cache_warm_enabled:
-            metrics.CACHE_WARM_UPDATES.labels(disposition='disabled').inc()
-            return
+            disposition = 'disabled'
+            metrics.CACHE_WARM_UPDATES.labels(disposition=disposition).inc()
+            return disposition
         if self._cache_finalizing:
-            metrics.CACHE_WARM_UPDATES.labels(disposition='finalizing').inc()
-            return
+            disposition = 'finalizing'
+            metrics.CACHE_WARM_UPDATES.labels(disposition=disposition).inc()
+            return disposition
         if (
             self._last_scheduled_transcript
             and transcript.startswith(self._last_scheduled_transcript)
             and len(transcript) - len(self._last_scheduled_transcript)
             < self.settings.llm_cache_warm_min_new_characters
         ):
-            metrics.CACHE_WARM_UPDATES.labels(disposition='too_small').inc()
-            return
+            disposition = 'too_small'
+            metrics.CACHE_WARM_UPDATES.labels(disposition=disposition).inc()
+            return disposition
 
         disposition = 'coalesced' if self._pending_warm_transcript is not None else 'scheduled'
         self._pending_warm_transcript = transcript
@@ -392,20 +404,25 @@ class AssistantUtterance:
         metrics.CACHE_WARM_UPDATES.labels(disposition=disposition).inc()
         if self._warm_worker is None:
             self._warm_worker = asyncio.create_task(self._run_cache_warms())
+        return disposition
 
     async def finalize_cache_warming(self, _transcript: str) -> list[ToolDefinition]:
         """Discard pending revisions, drain one active warm, and load available tools."""
         started = time.perf_counter()
-        waited_for_active_warm = self._warm_worker_state == 'active'
+        worker_state = self._warm_worker_state
+        pending_update = self._pending_warm_transcript is not None
         await self._stop_cache_warming()
         duration_seconds = time.perf_counter() - started
         metrics.CACHE_WARM_FINAL_WAIT_SECONDS.observe(duration_seconds)
-        LOGGER.info(
+        LOGGER.debug(
             'Final transcript cache barrier completed',
             extra={
                 'event_id': 'ID_assistant_llm_cache_final_barrier_completed',
                 'duration_seconds': duration_seconds,
-                'waited_for_active_warm': waited_for_active_warm,
+                'waited_for_active_warm': worker_state == 'active',
+                'cancelled_interval_wait': worker_state == 'waiting',
+                'dropped_pending_update': pending_update,
+                'cache_warm_count': self.cache_warm_count,
             },
         )
         available_tools = await self.tools.available()
@@ -526,14 +543,6 @@ class AssistantUtterance:
         tools_by_name = {tool.name: tool for tool in available_tools}
         history: list[tuple[str, str]] = []
         observe_first_token = True
-        LOGGER.info(
-            'Tool resolution started',
-            extra={
-                'event_id': 'ID_assistant_tool_resolution_started',
-                'slot': slot,
-                'tools': sorted(tools_by_name),
-            },
-        )
         for iteration in range(1, self.settings.maximum_tool_iterations + 1):
             prompt = build_prompt(
                 transcript,

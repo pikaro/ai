@@ -85,9 +85,24 @@ bounded token-like values in `request_id` and `request_timestamp`; other values
 are omitted from the record. The headers are for log correlation only and are
 not forwarded to upstream services.
 
-Successful `200` responses from `/health`, `/health/live`, and `/health/ready`
-are omitted from Uvicorn access logs and the assistant's HTTPX upstream request
-logs; failed health checks and all other requests remain visible.
+Successful `200` responses from `/health`, `/health/live`, `/health/ready`, and
+`/metrics` are omitted from Uvicorn access logs. Successful HTTPX access
+records are also omitted because the surrounding application event records the
+operation and duration; non-success responses remain visible. Uvicorn's
+successful WebSocket accept/open/close records and PocketTTS's per-segment
+internal timers are suppressed in favor of the corresponding service session
+and segment events.
+
+Routine incremental work stays out of INFO logs. STT records the first partial
+for latency correlation and then summarizes the completed session; at DEBUG it
+records changed partials, stable deltas, and the final recognized text.
+At DEBUG the assistant combines each stable STT update with its cache-warm
+scheduler disposition, records one timing event for every warm request that
+actually runs, and records the final cache-barrier wait. Cache-warm failures
+remain visible above DEBUG. TTS emits one completion event per synthesized
+pipeline segment with generation and silence-processing timings. This keeps
+one request readable as a chronological service narrative at INFO while
+retaining transcript revisions and incremental-warming diagnostics at DEBUG.
 
 ## Code structure
 
@@ -166,6 +181,13 @@ partial is dropped, the one active warm is allowed to finish, and the generation
 request appends and evaluates the final chat suffix. No speculative LLM requests
 run concurrently and no partially cancelled cache state is assumed to be
 reusable.
+
+Startup issues one warm request per configured llama.cpp slot. During an
+utterance, each actual incremental warm is also an HTTP request even though it
+normally requests zero generated tokens; an empty response is therefore
+expected and does not mean the prompt was empty. If the server rejects a
+zero-token request, the client retries that warm once with the configured
+one-token fallback.
 
 The prompt uses the non-thinking Qwen3 Instruct chat format. It starts with the
 user-editable system prompt followed by the complete, deterministically sorted

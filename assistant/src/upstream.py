@@ -172,40 +172,21 @@ class LlmClient:
         error_type: str | None = None
         url = f'{self.settings.llm_base_url.rstrip("/")}/completion'
         payload = self._payload(prompt, slot, maximum_tokens=maximum_tokens, stream=False)
-        LOGGER.info(
-            'LLM request started',
-            extra={
-                'event_id': 'ID_assistant_llm_request_started',
-                'operation': operation,
-                'slot': slot,
-                'stream': False,
-                'prompt_characters': len(prompt),
-                'maximum_tokens': maximum_tokens,
-            },
-        )
-        LOGGER.debug(
-            'LLM request',
-            extra={
-                'event_id': 'ID_assistant_llm_request',
-                'operation': operation,
-                'url': url,
-                'payload': payload,
-            },
+        body: dict[str, Any] = {}
+        self._log_request_started(
+            operation=operation,
+            slot=slot,
+            stream=False,
+            prompt_characters=len(prompt),
+            maximum_tokens=maximum_tokens,
+            url=url,
+            payload=payload,
         )
         try:
             response = await self.client.post(url, json=payload)
             _ = response.raise_for_status()
             body = response.json()
             self._observe_timings(body)
-            LOGGER.debug(
-                'LLM response',
-                extra={
-                    'event_id': 'ID_assistant_llm_response',
-                    'operation': operation,
-                    'slot': slot,
-                    'response': body,
-                },
-            )
             content = body.get('content', '')
             return content if isinstance(content, str) else ''
         except Exception as error:
@@ -216,17 +197,14 @@ class LlmClient:
             duration_seconds = time.perf_counter() - started
             metrics.LLM_REQUESTS.labels(operation=operation, outcome=outcome).inc()
             metrics.LLM_REQUEST_SECONDS.labels(operation=operation).observe(duration_seconds)
-            LOGGER.info(
-                'LLM request completed',
-                extra={
-                    'event_id': 'ID_assistant_llm_request_completed',
-                    'operation': operation,
-                    'slot': slot,
-                    'stream': False,
-                    'outcome': outcome,
-                    'duration_seconds': duration_seconds,
-                    'error_type': error_type,
-                },
+            self._log_request_completed(
+                operation=operation,
+                slot=slot,
+                stream=False,
+                outcome=outcome,
+                duration_seconds=duration_seconds,
+                error_type=error_type,
+                response=body,
             )
 
     async def stream(  # noqa: C901
@@ -250,25 +228,14 @@ class LlmClient:
             maximum_tokens=token_limit,
             stream=True,
         )
-        LOGGER.info(
-            'LLM request started',
-            extra={
-                'event_id': 'ID_assistant_llm_request_started',
-                'operation': operation,
-                'slot': slot,
-                'stream': True,
-                'prompt_characters': len(prompt),
-                'maximum_tokens': token_limit,
-            },
-        )
-        LOGGER.debug(
-            'LLM request',
-            extra={
-                'event_id': 'ID_assistant_llm_request',
-                'operation': operation,
-                'url': url,
-                'payload': payload,
-            },
+        self._log_request_started(
+            operation=operation,
+            slot=slot,
+            stream=True,
+            prompt_characters=len(prompt),
+            maximum_tokens=token_limit,
+            url=url,
+            payload=payload,
         )
         try:
             async with self.client.stream(
@@ -303,29 +270,93 @@ class LlmClient:
         finally:
             duration_seconds = time.perf_counter() - started
             self._observe_timings(final_data)
-            LOGGER.debug(
-                'LLM response',
-                extra={
-                    'event_id': 'ID_assistant_llm_response',
-                    'operation': operation,
-                    'slot': slot,
-                    'response': final_data,
-                },
-            )
             metrics.LLM_REQUESTS.labels(operation=operation, outcome=outcome).inc()
             metrics.LLM_REQUEST_SECONDS.labels(operation=operation).observe(duration_seconds)
-            LOGGER.info(
+            self._log_request_completed(
+                operation=operation,
+                slot=slot,
+                stream=True,
+                outcome=outcome,
+                duration_seconds=duration_seconds,
+                error_type=error_type,
+                response=final_data,
+            )
+
+    @staticmethod
+    def _is_cache_warm(operation: str) -> bool:
+        return operation in {'cache_warm', 'cache_warm_fallback'}
+
+    def _log_request_started(  # noqa: PLR0913
+        self,
+        *,
+        operation: str,
+        slot: int,
+        stream: bool,
+        prompt_characters: int,
+        maximum_tokens: int,
+        url: str,
+        payload: dict[str, object],
+    ) -> None:
+        if self._is_cache_warm(operation):
+            return
+        fields: dict[str, object] = {
+            'operation': operation,
+            'slot': slot,
+            'stream': stream,
+            'prompt_characters': prompt_characters,
+            'maximum_tokens': maximum_tokens,
+        }
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                'LLM request started',
+                extra={
+                    'event_id': 'ID_assistant_llm_request_started',
+                    **fields,
+                    'url': url,
+                    'payload': payload,
+                },
+            )
+            return
+        LOGGER.info(
+            'LLM request started',
+            extra={'event_id': 'ID_assistant_llm_request_started', **fields},
+        )
+
+    def _log_request_completed(  # noqa: PLR0913
+        self,
+        *,
+        operation: str,
+        slot: int,
+        stream: bool,
+        outcome: str,
+        duration_seconds: float,
+        error_type: str | None,
+        response: dict[str, Any],
+    ) -> None:
+        if self._is_cache_warm(operation):
+            return
+        fields: dict[str, object] = {
+            'operation': operation,
+            'slot': slot,
+            'stream': stream,
+            'outcome': outcome,
+            'duration_seconds': duration_seconds,
+            'error_type': error_type,
+        }
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
                 'LLM request completed',
                 extra={
                     'event_id': 'ID_assistant_llm_request_completed',
-                    'operation': operation,
-                    'slot': slot,
-                    'stream': True,
-                    'outcome': outcome,
-                    'duration_seconds': duration_seconds,
-                    'error_type': error_type,
+                    **fields,
+                    'response': response,
                 },
             )
+            return
+        LOGGER.info(
+            'LLM request completed',
+            extra={'event_id': 'ID_assistant_llm_request_completed', **fields},
+        )
 
     def _payload(
         self,

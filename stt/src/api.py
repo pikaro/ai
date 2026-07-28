@@ -214,7 +214,7 @@ async def transcribe(
         )
         try:
             text = await asyncio.to_thread(runtime.transcribe_file, path)
-            log_transcription('file', text)
+            log_transcription('file', text, announce=True)
         finally:
             await asyncio.to_thread(path.unlink, missing_ok=True)
         return TranscriptionResponse(text=text)
@@ -340,9 +340,25 @@ async def realtime(websocket: WebSocket) -> None:  # noqa: C901, PLR0912, PLR091
                     )
                 await websocket.send_json(transcript_event.model_dump())
             await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
+            duration_seconds = time.perf_counter() - started
+            audio_seconds = (
+                input_pcm_bytes / (sample_rate * channels * 2)
+                if sample_rate > 0 and channels > 0
+                else 0.0
+            )
+            completed_transcript = stream.latest_transcript or stream.emitted_text
             LOGGER.info(
                 'realtime transcription session completed',
-                extra={'event_id': 'ID_stt_realtime_session_completed'},
+                extra={
+                    'event_id': 'ID_stt_realtime_session_completed',
+                    'duration_seconds': duration_seconds,
+                    'audio_seconds': audio_seconds,
+                    'audio_bytes': input_pcm_bytes,
+                    'characters': len(completed_transcript),
+                    'partial_events': stream.partial_event_count,
+                    'delta_events': stream.delta_event_count,
+                    'inference_steps': stream.step_number,
+                },
             )
             return
     except WebSocketDisconnect as error:

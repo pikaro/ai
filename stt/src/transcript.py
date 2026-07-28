@@ -5,19 +5,27 @@ import logging
 LOGGER = logging.getLogger('stt')
 
 
-def log_transcription(stage: str, text: str) -> None:
-    LOGGER.info(
-        'Transcription produced',
-        extra={
-            'event_id': 'ID_stt_transcription_produced',
-            'stage': stage,
-            'characters': len(text),
-        },
-    )
-    LOGGER.debug(
-        'Transcription',
-        extra={'event_id': 'ID_stt_transcription', 'stage': stage, 'transcript': text},
-    )
+def log_transcription(stage: str, text: str, *, announce: bool = False) -> None:
+    """Log transcript content once at DEBUG or selected progress at INFO."""
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        LOGGER.debug(
+            'Transcription produced',
+            extra={
+                'event_id': 'ID_stt_transcription',
+                'stage': stage,
+                'characters': len(text),
+                'transcript': text,
+            },
+        )
+    elif announce:
+        LOGGER.info(
+            'Transcription produced',
+            extra={
+                'event_id': 'ID_stt_transcription_produced',
+                'stage': stage,
+                'characters': len(text),
+            },
+        )
 
 
 def extract_text(result: object) -> str:

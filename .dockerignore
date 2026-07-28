@@ -3,6 +3,8 @@
 !uv.lock
 !runtime_config.py
 !service_logging.py
+!service_contracts/
+!service_contracts/**
 !assistant/
 !assistant/Dockerfile
 !assistant/__init__.py
@@ -11,11 +13,13 @@
 !assistant/src/**
 !stt/
 !stt/Dockerfile
+!stt/__init__.py
 !stt/pyproject.toml
 !stt/src/
 !stt/src/**
 !tts/
 !tts/Dockerfile
+!tts/__init__.py
 !tts/pyproject.toml
 !tts/src/
 !tts/src/**

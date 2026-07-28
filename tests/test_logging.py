@@ -9,7 +9,12 @@ import unittest
 from pathlib import Path
 from typing import TypeGuard
 
-from service_logging import JsonFormatter, SuccessfulHealthCheckFilter
+from service_logging import (
+    JsonFormatter,
+    SuccessfulHealthCheckFilter,
+    SuccessfulHttpClientRequestFilter,
+    UvicornWebSocketNoiseFilter,
+)
 
 
 class JsonFormatterTest(unittest.TestCase):
@@ -339,6 +344,11 @@ class SuccessfulHealthCheckFilterTest(unittest.TestCase):
                 self._httpx_record('GET', 'http://nemo-asr.nemo-asr/health/ready', 200),
             ),
         )
+        self.assertFalse(
+            health_filter.filter(
+                self._httpx_record('GET', 'http://nemo-asr.nemo-asr/metrics', 200),
+            ),
+        )
 
     def test_failed_health_and_successful_application_requests_are_retained(self) -> None:
         health_filter = SuccessfulHealthCheckFilter()
@@ -353,3 +363,47 @@ class SuccessfulHealthCheckFilterTest(unittest.TestCase):
                 self._httpx_record('POST', 'http://llama-server.llama-server/completion', 200),
             ),
         )
+
+
+class SuccessfulHttpClientRequestFilterTest(unittest.TestCase):
+    @staticmethod
+    def _record(status_code: int) -> logging.LogRecord:
+        return logging.LogRecord(
+            'httpx',
+            logging.INFO,
+            __file__,
+            1,
+            'HTTP Request: %s %s "%s %d %s"',
+            ('POST', 'http://llama-server/completion', 'HTTP/1.1', status_code, 'status'),
+            None,
+        )
+
+    def test_success_is_suppressed_and_failure_is_retained(self) -> None:
+        request_filter = SuccessfulHttpClientRequestFilter()
+
+        self.assertFalse(request_filter.filter(self._record(200)))
+        self.assertTrue(request_filter.filter(self._record(503)))
+
+
+class UvicornWebSocketNoiseFilterTest(unittest.TestCase):
+    @staticmethod
+    def _record(message: str) -> logging.LogRecord:
+        return logging.LogRecord(
+            'uvicorn.error',
+            logging.INFO,
+            __file__,
+            1,
+            message,
+            (),
+            None,
+        )
+
+    def test_successful_protocol_lifecycle_is_suppressed(self) -> None:
+        protocol_filter = UvicornWebSocketNoiseFilter()
+
+        self.assertFalse(
+            protocol_filter.filter(self._record('%s - "WebSocket %s" [accepted]')),
+        )
+        self.assertFalse(protocol_filter.filter(self._record('connection open')))
+        self.assertFalse(protocol_filter.filter(self._record('connection closed')))
+        self.assertTrue(protocol_filter.filter(self._record('Application startup complete.')))

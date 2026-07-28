@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import shlex
 import unittest
 from pathlib import Path
 
@@ -113,3 +114,42 @@ class ServiceDependencyArchitectureTest(unittest.TestCase):
                 )
 
         self.assertEqual(problems, [], f'entrypoint dependencies: {problems}')
+
+
+class DockerBuildContextTest(unittest.TestCase):
+    def test_local_copy_sources_exist_and_are_allowlisted(self) -> None:  # noqa: C901
+        allowlist = {
+            line
+            for line in (REPOSITORY / '.dockerignore').read_text().splitlines()
+            if line.startswith('!')
+        }
+        problems: list[str] = []
+
+        for service in SERVICE_SOURCE_ROOTS:
+            dockerfile = REPOSITORY / service / 'Dockerfile'
+            for line_number, line in enumerate(dockerfile.read_text().splitlines(), start=1):
+                stripped = line.strip()
+                if not stripped.startswith('COPY ') or '--from=' in stripped:
+                    continue
+                tokens = [
+                    token for token in shlex.split(stripped)[1:] if not token.startswith('--')
+                ]
+                for source in tokens[:-1]:
+                    normalized = source.removeprefix('./').rstrip('/')
+                    source_path = REPOSITORY / normalized
+                    location = f'{dockerfile.relative_to(REPOSITORY)}:{line_number}'
+                    if not source_path.exists():
+                        problems.append(f'{location} copies missing {source}')
+                        continue
+                    required_patterns = (
+                        {f'!{normalized}/', f'!{normalized}/**'}
+                        if source_path.is_dir()
+                        else {f'!{normalized}'}
+                    )
+                    missing = required_patterns - allowlist
+                    if missing:
+                        problems.append(
+                            f'{location} copies ignored {source}; missing {sorted(missing)}',
+                        )
+
+        self.assertEqual(problems, [], f'invalid Docker COPY sources: {problems}')

@@ -121,24 +121,28 @@ class ToolRegistry:
             metrics.TOOLS_SELECTED.labels(source=tool.source).inc()
         catalog = tuple(sorted(tool.name for tool in available))
         if catalog != self._reported_catalog:
-            LOGGER.info(
-                'Tool catalog available',
-                extra={
-                    'event_id': 'ID_assistant_tool_catalog_available',
-                    'tool_count': len(available),
-                    'tools': list(catalog),
-                    'sources': sorted({tool.source for tool in available}),
-                },
-            )
             if LOGGER.isEnabledFor(logging.DEBUG):
                 LOGGER.debug(
-                    'Tool catalog',
+                    'Tool catalog available',
                     extra={
-                        'event_id': 'ID_assistant_tool_catalog',
-                        'tools': [
+                        'event_id': 'ID_assistant_tool_catalog_available',
+                        'tool_count': len(available),
+                        'tools': list(catalog),
+                        'sources': sorted({tool.source for tool in available}),
+                        'definitions': [
                             {'source': tool.source, **tool.prompt_description()}
                             for tool in sorted(available, key=lambda item: item.name)
                         ],
+                    },
+                )
+            else:
+                LOGGER.info(
+                    'Tool catalog available',
+                    extra={
+                        'event_id': 'ID_assistant_tool_catalog_available',
+                        'tool_count': len(available),
+                        'tools': list(catalog),
+                        'sources': sorted({tool.source for tool in available}),
                     },
                 )
             self._reported_catalog = catalog
@@ -173,23 +177,8 @@ class ToolRegistry:
     async def call(self, tool: ToolDefinition, arguments: dict[str, Any]) -> str:
         started = time.perf_counter()
         outcome = 'success'
-        LOGGER.info(
-            'Tool call started',
-            extra={
-                'event_id': 'ID_assistant_tool_call_started',
-                'tool': tool.name,
-                'source': tool.source,
-            },
-        )
-        LOGGER.debug(
-            'Tool call request',
-            extra={
-                'event_id': 'ID_assistant_tool_call_request',
-                'tool': tool.name,
-                'source': tool.source,
-                'arguments': arguments,
-            },
-        )
+        text: str | None = None
+        self._log_tool_call_started(tool, arguments)
         try:
             result = tool.executor(arguments, self.context)
             if inspect.isawaitable(result):
@@ -199,15 +188,6 @@ class ToolRegistry:
             outcome = 'error'
             raise
         else:
-            LOGGER.debug(
-                'Tool call response',
-                extra={
-                    'event_id': 'ID_assistant_tool_call_response',
-                    'tool': tool.name,
-                    'source': tool.source,
-                    'result': text,
-                },
-            )
             return text
         finally:
             duration_seconds = time.perf_counter() - started
@@ -219,6 +199,53 @@ class ToolRegistry:
             metrics.TOOL_CALL_SECONDS.labels(source=tool.source, tool=tool.name).observe(
                 duration_seconds,
             )
+            self._log_tool_call_completed(tool, outcome, duration_seconds, text)
+
+    @staticmethod
+    def _log_tool_call_started(
+        tool: ToolDefinition,
+        arguments: dict[str, Any],
+    ) -> None:
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                'Tool call started',
+                extra={
+                    'event_id': 'ID_assistant_tool_call_started',
+                    'tool': tool.name,
+                    'source': tool.source,
+                    'arguments': arguments,
+                },
+            )
+        else:
+            LOGGER.info(
+                'Tool call started',
+                extra={
+                    'event_id': 'ID_assistant_tool_call_started',
+                    'tool': tool.name,
+                    'source': tool.source,
+                },
+            )
+
+    @staticmethod
+    def _log_tool_call_completed(
+        tool: ToolDefinition,
+        outcome: str,
+        duration_seconds: float,
+        result: str | None,
+    ) -> None:
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                'Tool call completed',
+                extra={
+                    'event_id': 'ID_assistant_tool_call_completed',
+                    'tool': tool.name,
+                    'source': tool.source,
+                    'outcome': outcome,
+                    'duration_seconds': duration_seconds,
+                    'result': result,
+                },
+            )
+        else:
             LOGGER.info(
                 'Tool call completed',
                 extra={
@@ -244,6 +271,7 @@ class ToolRegistry:
         started = time.perf_counter()
         outcome = 'success'
         tool_count = 0
+        definitions: list[ToolDefinition] = []
         LOGGER.info(
             'MCP request started',
             extra={
@@ -265,7 +293,6 @@ class ToolRegistry:
                     cursor = response.nextCursor
                     if cursor is None:
                         break
-            definitions = []
             for remote_tool in remote_tools:
                 public_name = self._mcp_tool_name(server_name, remote_tool.name)
                 triggers = config.tool_triggers.get(remote_tool.name, frozenset())
@@ -289,19 +316,6 @@ class ToolRegistry:
                     ),
                 )
             tool_count = len(definitions)
-            if LOGGER.isEnabledFor(logging.DEBUG):
-                LOGGER.debug(
-                    'MCP tool discovery response',
-                    extra={
-                        'event_id': 'ID_assistant_mcp_tool_discovery_response',
-                        'server': server_name,
-                        'endpoint': config.endpoint,
-                        'tools': [
-                            {'source': tool.source, **tool.prompt_description()}
-                            for tool in definitions
-                        ],
-                    },
-                )
             return definitions  # noqa: TRY300
         except Exception:
             outcome = 'error'
@@ -317,17 +331,34 @@ class ToolRegistry:
                 server=server_name,
                 operation='list_tools',
             ).observe(duration_seconds)
-            LOGGER.info(
-                'MCP request completed',
-                extra={
-                    'event_id': 'ID_assistant_mcp_request_completed',
-                    'server': server_name,
-                    'operation': 'list_tools',
-                    'outcome': outcome,
-                    'duration_seconds': duration_seconds,
-                    'tool_count': tool_count,
-                },
-            )
+            if LOGGER.isEnabledFor(logging.DEBUG):
+                LOGGER.debug(
+                    'MCP request completed',
+                    extra={
+                        'event_id': 'ID_assistant_mcp_request_completed',
+                        'server': server_name,
+                        'operation': 'list_tools',
+                        'outcome': outcome,
+                        'duration_seconds': duration_seconds,
+                        'tool_count': tool_count,
+                        'definitions': [
+                            {'source': tool.source, **tool.prompt_description()}
+                            for tool in definitions
+                        ],
+                    },
+                )
+            else:
+                LOGGER.info(
+                    'MCP request completed',
+                    extra={
+                        'event_id': 'ID_assistant_mcp_request_completed',
+                        'server': server_name,
+                        'operation': 'list_tools',
+                        'outcome': outcome,
+                        'duration_seconds': duration_seconds,
+                        'tool_count': tool_count,
+                    },
+                )
 
     async def _call_mcp(
         self,
@@ -338,25 +369,6 @@ class ToolRegistry:
     ) -> object:
         started = time.perf_counter()
         outcome = 'success'
-        LOGGER.info(
-            'MCP request started',
-            extra={
-                'event_id': 'ID_assistant_mcp_request_started',
-                'server': server_name,
-                'operation': 'call_tool',
-                'tool': tool_name,
-            },
-        )
-        LOGGER.debug(
-            'MCP tool request',
-            extra={
-                'event_id': 'ID_assistant_mcp_tool_request',
-                'server': server_name,
-                'endpoint': config.endpoint,
-                'tool': tool_name,
-                'arguments': arguments,
-            },
-        )
         try:
             async with self._mcp_session(config) as session:
                 result = await session.call_tool(tool_name, arguments)
@@ -372,15 +384,6 @@ class ToolRegistry:
             outcome = 'error'
             raise
         else:
-            LOGGER.debug(
-                'MCP tool response',
-                extra={
-                    'event_id': 'ID_assistant_mcp_tool_response',
-                    'server': server_name,
-                    'tool': tool_name,
-                    'result': response,
-                },
-            )
             return response
         finally:
             duration_seconds = time.perf_counter() - started
@@ -393,17 +396,6 @@ class ToolRegistry:
                 server=server_name,
                 operation='call_tool',
             ).observe(duration_seconds)
-            LOGGER.info(
-                'MCP request completed',
-                extra={
-                    'event_id': 'ID_assistant_mcp_request_completed',
-                    'server': server_name,
-                    'operation': 'call_tool',
-                    'tool': tool_name,
-                    'outcome': outcome,
-                    'duration_seconds': duration_seconds,
-                },
-            )
 
     @staticmethod
     def _raise_mcp_error(tool_name: str) -> None:

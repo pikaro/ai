@@ -16,7 +16,7 @@ from stt.src.api import app, metrics
 from stt.src.config import Settings
 from stt.src.runtime import AsrRuntime
 from stt.src.schemas import RealtimeEvent
-from stt.src.transcript import stable_word_prefix, transcript_delta
+from stt.src.transcript import log_transcription, stable_word_prefix, transcript_delta
 
 
 class SettingsTest(unittest.TestCase):
@@ -53,6 +53,18 @@ class TranscriptTest(unittest.TestCase):
     def test_append_only_delta_is_returned(self) -> None:
         self.assertEqual(transcript_delta('hello', 'hello world'), 'world')
         self.assertEqual(transcript_delta('hello', 'yellow'), '')
+
+    def test_debug_transcript_is_one_content_bearing_record(self) -> None:
+        with self.assertLogs('stt', level='DEBUG') as captured:
+            log_transcription('partial', 'exact recognized text', announce=True)
+
+        self.assertEqual(len(captured.records), 1)
+        self.assertEqual(captured.records[0].levelno, logging.DEBUG)
+        self.assertEqual(captured.records[0].__dict__['transcript'], 'exact recognized text')
+
+    def test_routine_partial_is_silent_at_info(self) -> None:
+        with self.assertNoLogs('stt', level='INFO'):
+            log_transcription('partial', 'intermediate text')
 
 
 class RealtimeEventTest(unittest.TestCase):
