@@ -151,9 +151,10 @@ The assistant runtime combines the STT, llama.cpp, and TTS services through:
 One WebSocket carries one utterance. It accepts the same `session.update`,
 `input_audio_buffer.append`, and `input_audio_buffer.commit` events as STT. It
 also accepts an optional `session.voice` in `session.update`; the value is
-forwarded to TTS for the complete response. Omitting it uses the TTS service
-default, while `"voice": "default"` explicitly selects that default. The
-assistant forwards STT transcription events and then emits:
+substituted for the configured default character's voice for that response.
+Omitting it uses that character's configured voice, while `"voice": "default"`
+explicitly selects the TTS service default. The assistant forwards STT
+transcription events and then emits:
 
 - `response.created`
 - `response.text.delta` and `response.text.done`
@@ -220,6 +221,31 @@ returned binary PCM frames into `response.audio.delta` events. Text and audio
 flow concurrently. Sentence detection, sequential synthesis, pauses, fades, and
 composite WAV capture belong to TTS rather than the assistant orchestration
 layer.
+
+Spoken responses use multi-voice marker mode by default. `multi_voice` defines a
+default character and a non-empty map of character names to Pydantic-validated
+voice and one-symbol marker settings. The built-in safe configuration has one
+`assistant` character using `voice: default` and marker `§`; deployments can
+add voices without changing prompt or transport code. Assistant markers cannot
+use `{`, which is reserved for streamed tool-call classification:
+
+```yaml
+multi_voice:
+  default_character: narrator
+  characters:
+    narrator: {voice: attenborough, marker: "§"}
+    bandit: {voice: bender, marker: "¶"}
+```
+
+The prompt suffix explains each available character and tells the model to
+start every spoken response with the default marker, then emit another raw
+marker whenever the speaker changes. It also tells the model not to produce the
+header. The assistant prepends `<multi>` and one `<char>` declaration per
+configured character to every TTS pipeline text stream. A session voice, when
+present, is substituted into the default character declaration. The TTS parser
+therefore receives the complete validated format while the LLM spends output
+tokens only on speaker markers. Generated text events retain the markers; only
+TTS removes them from spoken text.
 
 The assistant retires idle pooled upstream HTTP connections after four seconds,
 before the five-second idle timeout used by Uvicorn and llama.cpp. This avoids
@@ -355,6 +381,30 @@ with the first completed segment without sender-managed sentence requests. WAV
 responses use the same synthesis path but are buffered until a complete WAV can
 be returned.
 
+Both ordinary HTTP speech endpoints also recognize strict tagged multi-speaker
+text when `input` starts exactly with `<multi>`. Tagged input always uses the
+multi-speaker pipeline, independent of `X-Pipeline`; the request-level `voice`
+must be omitted because every declared character owns its voice. Plain strings
+remain backward compatible. A tagged request can use compact raw markers,
+character tags, or both:
+
+```text
+<multi>
+<char narrator voice=attenborough marker=§>
+<char bandit voice=bender marker=¶>
+§The story begins.
+¶Not so fast.
+<narrator>And so it continued.
+```
+
+`multi` and `char` are reserved names. Character names use letters, numbers,
+underscores, and hyphens; a compact marker is one non-alphanumeric,
+non-whitespace symbol. Declarations must precede the body and have unique names
+and markers. Every body tag must name a declared character, every turn must
+contain spoken text, nesting and closing tags are invalid, and unknown
+declaration attributes are rejected. These rules intentionally make `<...>` in
+spoken content an error rather than implementing error-tolerant HTML behavior.
+
 The structured `POST /v1/audio/speech/multi-speaker` endpoint maps speaker names
 to existing voices and streams all segments as one pipeline response:
 
@@ -379,9 +429,8 @@ All declared voices are resolved before response streaming begins, so a missing
 voice fails before any audio bytes are sent. Adjacent segments assigned to the
 same speaker are joined before sentence segmentation. Voice changes reuse the
 same request gate, pipeline, backpressure path, and latest-recording capture;
-PCM streams continuously and WAV buffers the same combined PCM. The structured
-input is also suitable as the internal representation for a future speaker
-markup parser.
+PCM streams continuously and WAV buffers the same combined PCM. Structured and
+tagged inputs both normalize to the same internal multi-speaker command.
 
 The incremental `WS /v1/audio/speech/pipeline` interface preserves overlap with
 a text generator such as the assistant LLM. The client first sends a
@@ -392,7 +441,10 @@ a text generator such as the assistant LLM. The client first sends a
 deliberately stops reading more text; WebSocket/TCP flow control therefore
 propagates backpressure to the producer without another
 unbounded application queue. The exclusive TTS gate is acquired on the first
-text delta and retained through completion. An incomplete client has
+text delta and retained through completion. An initial `<multi>` selects the
+same tagged parser incrementally; otherwise the WebSocket retains its existing
+plain single-voice behavior. Tagged sessions must omit the request-level
+`session.start.voice` selector. An incomplete client has
 `pipeline_idle_timeout_seconds` to provide the next delta before its session is
 closed.
 

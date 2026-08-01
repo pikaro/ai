@@ -20,7 +20,8 @@ from starlette.datastructures import Headers
 from starlette.websockets import WebSocketState
 
 from assistant.src.api import app as assistant_app, lifespan, prometheus_metrics
-from assistant.src.config import MCPConfig, Settings
+from assistant.src.config import MCPConfig, MultiVoiceConfig, Settings, VoiceCharacterConfig
+from assistant.src.multi_voice import multi_voice_header
 from assistant.src.pipeline import (
     BASE_SYSTEM_PROMPT,
     AssistantUtterance,
@@ -49,6 +50,32 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.system_prompt_path, Path('/tmp/system-prompt'))  # noqa: S108
         self.assertEqual(settings.model_id, 'qwen3-4b-instruct')
         self.assertEqual(settings.default_timezone, 'Europe/Berlin')
+        self.assertEqual(settings.multi_voice.default_character, 'assistant')
+        self.assertEqual(settings.multi_voice.characters['assistant'].marker, '§')
+
+    def test_multi_voice_characters_are_strict_and_unique(self) -> None:
+        config = MultiVoiceConfig(
+            default_character='narrator',
+            characters={
+                'narrator': VoiceCharacterConfig(voice='attenborough', marker='§'),
+                'bandit': VoiceCharacterConfig(voice='bender', marker='¶'),
+            },
+        )
+
+        self.assertEqual(config.characters['bandit'].voice, 'bender')
+        with self.assertRaises(ValidationError):
+            _ = MultiVoiceConfig(
+                characters={
+                    'first': VoiceCharacterConfig(voice='alba', marker='§'),
+                    'second': VoiceCharacterConfig(voice='bender', marker='§'),
+                },
+            )
+        with self.assertRaises(ValidationError):
+            _ = VoiceCharacterConfig(voice='alba', marker='{')
+
+    def test_multi_voice_header_rejects_an_invalid_session_voice(self) -> None:
+        with self.assertRaises(ValueError):
+            _ = multi_voice_header(Settings().multi_voice, selected_voice='bad>voice')
 
     def test_environment_supports_nested_mcp_servers(self) -> None:
         environment = {
@@ -888,7 +915,7 @@ class TtsPipelineClientTest(unittest.IsolatedAsyncioTestCase):
                 del code
 
         async def text_stream() -> AsyncIterator[str]:
-            yield 'First sentence.'
+            yield '§First sentence.'
             yield ' Second sentence.'
 
         connection = FakeConnection()
@@ -905,14 +932,19 @@ class TtsPipelineClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tts.pipeline_websocket_url, 'ws://tts.test/v1/audio/speech/pipeline')
         sent_events = [json.loads(message) for message in connection.sent]
         self.assertEqual(sent_events[0]['type'], 'session.start')
-        self.assertEqual(sent_events[0]['voice'], 'bender')
+        self.assertNotIn('voice', sent_events[0])
         self.assertEqual(
             [event['type'] for event in sent_events[1:]],
-            ['input_text.delta', 'input_text.delta', 'input_text.done'],
+            [
+                'input_text.delta',
+                'input_text.delta',
+                'input_text.delta',
+                'input_text.done',
+            ],
         )
         self.assertEqual(
             ''.join(str(event.get('delta', '')) for event in sent_events),
-            'First sentence. Second sentence.',
+            '<multi>\n<char assistant voice=bender marker=§>\n§First sentence. Second sentence.',
         )
 
 
@@ -1113,6 +1145,8 @@ class StartupWarmTest(unittest.IsolatedAsyncioTestCase):
         prompt = str(warm_cache.await_args_list[0].args[0])
         self.assertTrue(prompt.endswith('<|im_start|>user\n'))
         self.assertIn('"name":"time"', prompt)
+        self.assertIn('§ means assistant using voice default', prompt)
+        self.assertIn('Do not emit <multi> or <char> declarations', prompt)
         self.assertNotIn('<|im_start|>assistant', prompt)
 
     async def test_lifespan_waits_for_startup_warm_before_serving(self) -> None:
@@ -1210,9 +1244,8 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
         _ = await self.utterance.finalize_cache_warming('unrelated command')
 
         self.assertEqual(len(self.llm.warms), 1)
-        self.assertIn(
-            '<|im_start|>system\nReloaded prompt.\nTools are available', self.llm.warms[0][0]
-        )
+        self.assertIn('<|im_start|>system\nReloaded prompt.', self.llm.warms[0][0])
+        self.assertIn('\nTools are available below.', self.llm.warms[0][0])
         self.assertIn('"name":"time"', self.llm.warms[0][0])
         self.assertTrue(self.llm.warms[0][0].endswith('<|im_start|>user\nunrelated command'))
         self.assertNotIn('<|im_start|>assistant', self.llm.warms[0][0])

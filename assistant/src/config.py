@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     JsonConfigSettingsSource,
@@ -55,6 +63,59 @@ class MCPConfig(BaseModel):
         return {'Authorization': f'Bearer {self.token.get_secret_value()}'}
 
 
+class VoiceCharacterConfig(BaseModel):
+    """Select one TTS voice and the compact marker emitted for its character."""
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    voice: str = Field(pattern=r'^(?:default|[A-Za-z0-9][A-Za-z0-9_-]{0,63})$')
+    marker: str = Field(min_length=1, max_length=1)
+
+    @field_validator('marker')
+    @classmethod
+    def require_symbol_marker(cls, marker: str) -> str:
+        if marker.isspace() or marker.isalnum() or marker in {'<', '>', '"', "'", '{'}:
+            message = 'multi-voice markers must be one non-reserved, non-alphanumeric symbol'
+            raise ValueError(message)
+        return marker
+
+
+def _default_voice_characters() -> dict[str, VoiceCharacterConfig]:
+    return {'assistant': VoiceCharacterConfig(voice='default', marker='§')}
+
+
+class MultiVoiceConfig(BaseModel):
+    """Define the character header added to every assistant TTS request."""
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    default_character: str = 'assistant'
+    characters: dict[str, VoiceCharacterConfig] = Field(
+        default_factory=_default_voice_characters,
+        min_length=1,
+    )
+
+    @model_validator(mode='after')
+    def validate_characters(self) -> MultiVoiceConfig:
+        name_pattern = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
+        invalid_names = [
+            name
+            for name in self.characters
+            if name_pattern.fullmatch(name) is None or name in {'char', 'multi'}
+        ]
+        if invalid_names:
+            message = f'invalid multi-voice character name: {invalid_names[0]!r}'
+            raise ValueError(message)
+        if self.default_character not in self.characters:
+            message = 'multi-voice default_character must name a configured character'
+            raise ValueError(message)
+        markers = [character.marker for character in self.characters.values()]
+        if len(set(markers)) != len(markers):
+            message = 'multi-voice character markers must be unique'
+            raise ValueError(message)
+        return self
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix='ASSISTANT_',
@@ -74,6 +135,7 @@ class Settings(BaseSettings):
     stt_base_url: str = 'http://nemo-asr.nemo-asr'
     tts_base_url: str = 'http://pockettts.pockettts'
     tts_model: str = 'kyutai/pocket-tts'
+    multi_voice: MultiVoiceConfig = Field(default_factory=MultiVoiceConfig)
     system_prompt_path: Path = Path('/tmp/system-prompt')  # noqa: S108
     llm_slots: tuple[int, ...] = (0,)
     llm_max_tokens: int = Field(default=128, ge=1)

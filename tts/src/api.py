@@ -47,6 +47,7 @@ from tts.src.domain import (
     EmptySegmentError,
     EmptyVoiceUploadError,
     InputTooLongError,
+    InvalidMultiSpeakerMarkupError,
     InvalidVoiceNameError,
     InvalidVoiceSelectorError,
     ModelMismatchError,
@@ -61,6 +62,7 @@ from tts.src.domain import (
     VoiceUnavailableError,
     VoiceUploadTooLargeError,
 )
+from tts.src.markup import MULTI_SPEAKER_MARKER, parse_multi_speaker_markup
 from tts.src.metrics import (
     ACTIVE_REQUESTS,
     AUDIO_SECONDS,
@@ -87,7 +89,7 @@ if TYPE_CHECKING:
     from starlette.types import Receive, Scope, Send
 
     from tts.src.pipeline import SpeakerTurn
-    from tts.src.streaming import IncrementalPipelineSession
+    from tts.src.streaming import IncrementalPipelineSession, IncrementalTaggedPipelineSession
 
 LOGGER = logging.getLogger('tts')
 RESTART_REQUIRED_SETTINGS = frozenset({'model_id', 'language', 'listen_port'})
@@ -144,6 +146,7 @@ _TTS_ERROR_STATUS: dict[type[TtsServiceError], int] = {
     EmptyInputError: status.HTTP_400_BAD_REQUEST,
     EmptySegmentError: status.HTTP_400_BAD_REQUEST,
     UndefinedSpeakerError: status.HTTP_400_BAD_REQUEST,
+    InvalidMultiSpeakerMarkupError: status.HTTP_400_BAD_REQUEST,
 }
 
 
@@ -299,12 +302,30 @@ def _multi_speaker_command(request: MultiSpeakerSpeechRequest) -> MultiSpeakerCo
     )
 
 
-def _speech_response(  # noqa: C901
+def _raise_tagged_voice_conflict(selector: str) -> Never:
+    message = f'the {selector} voice must be omitted because each character declares its voice'
+    raise InvalidMultiSpeakerMarkupError(message)
+
+
+def _speech_response(  # noqa: C901, PLR0912
     runtime: TtsRuntime,
     speech_request: SpeechRequest,
     *,
     pipeline: bool,
 ) -> Response:
+    if speech_request.input.startswith(MULTI_SPEAKER_MARKER):
+        if speech_request.voice is not None:
+            _raise_tagged_voice_conflict('request')
+        command = parse_multi_speaker_markup(
+            speech_request.input,
+            model=speech_request.model,
+            speed=speech_request.speed,
+        )
+        return _multi_speaker_response(
+            runtime,
+            command,
+            response_format=speech_request.response_format,
+        )
     try:
         reject_if_busy(runtime.operations, 'TTS')
     except HTTPException:
@@ -387,7 +408,9 @@ def _speech_response(  # noqa: C901
 
 def _multi_speaker_response(  # noqa: C901
     runtime: TtsRuntime,
-    speech_request: MultiSpeakerSpeechRequest,
+    command: MultiSpeakerCommand,
+    *,
+    response_format: str,
 ) -> Response:
     try:
         reject_if_busy(runtime.operations, 'TTS')
@@ -400,9 +423,9 @@ def _multi_speaker_response(  # noqa: C901
     request_observed = False
     outcome = 'success'
     try:
-        turns = runtime.prepare_multi_speaker_turns(_multi_speaker_command(speech_request))
+        turns = runtime.prepare_multi_speaker_turns(command)
         request_metadata = {
-            'response_format': speech_request.response_format,
+            'response_format': response_format,
             'characters': sum(len(turn.text) for turn in turns),
             'speakers': len({turn.speaker for turn in turns}),
             'turn_count': len(turns),
@@ -435,7 +458,7 @@ def _multi_speaker_response(  # noqa: C901
                     **request_metadata,
                 },
             )
-        if speech_request.response_format == 'pcm':
+        if response_format == 'pcm':
             response = _ClosingStreamingResponse(
                 _stream_multi_speaker_speech(runtime, turns, started),
                 media_type='application/octet-stream',
@@ -466,7 +489,7 @@ def _multi_speaker_response(  # noqa: C901
         return response  # noqa: TRY300
     except Exception:
         outcome = 'error'
-        if speech_request.response_format == 'wav':
+        if response_format == 'wav':
             PIPELINE_REQUESTS.labels(
                 transport='http_multi_speaker',
                 outcome=outcome,
@@ -477,7 +500,7 @@ def _multi_speaker_response(  # noqa: C901
             runtime.operations.release()
             ACTIVE_REQUESTS.dec()
             if not request_observed:
-                _observe_request(speech_request.response_format, outcome, started, 0, 1)
+                _observe_request(response_format, outcome, started, 0, 1)
 
 
 def _next_pcm_chunk(chunks: Iterator[bytes]) -> bytes | None:
@@ -552,8 +575,10 @@ async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
     gate_acquired = False
     active_request = False
     completed = False
-    pipeline: IncrementalPipelineSession | None = None
+    pipeline: IncrementalPipelineSession | IncrementalTaggedPipelineSession | None = None
     sender: _WebSocketPcmSender | None = None
+    classification_buffer = ''
+    tagged_input = False
     try:
         await websocket.accept()
         session_raw = await _receive_pipeline_text(
@@ -621,17 +646,30 @@ async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
                     )
             event = PIPELINE_INPUT_ADAPTER.validate_json(raw)
             if isinstance(event, PipelineTextDone):
-                if pipeline is None or not input_has_text:
+                if not input_has_text:
                     _raise_empty_pipeline()
+                if pipeline is None:
+                    _enforce_pipeline_input_limit(
+                        input_characters,
+                        runtime.settings.maximum_input_characters,
+                    )
+                    pipeline = await asyncio.to_thread(
+                        runtime.create_incremental_pipeline,
+                        session.voice,
+                    )
+                    sender = _WebSocketPcmSender(websocket, pipeline.sample_rate, started)
+                    await sender.send(
+                        pipeline.append_text(
+                            classification_buffer,
+                            observed_at=event_observed_at,
+                        ),
+                    )
+                    classification_buffer = ''
                 input_done = True
             else:
                 input_characters += len(event.delta)
                 input_has_text = input_has_text or bool(event.delta.strip())
-                _enforce_pipeline_input_limit(
-                    input_characters,
-                    runtime.settings.maximum_input_characters,
-                )
-                if pipeline is None:
+                if not gate_acquired:
                     if not runtime.operations.try_acquire():
                         BUSY_REJECTIONS.inc()
                         outcome = 'busy'
@@ -644,11 +682,33 @@ async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
                     gate_acquired = True
                     ACTIVE_REQUESTS.inc()
                     active_request = True
-                    pipeline = await asyncio.to_thread(
-                        runtime.create_incremental_pipeline,
-                        session.voice,
-                    )
+                if pipeline is None:
+                    classification_buffer += event.delta
+                    if (
+                        MULTI_SPEAKER_MARKER.startswith(classification_buffer)
+                        and classification_buffer != MULTI_SPEAKER_MARKER
+                    ):
+                        continue
+                    if classification_buffer.startswith(MULTI_SPEAKER_MARKER):
+                        if session.voice is not None:
+                            _raise_tagged_voice_conflict('session')
+                        tagged_input = True
+                        pipeline = await asyncio.to_thread(
+                            runtime.create_incremental_tagged_pipeline,
+                        )
+                    else:
+                        pipeline = await asyncio.to_thread(
+                            runtime.create_incremental_pipeline,
+                            session.voice,
+                        )
                     sender = _WebSocketPcmSender(websocket, pipeline.sample_rate, started)
+                    event.delta = classification_buffer
+                    classification_buffer = ''
+                if not tagged_input:
+                    _enforce_pipeline_input_limit(
+                        input_characters,
+                        runtime.settings.maximum_input_characters,
+                    )
 
             if sender is None:
                 continue
@@ -810,7 +870,11 @@ def multi_speaker_speech(
     request: Request,
     speech_request: MultiSpeakerSpeechRequest,
 ) -> Response:
-    return _multi_speaker_response(_runtime(request), speech_request)
+    return _multi_speaker_response(
+        _runtime(request),
+        _multi_speaker_command(speech_request),
+        response_format=speech_request.response_format,
+    )
 
 
 @app.websocket('/v1/audio/speech/pipeline')

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from assistant.src import metrics
+from assistant.src.multi_voice import system_prompt_with_multi_voice
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -378,6 +379,12 @@ class AssistantUtterance:
                 self.final_transcript_at - self.first_audio_at,
             )
 
+    def _active_system_prompt(self) -> str:
+        return system_prompt_with_multi_voice(
+            self.system_prompt.read(),
+            self.settings.multi_voice,
+        )
+
     def schedule_cache_warm(self, transcript: str) -> str:
         """Schedule a stable transcript without queueing every intermediate revision."""
         if not self.settings.llm_cache_warm_enabled:
@@ -473,7 +480,7 @@ class AssistantUtterance:
         prompt = build_prompt_prefix(
             transcript,
             available_tools,
-            system_prompt=self.system_prompt.read(),
+            system_prompt=self._active_system_prompt(),
         )
         await self._warm(prompt, reason='delta')
 
@@ -502,7 +509,7 @@ class AssistantUtterance:
         prompt = build_prompt(
             transcript,
             available_tools,
-            system_prompt=self.system_prompt.read(),
+            system_prompt=self._active_system_prompt(),
         )
         await send(
             {
@@ -548,7 +555,7 @@ class AssistantUtterance:
                 transcript,
                 available_tools,
                 history,
-                system_prompt=self.system_prompt.read(),
+                system_prompt=self._active_system_prompt(),
             )
             response_stream = self.llm.stream(
                 prompt,
@@ -628,7 +635,7 @@ class AssistantUtterance:
             transcript,
             available_tools,
             final_history,
-            system_prompt=self.system_prompt.read(),
+            system_prompt=self._active_system_prompt(),
         )
         response_stream = self.llm.stream(
             final_prompt,

@@ -22,12 +22,15 @@ from tts.src.api import app, metrics, speech_pipeline_websocket
 from tts.src.config import Settings
 from tts.src.domain import (
     InputTooLongError,
+    InvalidMultiSpeakerMarkupError,
     InvalidVoiceNameError,
     InvalidVoiceSelectorError,
     SpeechCommand,
+    UndefinedSpeakerError,
     UnsupportedSpeedError,
     VoiceUploadTooLargeError,
 )
+from tts.src.markup import parse_multi_speaker_markup
 from tts.src.pipeline import (
     PcmPipeline,
     SmartChunkKnowledge,
@@ -1240,6 +1243,49 @@ class PipelineEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requested_text, ['First sentence.', 'Second sentence.'])
 
 
+class MultiSpeakerMarkupTest(unittest.TestCase):
+    def test_parses_symbol_markers_and_named_character_tags(self) -> None:
+        command = parse_multi_speaker_markup(
+            '<multi>\n'
+            '<char narrator voice=attenborough marker=§>\n'
+            '<char bandit voice=bender marker=¶>\n'
+            '§First.<bandit>Second.§Third.',
+            model=MODEL_ID,
+            speed=1.0,
+        )
+
+        self.assertEqual(command.speakers, {'narrator': 'attenborough', 'bandit': 'bender'})
+        self.assertEqual(
+            [(segment.speaker, segment.text) for segment in command.segments],
+            [
+                ('narrator', 'First.'),
+                ('bandit', 'Second.'),
+                ('narrator', 'Third.'),
+            ],
+        )
+
+    def test_rejects_undefined_tags_and_duplicate_markers(self) -> None:
+        with self.assertRaises(UndefinedSpeakerError):
+            _ = parse_multi_speaker_markup(
+                '<multi><char narrator voice=alba><missing>No.</missing>',
+                model=MODEL_ID,
+                speed=1.0,
+            )
+
+        with self.assertRaises(InvalidMultiSpeakerMarkupError):
+            _ = parse_multi_speaker_markup(
+                '<multi><char narrator voice="">\u00a7No.',
+                model=MODEL_ID,
+                speed=1.0,
+            )
+        with self.assertRaises(InvalidMultiSpeakerMarkupError):
+            _ = parse_multi_speaker_markup(
+                '<multi><char first voice=alba marker=§><char second voice=bender marker=§>§No.',
+                model=MODEL_ID,
+                speed=1.0,
+            )
+
+
 class MultiSpeakerEndpointTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def runtime(settings: Settings | None = None) -> tuple[TtsRuntime, object, object]:
@@ -1282,15 +1328,69 @@ class MultiSpeakerEndpointTest(unittest.IsolatedAsyncioTestCase):
         self,
         runtime: TtsRuntime,
         payload: dict[str, object],
+        path: str = '/v1/audio/speech/multi-speaker',
     ) -> httpx.Response:
         app.state.runtime = runtime
         transport = httpx.ASGITransport(app=app)
         with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
             async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
                 return await client.post(
-                    '/v1/audio/speech/multi-speaker',
+                    path,
                     json=payload,
                 )
+
+    async def test_ordinary_speech_endpoint_accepts_tagged_multi_speaker_input(self) -> None:
+        runtime, attenborough_state, bender_state = self.runtime(
+            Settings(
+                voice='attenborough',
+                maximum_input_characters=40,
+                pipeline_first_segment_comma_delimiter=False,
+                pipeline_sentence_crossfade_seconds=0,
+                pipeline_smart_chunk_enabled=False,
+                pipeline_speaker_switch_pause_seconds=0,
+            ),
+        )
+        response = await self._request(
+            runtime,
+            {
+                'model': MODEL_ID,
+                'input': (
+                    '<multi>\n'
+                    '<char narrator voice=attenborough marker=§>\n'
+                    '<char bandit voice=bender marker=¶>\n'
+                    '§First.¶Reply.§Done.'
+                ),
+                'response_format': 'pcm',
+            },
+            '/v1/audio/speech',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        calls = cast('MagicMock', runtime.engine.model).generate_audio_stream.call_args_list
+        self.assertEqual(
+            [(call.args[0], call.args[1]) for call in calls],
+            [
+                (attenborough_state, 'First.'),
+                (bender_state, 'Reply.'),
+                (attenborough_state, 'Done.'),
+            ],
+        )
+
+    async def test_tagged_ordinary_request_rejects_conflicting_request_voice(self) -> None:
+        runtime, _, _ = self.runtime()
+        response = await self._request(
+            runtime,
+            {
+                'model': MODEL_ID,
+                'input': '<multi><char narrator voice=attenborough marker=§>§No.',
+                'voice': 'bender',
+            },
+            '/v1/audio/speech',
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('request voice must be omitted', response.json()['detail'])
+        cast('MagicMock', runtime.engine.model).generate_audio_stream.assert_not_called()
 
     async def test_streams_all_voices_as_one_pcm_response_and_recording(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1484,6 +1584,93 @@ class PipelineWebSocketTest(unittest.IsolatedAsyncioTestCase):
             ['First clause,', 'rest of sentence.'],
         )
         self.assertEqual(websocket.json_events[0]['type'], 'session.ready')
+        self.assertEqual(websocket.json_events[-1]['type'], 'response.audio.done')
+        self.assertEqual(websocket.close_code, 1000)
+        self.assertFalse(runtime.operations.active)
+
+    async def test_tagged_text_switches_preloaded_voices_before_input_done(self) -> None:  # noqa: C901
+        runtime = TtsRuntime(
+            Settings(
+                voice='attenborough',
+                maximum_input_characters=40,
+                pipeline_first_segment_comma_delimiter=False,
+                pipeline_sentence_crossfade_seconds=0,
+                pipeline_sentence_pause_seconds=0,
+                pipeline_smart_chunk_enabled=False,
+                pipeline_speaker_switch_pause_seconds=0,
+            ),
+        )
+        runtime.engine.model = MagicMock(sample_rate=24_000)
+        attenborough_state = object()
+        bender_state = object()
+        runtime.engine.voice_states = {
+            'attenborough': attenborough_state,
+            'bender': bender_state,
+        }
+        runtime.engine.model.generate_audio_stream.side_effect = lambda _voice, _text: iter(
+            [b'\x01\x02\x03\x04'],
+        )
+
+        class FakeWebSocket:
+            def __init__(self) -> None:
+                self.app = SimpleNamespace(state=SimpleNamespace(runtime=runtime))
+                self.client_state = WebSocketState.CONNECTED
+                self.received = 0
+                self.incoming = [
+                    '{"type":"session.start","model":"kyutai/pocket-tts"}',
+                    json.dumps(
+                        {
+                            'type': 'input_text.delta',
+                            'delta': (
+                                '<multi>\n'
+                                '<char narrator voice=attenborough marker=§>\n'
+                                '<char bandit voice=bender marker=¶>\n'
+                            ),
+                        },
+                    ),
+                    json.dumps({'type': 'input_text.delta', 'delta': '§First sentence.'}),
+                    json.dumps({'type': 'input_text.delta', 'delta': '¶Second sentence.'}),
+                    '{"type":"input_text.done"}',
+                ]
+                self.json_events: list[dict[str, object]] = []
+                self.audio: list[bytes] = []
+                self.first_audio_after_received: int | None = None
+                self.close_code: int | None = None
+
+            async def accept(self) -> None:
+                return
+
+            async def receive_text(self) -> str:
+                message = self.incoming.pop(0)
+                self.received += 1
+                return message
+
+            async def send_json(self, payload: dict[str, object]) -> None:
+                self.json_events.append(payload)
+
+            async def send_bytes(self, payload: bytes) -> None:
+                if self.first_audio_after_received is None:
+                    self.first_audio_after_received = self.received
+                self.audio.append(payload)
+
+            async def close(self, code: int, reason: str = '') -> None:
+                del reason
+                self.close_code = code
+                self.client_state = WebSocketState.DISCONNECTED
+
+        websocket = FakeWebSocket()
+        with patch.object(runtime.engine, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            await speech_pipeline_websocket(cast('WebSocket', websocket))
+
+        self.assertLess(cast('int', websocket.first_audio_after_received), 5)
+        calls = runtime.engine.model.generate_audio_stream.call_args_list
+        self.assertEqual(
+            [(call.args[0], call.args[1]) for call in calls],
+            [
+                (attenborough_state, 'First sentence.'),
+                (bender_state, 'Second sentence.'),
+            ],
+        )
         self.assertEqual(websocket.json_events[-1]['type'], 'response.audio.done')
         self.assertEqual(websocket.close_code, 1000)
         self.assertFalse(runtime.operations.active)

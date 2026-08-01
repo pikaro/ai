@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from websockets.asyncio.client import ClientConnection, connect
 
 from assistant.src import metrics
+from assistant.src.multi_voice import multi_voice_header
 from service_contracts.tts import (
     PIPELINE_OUTPUT_ADAPTER,
     PipelineError,
@@ -454,10 +455,18 @@ class TtsClient:
                     PipelineSessionRequest(
                         type='session.start',
                         model=self.settings.tts_model,
-                        voice=voice,
                     ).model_dump_json(exclude_none=True),
                 )
-                sender = asyncio.create_task(self._send_text(websocket, text_stream))
+                sender = asyncio.create_task(
+                    self._send_text(
+                        websocket,
+                        text_stream,
+                        header=multi_voice_header(
+                            self.settings.multi_voice,
+                            selected_voice=voice,
+                        ),
+                    ),
+                )
                 while not response_done:
                     message = await self._receive_or_sender(websocket, sender)
                     if isinstance(message, bytes):
@@ -509,8 +518,16 @@ class TtsClient:
     async def _send_text(
         websocket: ClientConnection,
         text_stream: AsyncIterator[str],
+        *,
+        header: str,
     ) -> None:
         try:
+            await websocket.send(
+                PipelineTextDelta(
+                    type='input_text.delta',
+                    delta=header,
+                ).model_dump_json(),
+            )
             async for delta in text_stream:
                 if delta:
                     await websocket.send(

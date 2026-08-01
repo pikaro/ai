@@ -4,6 +4,12 @@ listen_port: 8080
 llm_base_url: http://llama-server.llama-server
 stt_base_url: http://nemo-asr.nemo-asr
 tts_base_url: http://pockettts.pockettts
+multi_voice:
+  default_character: assistant
+  characters:
+    assistant:
+      voice: default
+      marker: "§"
 system_prompt_path: /tmp/system-prompt
 llm_slots: [0]
 llm_cache_warm_enabled: true

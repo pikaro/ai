@@ -838,6 +838,8 @@ class PipelineRuntime(Protocol):
 
     def sample_rate(self) -> int: ...
 
+    def prepare_voice(self, requested_voice: str | None) -> str: ...
+
     def stream_model_pcm(self, text: str, voice: str) -> Generator[bytes, None, None]: ...
 
     def smart_chunk_knowledge(self, voice: str) -> SmartChunkKnowledge: ...
@@ -1079,6 +1081,19 @@ class PcmPipeline:
         )
         self.smart_waiting = None
         yield from self._flush_queued_text()
+
+    def finish_speaker_turn(self) -> Generator[bytes, None, None]:
+        """Flush queued text and mark retained audio as ending at a speaker switch."""
+        self.smart_waiting = None
+        self.smart_decisions.clear()
+        self.smart_flushed = None
+        if self.queued_text:
+            self.queued_boundary = 'speaker_switch'
+            yield from self._flush_queued_text()
+            return
+        if self.pending is not None:
+            self.pending.set_boundary('speaker_switch', self.runtime.settings)
+            self.pending_stitch_deadline = self._projected_playback_deadline(self.pending)
 
     def _flush_queued_text(self) -> Generator[bytes, None, None]:
         if not self.queued_text:

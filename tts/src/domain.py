@@ -78,6 +78,11 @@ class UndefinedSpeakerError(TtsServiceError):
         super().__init__(f'speaker {speaker!r} is not defined')
 
 
+class InvalidMultiSpeakerMarkupError(TtsServiceError):
+    def __init__(self, message: str) -> None:
+        super().__init__(f'invalid multi-speaker markup: {message}')
+
+
 @dataclass(frozen=True, slots=True)
 class SpeechCommand:
     model: str

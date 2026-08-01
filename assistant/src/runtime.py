@@ -7,6 +7,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from assistant.src.domain import RuntimeStatus, UpstreamUnavailableError
+from assistant.src.multi_voice import system_prompt_with_multi_voice
 from assistant.src.pipeline import (
     AssistantUtterance,
     SystemPromptFile,
@@ -63,7 +64,10 @@ class AssistantRuntime:
         prompt = build_prompt_prefix(
             '',
             available_tools,
-            system_prompt=self.system_prompt.read(),
+            system_prompt=system_prompt_with_multi_voice(
+                self.system_prompt.read(),
+                self.settings.multi_voice,
+            ),
         )
         for slot in self.settings.llm_slots:
             await warm_llm_cache(self.llm, prompt, slot, reason='startup')

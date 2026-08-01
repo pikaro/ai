@@ -24,7 +24,7 @@ from tts.src.domain import (
 from tts.src.engine import PocketTtsEngine, wav_from_pcm
 from tts.src.pipeline import PcmPipeline, SmartChunkKnowledge, SpeakerTurn, TextSegmenter
 from tts.src.recording import AtomicWavWriter
-from tts.src.streaming import IncrementalPipelineSession
+from tts.src.streaming import IncrementalPipelineSession, IncrementalTaggedPipelineSession
 from tts.src.voices import StoredVoice, VoiceRepository
 
 if TYPE_CHECKING:
@@ -95,6 +95,9 @@ class TtsRuntime:
             self,
             self.prepare_voice(requested_voice),
         )
+
+    def create_incremental_tagged_pipeline(self) -> IncrementalTaggedPipelineSession:
+        return IncrementalTaggedPipelineSession(self)
 
     def validate_speech(self, command: SpeechCommand) -> str:
         text = command.text.strip()
