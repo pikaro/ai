@@ -30,7 +30,12 @@ from tts.src.domain import (
     UnsupportedSpeedError,
     VoiceUploadTooLargeError,
 )
-from tts.src.markup import parse_multi_speaker_markup
+from tts.src.markup import (
+    MarkupSpeaker,
+    MarkupText,
+    MultiSpeakerMarkupParser,
+    parse_multi_speaker_markup,
+)
 from tts.src.pipeline import (
     PcmPipeline,
     SmartChunkKnowledge,
@@ -1262,6 +1267,45 @@ class MultiSpeakerMarkupTest(unittest.TestCase):
                 ('bandit', 'Second.'),
                 ('narrator', 'Third.'),
             ],
+        )
+
+    def test_parses_literal_aliases_without_reserving_similar_text(self) -> None:
+        command = parse_multi_speaker_markup(
+            '<multi>\n'
+            '<char narrator voice=attenborough alias={n}>\n'
+            '<char bandit voice=bender alias={b}>\n'
+            '{n}First {ordinary} text.{b}Second.',
+            model=MODEL_ID,
+            speed=1.0,
+        )
+
+        self.assertEqual(
+            [(segment.speaker, segment.text) for segment in command.segments],
+            [
+                ('narrator', 'First {ordinary} text.'),
+                ('bandit', 'Second.'),
+            ],
+        )
+
+    def test_literal_aliases_may_span_incremental_deltas(self) -> None:
+        parser = MultiSpeakerMarkupParser()
+        events = parser.append(
+            '<multi>\n'
+            '<char narrator voice=attenborough alias={n}>\n'
+            '<char bandit voice=bender alias={b}>\n',
+        )
+        events.extend(parser.append('{'))
+        events.extend(parser.append('n}First {ordinary} text.{'))
+        events.extend(parser.append('b}Second.'))
+        events.extend(parser.finish())
+
+        self.assertEqual(
+            [
+                (event.name if isinstance(event, MarkupSpeaker) else event.text)
+                for event in events
+                if isinstance(event, (MarkupSpeaker, MarkupText))
+            ],
+            ['narrator', 'First {ordinary} text.', 'bandit', 'Second.'],
         )
 
     def test_rejects_undefined_tags_and_duplicate_markers(self) -> None:

@@ -25,6 +25,7 @@ class MarkupCharacter:
     name: str
     voice: str
     marker: str | None
+    alias: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +74,7 @@ def _parse_character_tag(tag: str) -> MarkupCharacter:  # noqa: C901
             value = value[1:-1]
         attributes[key] = value
 
-    unknown = sorted(set(attributes) - {'marker', 'voice'})
+    unknown = sorted(set(attributes) - {'alias', 'marker', 'voice'})
     if unknown:
         _raise_invalid(f'unknown character attribute {unknown[0]!r}')
     voice = attributes.get('voice')
@@ -88,7 +89,19 @@ def _parse_character_tag(tag: str) -> MarkupCharacter:  # noqa: C901
         _raise_invalid(
             f'marker for character {name!r} must be one non-alphanumeric symbol',
         )
-    return MarkupCharacter(name=name, voice=voice, marker=marker)
+    return MarkupCharacter(
+        name=name,
+        voice=voice,
+        marker=marker,
+        alias=attributes.get('alias'),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _BodyBoundary:
+    index: int
+    kind: Literal['selector', 'tag', 'pending']
+    selector: str | None = None
 
 
 class MultiSpeakerMarkupParser:
@@ -98,7 +111,7 @@ class MultiSpeakerMarkupParser:
         self._buffer = ''
         self._phase: Literal['start', 'header', 'body'] = 'start'
         self._characters: dict[str, MarkupCharacter] = {}
-        self._markers: dict[str, str] = {}
+        self._selectors: dict[str, str] = {}
         self._current_speaker: str | None = None
         self._turn_has_text = False
 
@@ -130,16 +143,9 @@ class MultiSpeakerMarkupParser:
                     if character.name in self._characters:
                         _raise_invalid(f'character {character.name!r} is declared more than once')
                     if character.marker is not None:
-                        existing = self._markers.get(character.marker)
-                        if existing is not None:
-                            message = ''.join(
-                                (
-                                    f'marker {character.marker!r} is shared by {existing!r} and ',
-                                    f'{character.name!r}',
-                                ),
-                            )
-                            _raise_invalid(message)
-                        self._markers[character.marker] = character.name
+                        self._register_selector(character.marker, character.name)
+                    if character.alias:
+                        self._register_selector(character.alias, character.name)
                     self._characters[character.name] = character
                     self._buffer = self._buffer[tag_end + 1 :]
                     continue
@@ -165,27 +171,36 @@ class MultiSpeakerMarkupParser:
         if self._phase == 'header':
             if self._buffer:
                 _raise_invalid('incomplete character declaration')
-            _raise_invalid('body must start with a character marker')
+            _raise_invalid('body must start with a character selector')
+        while self._drain_body(events, final=True):
+            pass
         if self._buffer:
             if '<' in self._buffer:
                 _raise_invalid('incomplete character tag')
             self._emit_text(events, self._buffer)
             self._buffer = ''
         if self._current_speaker is None:
-            _raise_invalid('body must start with a character marker')
+            _raise_invalid('body must start with a character selector')
         if not self._turn_has_text:
             _raise_invalid(f'character {self._current_speaker!r} has no text')
         return events
 
-    def _drain_body(self, events: list[MarkupEvent]) -> bool:  # noqa: C901, PLR0911
+    def _drain_body(  # noqa: C901, PLR0911
+        self,
+        events: list[MarkupEvent],
+        *,
+        final: bool = False,
+    ) -> bool:
         if self._current_speaker is None:
             self._buffer = self._buffer.lstrip()
             if not self._buffer:
                 return False
-            marker_speaker = self._marker_at_start()
-            if marker_speaker is not None:
-                marker, speaker = marker_speaker
-                self._buffer = self._buffer[len(marker) :]
+            selector_speaker, pending = self._selector_at_start(final=final)
+            if pending:
+                return False
+            if selector_speaker is not None:
+                selector, speaker = selector_speaker
+                self._buffer = self._buffer[len(selector) :]
                 self._switch_speaker(events, speaker)
                 return True
             if self._buffer.startswith('<'):
@@ -196,19 +211,20 @@ class MultiSpeakerMarkupParser:
                 self._buffer = self._buffer[tag_end + 1 :]
                 self._switch_speaker(events, self._speaker_from_tag(tag))
                 return True
-            _raise_invalid('body must start with a character marker')
+            _raise_invalid('body must start with a character selector')
 
-        boundary = self._next_body_boundary()
+        boundary = self._next_body_boundary(final=final)
         if boundary is None:
             self._emit_text(events, self._buffer)
             self._buffer = ''
             return False
-        boundary_index, boundary_kind = boundary
-        if boundary_index:
-            self._emit_text(events, self._buffer[:boundary_index])
-            self._buffer = self._buffer[boundary_index:]
+        if boundary.index:
+            self._emit_text(events, self._buffer[: boundary.index])
+            self._buffer = self._buffer[boundary.index :]
             return True
-        if boundary_kind == 'tag':
+        if boundary.kind == 'pending':
+            return False
+        if boundary.kind == 'tag':
             tag_end = self._buffer.find('>')
             if tag_end < 0:
                 return False
@@ -217,31 +233,67 @@ class MultiSpeakerMarkupParser:
             self._switch_speaker(events, self._speaker_from_tag(tag))
             return True
 
-        speaker = self._markers[boundary_kind]
-        self._buffer = self._buffer[len(boundary_kind) :]
+        selector = boundary.selector or ''
+        speaker = self._selectors[selector]
+        self._buffer = self._buffer[len(selector) :]
         self._switch_speaker(events, speaker)
         return True
 
-    def _next_body_boundary(self) -> tuple[int, str] | None:
-        candidates: list[tuple[int, str]] = []
+    def _next_body_boundary(self, *, final: bool) -> _BodyBoundary | None:  # noqa: C901
+        candidates: list[_BodyBoundary] = []
         tag_index = self._buffer.find('<')
         if tag_index >= 0:
-            candidates.append((tag_index, 'tag'))
-        for marker in self._markers:
-            marker_index = self._buffer.find(marker)
-            if marker_index >= 0:
-                candidates.append((marker_index, marker))
-        return min(candidates, default=None, key=lambda item: item[0])
-
-    def _marker_at_start(self) -> tuple[str, str] | None:
-        return next(
-            (
-                (marker, speaker)
-                for marker, speaker in self._markers.items()
-                if self._buffer.startswith(marker)
+            candidates.append(_BodyBoundary(tag_index, 'tag'))
+        for selector in self._selectors:
+            selector_index = self._buffer.find(selector)
+            if selector_index >= 0:
+                candidates.append(_BodyBoundary(selector_index, 'selector', selector))
+        boundary = min(
+            candidates,
+            default=None,
+            key=lambda item: (
+                item.index,
+                item.kind == 'tag',
+                -(len(item.selector) if item.selector is not None else 0),
             ),
-            None,
         )
+        if final:
+            return boundary
+        pending_index = self._pending_selector_index()
+        if pending_index is not None and (boundary is None or pending_index <= boundary.index):
+            return _BodyBoundary(pending_index, 'pending')
+        return boundary
+
+    def _selector_at_start(self, *, final: bool) -> tuple[tuple[str, str] | None, bool]:
+        matches = [
+            (selector, speaker)
+            for selector, speaker in self._selectors.items()
+            if self._buffer.startswith(selector)
+        ]
+        pending = any(
+            len(self._buffer) < len(selector) and selector.startswith(self._buffer)
+            for selector in self._selectors
+        )
+        if pending and not final:
+            return None, True
+        return max(matches, default=None, key=lambda item: len(item[0])), False
+
+    def _pending_selector_index(self) -> int | None:
+        indexes: list[int] = []
+        for selector in self._selectors:
+            maximum_prefix = min(len(self._buffer), len(selector) - 1)
+            for length in range(maximum_prefix, 0, -1):
+                if self._buffer.endswith(selector[:length]):
+                    indexes.append(len(self._buffer) - length)
+                    break
+        return min(indexes, default=None)
+
+    def _register_selector(self, selector: str, speaker: str) -> None:
+        existing = self._selectors.get(selector)
+        if existing is not None and existing != speaker:
+            message = f'selector {selector!r} is shared by {existing!r} and {speaker!r}'
+            _raise_invalid(message)
+        self._selectors[selector] = speaker
 
     def _speaker_from_tag(self, tag: str) -> str:
         match = re.fullmatch(r'<([A-Za-z0-9][A-Za-z0-9_-]{0,63})>', tag)

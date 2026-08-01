@@ -397,11 +397,12 @@ character tags, or both:
 
 ```text
 <multi>
-<char narrator voice=attenborough marker=§>
+<char narrator voice=attenborough marker=§ alias={n}>
 <char bandit voice=bender marker=¶>
 §The story begins.
 ¶Not so fast.
 <narrator>And so it continued.
+{n}An alias selects the narrator too.
 ```
 
 `multi` and `char` are reserved names. Character names use letters, numbers,
@@ -411,6 +412,8 @@ and markers. Every body tag must name a declared character, every turn must
 contain spoken text, nesting and closing tags are invalid, and unknown
 declaration attributes are rejected. These rules intentionally make `<...>` in
 spoken content an error rather than implementing error-tolerant HTML behavior.
+An optional `alias` is matched as a literal character selector; text that does
+not exactly match a configured alias remains spoken text.
 
 The structured `POST /v1/audio/speech/multi-speaker` endpoint maps speaker names
 to existing voices and streams all segments as one pipeline response:
