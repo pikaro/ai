@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     voice: str = 'alba'
     data_directory: Path = Path('/data')
     torch_threads: int = Field(default=2, ge=1)
-    maximum_input_characters: int = Field(default=4_000, ge=1)
+    maximum_input_characters: int = Field(default=50_000, ge=1)
     maximum_voice_upload_bytes: int = Field(default=100 * 1024**2, ge=1)
     pipeline_clause_pause_seconds: float = Field(default=0.04, ge=0, le=2)
     pipeline_sentence_pause_seconds: float = Field(default=0.12, ge=0, le=2)
