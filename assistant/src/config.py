@@ -70,6 +70,7 @@ class VoiceCharacterConfig(BaseModel):
 
     voice: str = Field(pattern=r'^(?:default|[A-Za-z0-9][A-Za-z0-9_-]{0,63})$')
     marker: str = Field(min_length=1, max_length=1)
+    description: str | None = None
 
     @field_validator('marker')
     @classmethod

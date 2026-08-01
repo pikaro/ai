@@ -21,7 +21,7 @@ from starlette.websockets import WebSocketState
 
 from assistant.src.api import app as assistant_app, lifespan, prometheus_metrics
 from assistant.src.config import MCPConfig, MultiVoiceConfig, Settings, VoiceCharacterConfig
-from assistant.src.multi_voice import multi_voice_header
+from assistant.src.multi_voice import multi_voice_header, system_prompt_with_multi_voice
 from assistant.src.pipeline import (
     BASE_SYSTEM_PROMPT,
     AssistantUtterance,
@@ -57,12 +57,17 @@ class SettingsTest(unittest.TestCase):
         config = MultiVoiceConfig(
             default_character='narrator',
             characters={
-                'narrator': VoiceCharacterConfig(voice='attenborough', marker='§'),
                 'bandit': VoiceCharacterConfig(voice='bender', marker='¶'),
+                'narrator': VoiceCharacterConfig(voice='attenborough', marker='§'),
             },
         )
 
         self.assertEqual(config.characters['bandit'].voice, 'bender')
+        self.assertTrue(multi_voice_header(config).endswith('\n'))
+        self.assertIn(
+            'Unmarked spoken text starts as narrator',
+            system_prompt_with_multi_voice('Base prompt.', config),
+        )
         with self.assertRaises(ValidationError):
             _ = MultiVoiceConfig(
                 characters={
@@ -141,11 +146,15 @@ class RealtimeEventTest(unittest.TestCase):
 
     def test_session_voice_is_accepted(self) -> None:
         event = RealtimeEvent.model_validate(
-            {'type': 'session.update', 'session': {'voice': 'bender'}},
+            {
+                'type': 'session.update',
+                'session': {'voice': 'bender', 'multi_voice': False},
+            },
         )
 
         self.assertIsNotNone(event.session)
         self.assertEqual(getattr(event.session, 'voice', None), 'bender')
+        self.assertFalse(getattr(event.session, 'multi_voice', None))
 
 
 class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
@@ -915,11 +924,20 @@ class TtsPipelineClientTest(unittest.IsolatedAsyncioTestCase):
                 del code
 
         async def text_stream() -> AsyncIterator[str]:
-            yield '§First sentence.'
+            yield 'First sentence.'
             yield ' Second sentence.'
 
         connection = FakeConnection()
-        settings = Settings(tts_base_url='http://tts.test')
+        settings = Settings(
+            tts_base_url='http://tts.test',
+            multi_voice=MultiVoiceConfig(
+                default_character='assistant',
+                characters={
+                    'bandit': VoiceCharacterConfig(voice='bandit', marker='¶'),
+                    'assistant': VoiceCharacterConfig(voice='default', marker='§'),
+                },
+            ),
+        )
         async with httpx.AsyncClient() as client:
             tts = TtsClient(client, settings)
             with patch('assistant.src.upstream.connect', return_value=connection):
@@ -944,8 +962,44 @@ class TtsPipelineClientTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             ''.join(str(event.get('delta', '')) for event in sent_events),
-            '<multi>\n<char assistant voice=bender marker=§>\n§First sentence. Second sentence.',
+            '<multi>\n'
+            '<char bandit voice=bandit marker=¶>\n'
+            '<char assistant voice=bender marker=§>\n'
+            '§First sentence. Second sentence.',
         )
+
+        plain_connection = FakeConnection()
+        with patch('assistant.src.upstream.connect', return_value=plain_connection):
+            plain_chunks = [
+                item
+                async for item in tts.stream(
+                    text_stream(),
+                    voice='bender',
+                    multi_voice=False,
+                )
+            ]
+
+        self.assertEqual(plain_chunks, chunks)
+        plain_events = [json.loads(message) for message in plain_connection.sent]
+        self.assertEqual(plain_events[0]['voice'], 'bender')
+        self.assertEqual(
+            ''.join(str(event.get('delta', '')) for event in plain_events),
+            'First sentence. Second sentence.',
+        )
+
+        async def bandit_text_stream() -> AsyncIterator[str]:
+            yield '¶Bandit first.'
+
+        bandit_connection = FakeConnection()
+        with patch('assistant.src.upstream.connect', return_value=bandit_connection):
+            _ = [item async for item in tts.stream(bandit_text_stream())]
+
+        bandit_text = ''.join(
+            str(event.get('delta', ''))
+            for event in (json.loads(message) for message in bandit_connection.sent)
+        )
+        self.assertTrue(bandit_text.endswith('\n¶Bandit first.'))
+        self.assertNotIn('\n§¶Bandit first.', bandit_text)
 
 
 class TimeToolTest(unittest.TestCase):
@@ -1074,6 +1128,7 @@ class FakeLlm:
     def __init__(self) -> None:
         self.warms: list[tuple[str, int]] = []
         self.stream_requests: list[tuple[str, int | None]] = []
+        self.prompts: list[str] = []
         self.response = 'It is three.'
 
     async def warm_cache(self, prompt: str, slot: int) -> None:
@@ -1098,7 +1153,8 @@ class FakeLlm:
         operation: str = 'generation',
         maximum_tokens: int | None = None,
     ) -> AsyncIterator[str]:
-        del prompt, slot
+        del slot
+        self.prompts.append(prompt)
         self.stream_requests.append((operation, maximum_tokens))
         yield self.response
 
@@ -1107,14 +1163,17 @@ class FakeTts:
     def __init__(self) -> None:
         self.requests: list[str] = []
         self.voices: list[str | None] = []
+        self.multi_voice_modes: list[bool] = []
 
     async def stream(
         self,
         text_stream: AsyncIterator[str],
         *,
         voice: str | None = None,
+        multi_voice: bool = True,
     ) -> AsyncIterator[tuple[bytes, AudioFormat]]:
         self.voices.append(voice)
+        self.multi_voice_modes.append(multi_voice)
         self.requests.append(''.join([delta async for delta in text_stream]))
         yield (
             struct.pack('<hhhh', 1_000, 1_000, 1_000, 1_000),
@@ -1146,6 +1205,7 @@ class StartupWarmTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(prompt.endswith('<|im_start|>user\n'))
         self.assertIn('"name":"time"', prompt)
         self.assertIn('§ means assistant using voice default', prompt)
+        self.assertIn('Unmarked spoken text starts as assistant', prompt)
         self.assertIn('Do not emit <multi> or <char> declarations', prompt)
         self.assertNotIn('<|im_start|>assistant', prompt)
 
@@ -1339,6 +1399,19 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.tts.voices, ['bender'])
 
+    async def test_single_voice_mode_skips_multi_voice_prompt_and_transport(self) -> None:
+        self.utterance.select_voice('bender')
+        self.utterance.set_multi_voice(enabled=False)
+
+        async def send(_event: dict[str, object]) -> None:
+            return
+
+        await self.utterance.generate('hello', [], send)
+
+        self.assertEqual(self.tts.voices, ['bender'])
+        self.assertEqual(self.tts.multi_voice_modes, [False])
+        self.assertNotIn('voice-character markers', self.llm.prompts[-1])
+
     async def test_tool_aware_answer_reaches_tts_before_llm_stream_finishes(  # noqa: C901
         self,
     ) -> None:
@@ -1365,8 +1438,10 @@ class CachePipelineTest(unittest.IsolatedAsyncioTestCase):
                 text_stream: AsyncIterator[str],
                 *,
                 voice: str | None = None,
+                multi_voice: bool = True,
             ) -> AsyncIterator[tuple[bytes, AudioFormat]]:
                 self.voices.append(voice)
+                self.multi_voice_modes.append(multi_voice)
                 parts: list[str] = []
                 first_audio = True
                 async for text in text_stream:

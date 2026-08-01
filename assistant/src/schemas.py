@@ -9,6 +9,7 @@ from service_contracts.realtime import AudioInputSessionOptions, RealtimeAudioIn
 
 class SessionOptions(AudioInputSessionOptions):
     voice: str | None = Field(default=None, min_length=1)
+    multi_voice: bool | None = None
 
 
 RealtimeEvent = RealtimeAudioInputEvent[SessionOptions]

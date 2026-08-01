@@ -87,12 +87,11 @@ async def _forward_client_audio(  # noqa: C901
                 {'type': 'error', 'message': f'invalid event: {error.errors(include_url=False)}'},
             )
             continue
-        if (
-            event.type == 'session.update'
-            and event.session is not None
-            and event.session.voice is not None
-        ):
-            utterance.select_voice(event.session.voice)
+        if event.type == 'session.update' and event.session is not None:
+            if event.session.voice is not None:
+                utterance.select_voice(event.session.voice)
+            if event.session.multi_voice is not None:
+                utterance.set_multi_voice(enabled=event.session.multi_voice)
         await stt.send(event.model_dump_json(exclude_none=True))
         if event.type == 'input_audio_buffer.append' and event.audio:
             padding = len(event.audio) - len(event.audio.rstrip('='))

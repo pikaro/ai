@@ -225,6 +225,7 @@ class TtsProtocol(Protocol):
         text_stream: AsyncIterator[str],
         *,
         voice: str | None = None,
+        multi_voice: bool = True,
     ) -> AsyncIterator[tuple[bytes, AudioFormat]]: ...
 
 
@@ -344,6 +345,7 @@ class AssistantUtterance:
         self.first_delta_at: float | None = None
         self.final_transcript_at: float | None = None
         self.voice: str | None = None
+        self.multi_voice_enabled = True
         self.slot: int | None = None
         self.last_warmed_prompt: str | None = None
         self.last_tool_names: tuple[str, ...] = ()
@@ -365,6 +367,16 @@ class AssistantUtterance:
             },
         )
 
+    def set_multi_voice(self, *, enabled: bool) -> None:
+        self.multi_voice_enabled = enabled
+        LOGGER.info(
+            'Assistant multi-voice mode selected',
+            extra={
+                'event_id': 'ID_assistant_multi_voice_selected',
+                'enabled': enabled,
+            },
+        )
+
     def note_audio(self, byte_count: int) -> None:
         if self.first_audio_at is None:
             self.first_audio_at = time.perf_counter()
@@ -380,6 +392,8 @@ class AssistantUtterance:
             )
 
     def _active_system_prompt(self) -> str:
+        if not self.multi_voice_enabled:
+            return self.system_prompt.read()
         return system_prompt_with_multi_voice(
             self.system_prompt.read(),
             self.settings.multi_voice,
@@ -791,7 +805,11 @@ class AssistantUtterance:
     ) -> None:
         expected_format: AudioFormat | None = None
         first_audio = True
-        async for chunk, audio_format in self.tts.stream(text_stream, voice=self.voice):
+        async for chunk, audio_format in self.tts.stream(
+            text_stream,
+            voice=self.voice,
+            multi_voice=self.multi_voice_enabled,
+        ):
             if expected_format is None:
                 expected_format = audio_format
             elif audio_format != expected_format:

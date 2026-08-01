@@ -153,8 +153,15 @@ One WebSocket carries one utterance. It accepts the same `session.update`,
 also accepts an optional `session.voice` in `session.update`; the value is
 substituted for the configured default character's voice for that response.
 Omitting it uses that character's configured voice, while `"voice": "default"`
-explicitly selects the TTS service default. The assistant forwards STT
+explicitly selects the TTS service default. Multi-voice mode is enabled when
+`session.multi_voice` is omitted. Sending `"multi_voice": false` skips the
+multi-voice prompt instructions and tagged header, and forwards `session.voice`
+through the ordinary single-voice TTS request path. The assistant forwards STT
 transcription events and then emits:
+
+```json
+{"type":"session.update","session":{"voice":"bender","multi_voice":false}}
+```
 
 - `response.created`
 - `response.text.delta` and `response.text.done`
@@ -237,15 +244,15 @@ multi_voice:
     bandit: {voice: bender, marker: "¶"}
 ```
 
-The prompt suffix explains each available character and tells the model to
-start every spoken response with the default marker, then emit another raw
-marker whenever the speaker changes. It also tells the model not to produce the
-header. The assistant prepends `<multi>` and one `<char>` declaration per
-configured character to every TTS pipeline text stream. A session voice, when
-present, is substituted into the default character declaration. The TTS parser
-therefore receives the complete validated format while the LLM spends output
-tokens only on speaker markers. Generated text events retain the markers; only
-TTS removes them from spoken text.
+The prompt suffix explains each available character and tells the model to emit
+a raw marker only when the speaker changes. The assistant selects
+`default_character` itself by appending that character's marker to the generated
+`<multi>` and `<char>` header, so a normal one-character response costs the LLM
+no marker token. A session voice, when present, is substituted into the default
+character declaration. The TTS parser therefore receives an explicit initial
+speaker while the LLM spends output tokens only on actual speaker changes.
+Generated text events retain model-generated change markers; the automatically
+inserted initial marker exists only in the TTS stream.
 
 The assistant retires idle pooled upstream HTTP connections after four seconds,
 before the five-second idle timeout used by Uvicorn and llama.cpp. This avoids

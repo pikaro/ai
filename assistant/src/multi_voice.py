@@ -31,23 +31,28 @@ def system_prompt_with_multi_voice(base_prompt: str, config: MultiVoiceConfig) -
     """Append stable marker instructions while leaving the editable prompt untouched."""
     character_lines = [
         (
-            f'- {character.marker} means {name} using voice {character.voice}'
+            f'- {character.marker} means {name} using voice {character.voice}.'
             + (' and is the default character' if name == config.default_character else '')
+            + (character.description or '')
         )
         for name, character in config.characters.items()
     ]
+    default_character = config.default_character
     default_marker = config.characters[config.default_character].marker
     usage = ''.join(
         (
-            f'Start every spoken answer with {default_marker}. Insert another marker exactly ',
-            'when that character starts speaking. Write markers directly, without angle brackets. ',
+            f'Unmarked spoken text starts as {default_character}; do not emit {default_marker} ',
+            'at the beginning of an answer because the assistant selects it automatically. Emit a ',
+            'marker only when changing characters, including ',
+            f'{default_marker} when changing back to {default_character}. Write markers directly, ',
+            'without angle brackets. ',
             'Do not emit <multi> or <char> declarations; the assistant adds them automatically. ',
             'A JSON tool request is not a spoken answer and must not contain a voice marker.',
         ),
     )
     instructions = '\n'.join(
         (
-            'For every spoken answer, use the following voice-character markers:',
+            'To select a voice, use the following voice-character markers:',
             *character_lines,
             usage,
         ),

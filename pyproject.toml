@@ -39,7 +39,7 @@ venvPath                            = "."
 
 reportConstantRedefinition          = "error"
 reportDeprecated                    = "warning"
-reportImplicitStringConcatenation   = "warning"
+reportImplicitStringConcatenation   = false
 reportInconsistentConstructor       = "warning"
 reportMissingSuperCall              = false
 reportMissingTypeArgument           = "warning"

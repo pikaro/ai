@@ -426,6 +426,45 @@ class LlmClient:
             metrics.LLM_CACHE_REUSE_RATIO.observe(min(1.0, cached_tokens / prompt_tokens))
 
 
+def _frame_initial_multi_voice_delta(
+    text: str,
+    default_marker: str,
+    voice_markers: frozenset[str],
+) -> str | None:
+    meaningful_text = text.lstrip()
+    if not meaningful_text:
+        return None
+    if meaningful_text[0] in voice_markers or meaningful_text.startswith('<'):
+        return text
+    return f'{default_marker}{text}'
+
+
+async def _frame_multi_voice_text_stream(
+    text_stream: AsyncIterator[str],
+    default_marker: str | None,
+    voice_markers: frozenset[str],
+) -> AsyncGenerator[str, None]:
+    speaker_selected = default_marker is None
+    pending_prefix = ''
+    async for delta in text_stream:
+        if not delta:
+            continue
+        if speaker_selected:
+            yield delta
+            continue
+        pending_prefix += delta
+        framed_prefix = _frame_initial_multi_voice_delta(
+            pending_prefix,
+            default_marker or '',
+            voice_markers,
+        )
+        if framed_prefix is None:
+            continue
+        speaker_selected = True
+        pending_prefix = ''
+        yield framed_prefix
+
+
 class TtsClient:
     def __init__(self, client: httpx.AsyncClient, settings: Settings) -> None:
         self.client = client
@@ -436,6 +475,7 @@ class TtsClient:
         text_stream: AsyncIterator[str],
         *,
         voice: str | None = None,
+        multi_voice: bool = True,
     ) -> AsyncGenerator[tuple[bytes, AudioFormat]]:
         started = time.perf_counter()
         outcome = 'success'
@@ -455,15 +495,35 @@ class TtsClient:
                     PipelineSessionRequest(
                         type='session.start',
                         model=self.settings.tts_model,
+                        voice=None if multi_voice else voice,
                     ).model_dump_json(exclude_none=True),
                 )
                 sender = asyncio.create_task(
                     self._send_text(
                         websocket,
                         text_stream,
-                        header=multi_voice_header(
-                            self.settings.multi_voice,
-                            selected_voice=voice,
+                        header=(
+                            multi_voice_header(
+                                self.settings.multi_voice,
+                                selected_voice=voice,
+                            )
+                            if multi_voice
+                            else None
+                        ),
+                        default_marker=(
+                            self.settings.multi_voice.characters[
+                                self.settings.multi_voice.default_character
+                            ].marker
+                            if multi_voice
+                            else None
+                        ),
+                        voice_markers=(
+                            frozenset(
+                                character.marker
+                                for character in self.settings.multi_voice.characters.values()
+                            )
+                            if multi_voice
+                            else frozenset()
                         ),
                     ),
                 )
@@ -519,23 +579,29 @@ class TtsClient:
         websocket: ClientConnection,
         text_stream: AsyncIterator[str],
         *,
-        header: str,
+        header: str | None,
+        default_marker: str | None,
+        voice_markers: frozenset[str],
     ) -> None:
         try:
-            await websocket.send(
-                PipelineTextDelta(
-                    type='input_text.delta',
-                    delta=header,
-                ).model_dump_json(),
-            )
-            async for delta in text_stream:
-                if delta:
-                    await websocket.send(
-                        PipelineTextDelta(
-                            type='input_text.delta',
-                            delta=delta,
-                        ).model_dump_json(),
-                    )
+            if header is not None:
+                await websocket.send(
+                    PipelineTextDelta(
+                        type='input_text.delta',
+                        delta=header,
+                    ).model_dump_json(),
+                )
+            async for outgoing_delta in _frame_multi_voice_text_stream(
+                text_stream,
+                default_marker,
+                voice_markers,
+            ):
+                await websocket.send(
+                    PipelineTextDelta(
+                        type='input_text.delta',
+                        delta=outgoing_delta,
+                    ).model_dump_json(),
+                )
             await websocket.send(
                 PipelineTextDone(type='input_text.done').model_dump_json(),
             )
