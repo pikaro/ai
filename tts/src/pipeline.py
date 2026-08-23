@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -192,10 +193,19 @@ class SmartChunkKnowledge:
         'seconds_per_word',
     )
 
-    def __init__(self, settings: Settings, voice: str) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        voice: str,
+        *,
+        model_scope: str | None = None,
+    ) -> None:
         self.settings = settings
         self.voice = voice
         directory = settings.data_directory / '.pipeline-knowledge'
+        if model_scope is not None:
+            model_key = hashlib.sha256(model_scope.encode()).hexdigest()[:16]
+            directory /= f'model-{model_key}'
         self.voice_path = directory / f'voice-{voice}.json'
         self.llm_path = directory / f'llm-{settings.pipeline_smart_chunk_llm_id}.json'
         self.voice_stats = {key: _RunningStats() for key in self._VOICE_KEYS}
@@ -1453,6 +1463,7 @@ class PcmPipeline:
                 yield self._capture(output)
         completion_fields: dict[str, object] = {
             'transport': self.transport,
+            'model': self.runtime.settings.model_id,
             'voice': self.voice,
             'characters': len(text),
             'boundary': boundary,

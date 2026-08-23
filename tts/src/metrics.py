@@ -1,8 +1,20 @@
 from prometheus_client import Counter, Gauge, Histogram
 
-MODEL_READY = Gauge('tts_model_ready', 'Whether the TTS model and voice are loaded and ready')
-MODEL_LOAD_SECONDS = Gauge('tts_model_load_seconds', 'Time spent loading the TTS model')
-VOICE_LOAD_SECONDS = Gauge('tts_voice_load_seconds', 'Time spent loading the TTS voice')
+MODEL_READY = Gauge(
+    'tts_model_ready',
+    'Whether the TTS model and default voice are loaded and ready',
+    ['model'],
+)
+MODEL_LOAD_SECONDS = Gauge(
+    'tts_model_load_seconds',
+    'Time spent loading the TTS model',
+    ['model'],
+)
+VOICE_LOAD_SECONDS = Gauge(
+    'tts_voice_load_seconds',
+    'Time spent loading a TTS voice',
+    ['model'],
+)
 ACTIVE_REQUESTS = Gauge('tts_active_requests', 'Active TTS inference requests')
 BUSY_REJECTIONS = Counter(
     'tts_busy_rejections_total',

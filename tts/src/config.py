@@ -1,11 +1,20 @@
 import tempfile
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from service_contracts.tts import MODEL_ID
+
+
+class AdditionalModelSettings(BaseModel):
+    """Configure one additional preloaded Pocket TTS language model."""
+
+    model_config = ConfigDict(extra='forbid', frozen=True)
+
+    language: str = Field(min_length=1)
+    voice: str = Field(min_length=1)
 
 
 class Settings(BaseSettings):
@@ -24,6 +33,7 @@ class Settings(BaseSettings):
     )
     language: str = 'english'
     voice: str = 'alba'
+    additional_models: dict[str, AdditionalModelSettings] = Field(default_factory=dict)
     data_directory: Path = Path('/data')
     torch_threads: int = Field(default=2, ge=1)
     maximum_input_characters: int = Field(default=50_000, ge=1)
@@ -61,3 +71,14 @@ class Settings(BaseSettings):
         le=65_535,
         validation_alias='LISTEN_PORT',
     )
+
+    @model_validator(mode='after')
+    def validate_additional_models(self) -> Self:
+        if self.model_id in self.additional_models:
+            message = 'additional_models must not repeat the default model_id'
+            raise ValueError(message)
+        empty_model_ids = [model_id for model_id in self.additional_models if not model_id.strip()]
+        if empty_model_ids:
+            message = 'additional_models keys must be non-empty model ids'
+            raise ValueError(message)
+        return self

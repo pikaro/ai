@@ -106,7 +106,9 @@ class PocketTtsEngine:
             self.voice_states = replacement_voices
             self.voice_load_seconds = replacement_voice_load_seconds
             if voice_changed:
-                VOICE_LOAD_SECONDS.set(self.voice_load_seconds)
+                VOICE_LOAD_SECONDS.labels(model=self.settings.model_id).set(
+                    self.voice_load_seconds,
+                )
 
     def load(self) -> None:
         LOGGER.info(
@@ -128,13 +130,14 @@ class PocketTtsEngine:
         voice_state = model.get_state_for_audio_prompt(voice_source)
         self.voice_states = {self.settings.voice: voice_state}
         self.voice_load_seconds = time.perf_counter() - started
-        MODEL_LOAD_SECONDS.set(self.load_seconds)
-        VOICE_LOAD_SECONDS.set(self.voice_load_seconds)
-        MODEL_READY.set(1)
+        MODEL_LOAD_SECONDS.labels(model=self.settings.model_id).set(self.load_seconds)
+        VOICE_LOAD_SECONDS.labels(model=self.settings.model_id).set(self.voice_load_seconds)
+        MODEL_READY.labels(model=self.settings.model_id).set(1)
         LOGGER.info(
             'TTS model ready',
             extra={
                 'event_id': 'ID_tts_model_ready',
+                'model': self.settings.model_id,
                 'duration_seconds': self.load_seconds,
                 'voice': voice_source,
                 'voice_load_seconds': self.voice_load_seconds,
@@ -142,7 +145,7 @@ class PocketTtsEngine:
         )
 
     def close(self) -> None:
-        MODEL_READY.set(0)
+        MODEL_READY.labels(model=self.settings.model_id).set(0)
         self.voice_states.clear()
         self.model = None
 
@@ -173,11 +176,14 @@ class PocketTtsEngine:
                 raise VoiceUnavailableError(voice) from error
             self.voice_load_seconds = time.perf_counter() - started
             self.voice_states[voice] = voice_state
-            VOICE_LOAD_SECONDS.set(self.voice_load_seconds)
+            VOICE_LOAD_SECONDS.labels(model=self.settings.model_id).set(
+                self.voice_load_seconds,
+            )
             LOGGER.info(
                 'TTS voice loaded',
                 extra={
                     'event_id': 'ID_tts_voice_loaded',
+                    'model': self.settings.model_id,
                     'voice': voice,
                     'duration_seconds': self.voice_load_seconds,
                     'cached_voices': len(self.voice_states),

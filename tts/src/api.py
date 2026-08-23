@@ -92,7 +92,9 @@ if TYPE_CHECKING:
     from tts.src.streaming import IncrementalPipelineSession, IncrementalTaggedPipelineSession
 
 LOGGER = logging.getLogger('tts')
-RESTART_REQUIRED_SETTINGS = frozenset({'model_id', 'language', 'listen_port'})
+RESTART_REQUIRED_SETTINGS = frozenset(
+    {'model_id', 'language', 'additional_models', 'listen_port'},
+)
 
 
 class _ClosingStreamingResponse(StreamingResponse):
@@ -182,8 +184,9 @@ def _observe_request(
         REALTIME_FACTOR.observe(wall_seconds / audio_seconds)
 
 
-def _stream_speech(  # noqa: C901
+def _stream_speech(  # noqa: C901, PLR0913
     runtime: TtsRuntime,
+    model: str,
     text: str,
     voice: str,
     started: float,
@@ -196,11 +199,11 @@ def _stream_speech(  # noqa: C901
     sample_rate = 0
     chunks: Generator[bytes, None, None] | None = None
     try:
-        sample_rate = runtime.sample_rate()
+        sample_rate = runtime.sample_rate(model)
         chunks = (
-            runtime.stream_pipeline_pcm(text, voice, transport='http')
+            runtime.stream_pipeline_pcm(text, voice, model=model, transport='http')
             if pipeline
-            else runtime.stream_pcm(text, voice)
+            else runtime.stream_pcm(text, voice, model=model)
         )
         for chunk in chunks:
             if first_audio:
@@ -226,6 +229,7 @@ def _stream_speech(  # noqa: C901
                 'TTS HTTP pipeline finished',
                 extra={
                     'event_id': 'ID_tts_pipeline_http_finished',
+                    'model': model,
                     'outcome': outcome,
                     'audio_bytes': output_bytes,
                 },
@@ -234,6 +238,7 @@ def _stream_speech(  # noqa: C901
 
 def _stream_multi_speaker_speech(  # noqa: C901
     runtime: TtsRuntime,
+    model: str,
     turns: list[SpeakerTurn],
     started: float,
 ) -> Generator[bytes, None, None]:
@@ -243,8 +248,8 @@ def _stream_multi_speaker_speech(  # noqa: C901
     sample_rate = 0
     chunks: Generator[bytes, None, None] | None = None
     try:
-        sample_rate = runtime.sample_rate()
-        chunks = runtime.stream_multi_speaker_pcm(turns)
+        sample_rate = runtime.sample_rate(model)
+        chunks = runtime.stream_multi_speaker_pcm(turns, model=model)
         for chunk in chunks:
             if first_audio:
                 first_audio = False
@@ -271,6 +276,7 @@ def _stream_multi_speaker_speech(  # noqa: C901
             'TTS multi-speaker stream finished',
             extra={
                 'event_id': 'ID_tts_multi_speaker_finished',
+                'model': model,
                 'response_format': 'pcm',
                 'outcome': outcome,
                 'audio_bytes': output_bytes,
@@ -338,6 +344,7 @@ def _speech_response(  # noqa: C901, PLR0912
     outcome = 'success'
     try:
         prepared = runtime.prepare_speech(_speech_command(speech_request))
+        model = prepared.model
         text = prepared.text
         voice = prepared.voice
         if LOGGER.isEnabledFor(logging.DEBUG):
@@ -347,6 +354,7 @@ def _speech_response(  # noqa: C901, PLR0912
                     'event_id': 'ID_tts_synthesis_requested',
                     'response_format': speech_request.response_format,
                     'pipeline': pipeline,
+                    'model': model,
                     'characters': len(text),
                     'voice': voice,
                     'text': text,
@@ -359,23 +367,24 @@ def _speech_response(  # noqa: C901, PLR0912
                     'event_id': 'ID_tts_synthesis_requested',
                     'response_format': speech_request.response_format,
                     'pipeline': pipeline,
+                    'model': model,
                     'characters': len(text),
                     'voice': voice,
                 },
             )
         if speech_request.response_format == 'pcm':
             response = _ClosingStreamingResponse(
-                _stream_speech(runtime, text, voice, started, pipeline=pipeline),
+                _stream_speech(runtime, model, text, voice, started, pipeline=pipeline),
                 media_type='application/octet-stream',
-                headers=runtime.pcm_headers(),
+                headers=runtime.pcm_headers(model),
             )
             stream_response = True
             return response
         if pipeline:
-            wav, pcm_bytes = runtime.generate_pipeline_wav(text, voice)
+            wav, pcm_bytes = runtime.generate_pipeline_wav(text, voice, model=model)
             PIPELINE_REQUESTS.labels(transport='http', outcome=outcome).inc()
         else:
-            wav = runtime.generate_wav(text, voice)
+            wav = runtime.generate_wav(text, voice, model=model)
             with wave.open(io.BytesIO(wav), 'rb') as wav_file:
                 pcm_bytes = (
                     wav_file.getnframes() * wav_file.getnchannels() * wav_file.getsampwidth()
@@ -388,7 +397,7 @@ def _speech_response(  # noqa: C901, PLR0912
                 'audio_bytes': len(wav),
             },
         )
-        sample_rate = runtime.sample_rate()
+        sample_rate = runtime.sample_rate(model)
         response = Response(wav, media_type='audio/wav')
         _observe_request('wav', outcome, started, pcm_bytes, sample_rate)
         request_observed = True
@@ -425,6 +434,7 @@ def _multi_speaker_response(  # noqa: C901
     try:
         turns = runtime.prepare_multi_speaker_turns(command)
         request_metadata = {
+            'model': command.model,
             'response_format': response_format,
             'characters': sum(len(turn.text) for turn in turns),
             'speakers': len({turn.speaker for turn in turns}),
@@ -460,14 +470,14 @@ def _multi_speaker_response(  # noqa: C901
             )
         if response_format == 'pcm':
             response = _ClosingStreamingResponse(
-                _stream_multi_speaker_speech(runtime, turns, started),
+                _stream_multi_speaker_speech(runtime, command.model, turns, started),
                 media_type='application/octet-stream',
-                headers=runtime.pcm_headers(),
+                headers=runtime.pcm_headers(command.model),
             )
             stream_response = True
             return response
 
-        wav, pcm_bytes = runtime.generate_multi_speaker_wav(turns)
+        wav, pcm_bytes = runtime.generate_multi_speaker_wav(turns, model=command.model)
         PIPELINE_REQUESTS.labels(
             transport='http_multi_speaker',
             outcome=outcome,
@@ -482,7 +492,7 @@ def _multi_speaker_response(  # noqa: C901
                 'turn_count': len(turns),
             },
         )
-        sample_rate = runtime.sample_rate()
+        sample_rate = runtime.sample_rate(command.model)
         response = Response(wav, media_type='audio/wav')
         _observe_request('wav', outcome, started, pcm_bytes, sample_rate)
         request_observed = True
@@ -586,17 +596,20 @@ async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
             runtime.settings.pipeline_idle_timeout_seconds,
         )
         session = PipelineSessionRequest.model_validate_json(session_raw)
-        runtime.validate_options(session.model, session.speed)
+        _ = runtime.validate_options(session.model, session.speed)
         await websocket.send_json(
             PipelineSessionReady(
-                sample_rate=runtime.sample_rate(),
+                sample_rate=runtime.sample_rate(session.model),
                 sample_width=2,
                 channels=1,
             ).model_dump(),
         )
         LOGGER.info(
             'TTS pipeline WebSocket started',
-            extra={'event_id': 'ID_tts_pipeline_websocket_started'},
+            extra={
+                'event_id': 'ID_tts_pipeline_websocket_started',
+                'model': session.model,
+            },
         )
 
         input_characters = 0
@@ -656,6 +669,7 @@ async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
                     pipeline = await asyncio.to_thread(
                         runtime.create_incremental_pipeline,
                         session.voice,
+                        model=session.model,
                     )
                     sender = _WebSocketPcmSender(websocket, pipeline.sample_rate, started)
                     await sender.send(
@@ -695,11 +709,13 @@ async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
                         tagged_input = True
                         pipeline = await asyncio.to_thread(
                             runtime.create_incremental_tagged_pipeline,
+                            model=session.model,
                         )
                     else:
                         pipeline = await asyncio.to_thread(
                             runtime.create_incremental_pipeline,
                             session.voice,
+                            model=session.model,
                         )
                     sender = _WebSocketPcmSender(websocket, pipeline.sample_rate, started)
                     event.delta = classification_buffer
@@ -734,6 +750,7 @@ async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
             'TTS pipeline WebSocket completed',
             extra={
                 'event_id': 'ID_tts_pipeline_websocket_completed',
+                'model': session.model,
                 'characters': input_characters,
                 'audio_bytes': sender.output_bytes,
             },
@@ -784,7 +801,8 @@ async def _stream_pipeline_websocket(  # noqa: C901, PLR0912, PLR0915
         if active_request:
             ACTIVE_REQUESTS.dec()
             output_bytes = sender.output_bytes if sender is not None else 0
-            _observe_request('pcm', outcome, started, output_bytes, runtime.sample_rate())
+            sample_rate = sender.sample_rate if sender is not None else 1
+            _observe_request('pcm', outcome, started, output_bytes, sample_rate)
         PIPELINE_REQUESTS.labels(transport='websocket', outcome=outcome).inc()
 
 
@@ -808,7 +826,7 @@ async def ready(request: Request) -> HealthResponse:
 @app.get('/v1/models', response_model=ModelList)
 async def models(request: Request) -> ModelList:
     runtime = _runtime(request)
-    return ModelList(data=[ModelDescription(id=runtime.settings.model_id)])
+    return ModelList(data=[ModelDescription(id=model_id) for model_id in runtime.model_ids])
 
 
 @app.get('/config', response_model=Settings, response_model_by_alias=False)

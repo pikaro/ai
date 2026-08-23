@@ -36,24 +36,119 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger('tts')
 
 
-class TtsRuntime:
-    def __init__(self, settings: Settings) -> None:
-        self.operations = ExclusiveOperationGate()
-        self.engine = PocketTtsEngine(settings)
-        self._smart_chunk_knowledge_cache: dict[
-            tuple[Path, str, str, str],
-            SmartChunkKnowledge,
-        ] = {}
+class _ModelRuntime:
+    """Bind pipeline operations to one preloaded model for a complete request."""
+
+    def __init__(self, runtime: TtsRuntime, engine: PocketTtsEngine) -> None:
+        self._runtime = runtime
+        self.engine = engine
 
     @property
     def settings(self) -> Settings:
         return self.engine.settings
 
+    def sample_rate(self) -> int:
+        return self.engine.sample_rate()
+
+    def prepare_voice(self, requested_voice: str | None) -> str:
+        return self.engine.prepare_voice(requested_voice)
+
+    def stream_model_pcm(self, text: str, voice: str) -> Generator[bytes, None, None]:
+        yield from self.engine.stream_pcm(text, voice)
+
+    def smart_chunk_knowledge(self, voice: str) -> SmartChunkKnowledge:
+        return self._runtime.smart_chunk_knowledge(
+            voice,
+            model=self.settings.model_id,
+        )
+
+    def open_latest_wav_capture(self, sample_rate: int) -> AtomicWavWriter | None:
+        return self._runtime.open_latest_wav_capture(sample_rate)
+
+    def write_latest_wav_chunk(
+        self,
+        capture: AtomicWavWriter | None,
+        chunk: bytes,
+    ) -> AtomicWavWriter | None:
+        return self._runtime.write_latest_wav_chunk(capture, chunk)
+
+    def finish_latest_wav_capture(
+        self,
+        capture: AtomicWavWriter | None,
+        *,
+        completed: bool,
+        pcm_bytes: int,
+    ) -> None:
+        self._runtime.finish_latest_wav_capture(
+            capture,
+            completed=completed,
+            pcm_bytes=pcm_bytes,
+        )
+
+
+class TtsRuntime:
+    def __init__(self, settings: Settings) -> None:
+        self.operations = ExclusiveOperationGate()
+        self._settings = settings
+        self._models = {
+            model_id: _ModelRuntime(self, PocketTtsEngine(model_settings))
+            for model_id, model_settings in self._configured_model_settings(settings).items()
+        }
+        # Preserve the existing default-engine access used by focused engine tests and callers.
+        self.engine = self._models[settings.model_id].engine
+        self._smart_chunk_knowledge_cache: dict[
+            tuple[Path, str, str, str],
+            SmartChunkKnowledge,
+        ] = {}
+
+    @staticmethod
+    def _configured_model_settings(settings: Settings) -> dict[str, Settings]:
+        configured = {settings.model_id: settings}
+        configured.update(
+            {
+                model_id: settings.model_copy(
+                    update={
+                        'model_id': model_id,
+                        'language': model.language,
+                        'voice': model.voice,
+                        'additional_models': {},
+                    },
+                )
+                for model_id, model in settings.additional_models.items()
+            },
+        )
+        return configured
+
+    @property
+    def settings(self) -> Settings:
+        return self._settings
+
+    @property
+    def model_ids(self) -> tuple[str, ...]:
+        return tuple(self._models)
+
     def apply_settings(self, settings: Settings) -> None:
-        self.engine.apply_settings(settings)
+        replacements = self._configured_model_settings(settings)
+        previous = {model_id: model.engine.settings for model_id, model in self._models.items()}
+        applied: list[str] = []
+        try:
+            for model_id, model in self._models.items():
+                model.engine.apply_settings(replacements[model_id])
+                applied.append(model_id)
+        except BaseException:
+            for model_id in reversed(applied):
+                self._models[model_id].engine.apply_settings(previous[model_id])
+            raise
+        self._settings = settings
 
     def load(self) -> None:
-        self.engine.load()
+        try:
+            for model in self._models.values():
+                model.engine.load()
+        except BaseException:
+            for model in self._models.values():
+                model.engine.close()
+            raise
 
     def save_voice(
         self,
@@ -73,7 +168,8 @@ class TtsRuntime:
                 'replaced': stored.replaced,
             },
         )
-        self.engine.invalidate_voice(stored.name)
+        for model in self._models.values():
+            model.engine.invalidate_voice(stored.name)
         return stored
 
     def list_voices(self) -> list[StoredVoice]:
@@ -85,29 +181,44 @@ class TtsRuntime:
     def close(self) -> None:
         for knowledge in self._smart_chunk_knowledge_cache.values():
             knowledge.save(force=True)
-        self.engine.close()
+        for model in self._models.values():
+            model.engine.close()
 
     def status(self) -> RuntimeStatus:
         return self.engine.status()
 
-    def prepare_voice(self, requested_voice: str | None) -> str:
-        return self.engine.prepare_voice(requested_voice)
+    def _model(self, model: str | None = None) -> _ModelRuntime:
+        selected = self.settings.model_id if model is None else model
+        try:
+            return self._models[selected]
+        except KeyError as error:
+            raise ModelMismatchError(self.model_ids, selected) from error
+
+    def prepare_voice(self, requested_voice: str | None, *, model: str | None = None) -> str:
+        return self._model(model).prepare_voice(requested_voice)
 
     def create_incremental_pipeline(
         self,
         requested_voice: str | None,
+        *,
+        model: str | None = None,
     ) -> IncrementalPipelineSession:
+        selected = self._model(model)
         return IncrementalPipelineSession(
-            self,
-            self.prepare_voice(requested_voice),
+            selected,
+            selected.prepare_voice(requested_voice),
         )
 
-    def create_incremental_tagged_pipeline(self) -> IncrementalTaggedPipelineSession:
-        return IncrementalTaggedPipelineSession(self)
+    def create_incremental_tagged_pipeline(
+        self,
+        *,
+        model: str | None = None,
+    ) -> IncrementalTaggedPipelineSession:
+        return IncrementalTaggedPipelineSession(self._model(model))
 
     def validate_speech(self, command: SpeechCommand) -> str:
         text = command.text.strip()
-        self.validate_options(command.model, command.speed)
+        _ = self.validate_options(command.model, command.speed)
         if not text:
             raise EmptyInputError
         if len(text) > self.settings.maximum_input_characters:
@@ -116,14 +227,18 @@ class TtsRuntime:
 
     def prepare_speech(self, command: SpeechCommand) -> PreparedSpeech:
         text = self.validate_speech(command)
-        return PreparedSpeech(text=text, voice=self.prepare_voice(command.voice))
+        return PreparedSpeech(
+            model=command.model,
+            text=text,
+            voice=self.prepare_voice(command.voice, model=command.model),
+        )
 
     def prepare_multi_speaker_turns(  # noqa: C901
         self,
         command: MultiSpeakerCommand,
     ) -> list[SpeakerTurn]:
         """Validate structured input and preload every voice before streaming."""
-        self.validate_options(command.model, command.speed)
+        selected = self.validate_options(command.model, command.speed)
         normalized_segments: list[tuple[str, str]] = []
         total_characters = 0
         for segment in command.segments:
@@ -145,35 +260,50 @@ class TtsRuntime:
             else:
                 normalized_segments.append((segment.speaker, text))
 
-        voices = {speaker: self.prepare_voice(voice) for speaker, voice in command.speakers.items()}
+        voices = {
+            speaker: selected.prepare_voice(voice) for speaker, voice in command.speakers.items()
+        }
         return [
             SpeakerTurn(speaker, voices[speaker], text) for speaker, text in normalized_segments
         ]
 
-    def validate_options(self, model: str, speed: float) -> None:
-        if model != self.settings.model_id:
-            raise ModelMismatchError(self.settings.model_id, model)
+    def validate_options(self, model: str, speed: float) -> _ModelRuntime:
+        selected = self._model(model)
         if speed != 1.0:
             raise UnsupportedSpeedError
+        return selected
 
-    def generate_wav(self, text: str, voice: str) -> bytes:
-        wav = self.engine.generate_wav(text, voice)
+    def generate_wav(self, text: str, voice: str, *, model: str | None = None) -> bytes:
+        wav = self._model(model).engine.generate_wav(text, voice)
         if self.settings.save_latest_wav:
             self._save_latest_wav_response(wav)
         return wav
 
-    def stream_model_pcm(self, text: str, voice: str) -> Generator[bytes, None, None]:
+    def stream_model_pcm(
+        self,
+        text: str,
+        voice: str,
+        *,
+        model: str | None = None,
+    ) -> Generator[bytes, None, None]:
         """Stream raw model PCM without request-level recording semantics."""
-        yield from self.engine.stream_pcm(text, voice)
+        yield from self._model(model).stream_model_pcm(text, voice)
 
-    def stream_pcm(self, text: str, voice: str) -> Generator[bytes, None, None]:
+    def stream_pcm(
+        self,
+        text: str,
+        voice: str,
+        *,
+        model: str | None = None,
+    ) -> Generator[bytes, None, None]:
+        selected = self._model(model)
         output_bytes = 0
         capture: AtomicWavWriter | None = None
         completed = False
         if self.settings.save_latest_wav:
-            capture = self.open_latest_wav_capture(self.sample_rate())
+            capture = self.open_latest_wav_capture(selected.sample_rate())
         try:
-            for chunk in self.stream_model_pcm(text, voice):
+            for chunk in selected.stream_model_pcm(text, voice):
                 output_bytes += len(chunk)
                 yield chunk
                 capture = self.write_latest_wav_chunk(capture, chunk)
@@ -188,14 +318,29 @@ class TtsRuntime:
             'Speech synthesis completed',
             extra={
                 'event_id': 'ID_tts_synthesis_completed',
+                'model': selected.settings.model_id,
                 'response_format': 'pcm',
                 'audio_bytes': output_bytes,
             },
         )
 
-    def generate_pipeline_wav(self, text: str, voice: str) -> tuple[bytes, int]:
-        pcm = b''.join(self.stream_pipeline_pcm(text, voice, capture_latest=False))
-        wav = wav_from_pcm(self.sample_rate(), pcm)
+    def generate_pipeline_wav(
+        self,
+        text: str,
+        voice: str,
+        *,
+        model: str | None = None,
+    ) -> tuple[bytes, int]:
+        selected = self._model(model)
+        pcm = b''.join(
+            self.stream_pipeline_pcm(
+                text,
+                voice,
+                model=selected.settings.model_id,
+                capture_latest=False,
+            ),
+        )
+        wav = wav_from_pcm(selected.sample_rate(), pcm)
         if self.settings.save_latest_wav:
             self._save_latest_wav_response(wav)
         return wav, len(pcm)
@@ -203,9 +348,18 @@ class TtsRuntime:
     def generate_multi_speaker_wav(
         self,
         turns: list[SpeakerTurn],
+        *,
+        model: str | None = None,
     ) -> tuple[bytes, int]:
-        pcm = b''.join(self.stream_multi_speaker_pcm(turns, capture_latest=False))
-        wav = wav_from_pcm(self.sample_rate(), pcm)
+        selected = self._model(model)
+        pcm = b''.join(
+            self.stream_multi_speaker_pcm(
+                turns,
+                model=selected.settings.model_id,
+                capture_latest=False,
+            ),
+        )
+        wav = wav_from_pcm(selected.sample_rate(), pcm)
         if self.settings.save_latest_wav:
             self._save_latest_wav_response(wav)
         return wav, len(pcm)
@@ -215,16 +369,20 @@ class TtsRuntime:
         text: str,
         voice: str,
         *,
+        model: str | None = None,
         capture_latest: bool = True,
         transport: str = 'http',
     ) -> Generator[bytes, None, None]:
+        selected = self._model(model)
         segmenter = TextSegmenter(
-            self.settings.pipeline_sentence_terminators,
-            first_segment_comma_delimiter=self.settings.pipeline_first_segment_comma_delimiter,
+            selected.settings.pipeline_sentence_terminators,
+            first_segment_comma_delimiter=(
+                selected.settings.pipeline_first_segment_comma_delimiter
+            ),
         )
         segments = [*segmenter.append(text), *segmenter.finish()]
         pipeline = PcmPipeline(
-            self,
+            selected,
             voice,
             capture_latest=capture_latest,
             transport=transport,
@@ -246,10 +404,12 @@ class TtsRuntime:
         self,
         turns: list[SpeakerTurn],
         *,
+        model: str | None = None,
         capture_latest: bool = True,
     ) -> Generator[bytes, None, None]:
+        selected = self._model(model)
         pipeline = PcmPipeline(
-            self,
+            selected,
             turns[0].voice,
             capture_latest=capture_latest,
             transport='http_multi_speaker',
@@ -259,9 +419,9 @@ class TtsRuntime:
             for turn_index, turn in enumerate(turns):
                 pipeline.select_voice(turn.voice)
                 segmenter = TextSegmenter(
-                    self.settings.pipeline_sentence_terminators,
+                    selected.settings.pipeline_sentence_terminators,
                     first_segment_comma_delimiter=(
-                        self.settings.pipeline_first_segment_comma_delimiter
+                        selected.settings.pipeline_first_segment_comma_delimiter
                     ),
                 )
                 segments = [*segmenter.append(turn.text), *segmenter.finish()]
@@ -269,6 +429,7 @@ class TtsRuntime:
                     'TTS multi-speaker turn started',
                     extra={
                         'event_id': 'ID_tts_multi_speaker_turn_started',
+                        'model': selected.settings.model_id,
                         'turn_index': turn_index,
                         'voice': turn.voice,
                         'characters': len(turn.text),
@@ -393,8 +554,8 @@ class TtsRuntime:
             },
         )
 
-    def pcm_headers(self) -> dict[str, str]:
-        sample_rate = self.sample_rate()
+    def pcm_headers(self, model: str | None = None) -> dict[str, str]:
+        sample_rate = self.sample_rate(model)
         return {
             'X-Audio-Format': 'pcm_s16le',
             'X-Audio-Sample-Rate': str(sample_rate),
@@ -402,11 +563,16 @@ class TtsRuntime:
             'X-Audio-Channels': '1',
         }
 
-    def sample_rate(self) -> int:
-        return self.engine.sample_rate()
+    def sample_rate(self, model: str | None = None) -> int:
+        return self._model(model).sample_rate()
 
-    def smart_chunk_knowledge(self, voice: str) -> SmartChunkKnowledge:
-        settings = self.settings
+    def smart_chunk_knowledge(
+        self,
+        voice: str,
+        *,
+        model: str | None = None,
+    ) -> SmartChunkKnowledge:
+        settings = self._model(model).settings
         key = (
             settings.data_directory,
             settings.model_id,
@@ -415,7 +581,13 @@ class TtsRuntime:
         )
         knowledge = self._smart_chunk_knowledge_cache.get(key)
         if knowledge is None:
-            knowledge = SmartChunkKnowledge(settings, voice)
+            knowledge = SmartChunkKnowledge(
+                settings,
+                voice,
+                model_scope=(
+                    settings.model_id if settings.model_id != self.settings.model_id else None
+                ),
+            )
             self._smart_chunk_knowledge_cache[key] = knowledge
         else:
             knowledge.settings = settings

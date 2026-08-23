@@ -49,8 +49,15 @@ class VoiceUnavailableError(TtsServiceError):
 
 
 class ModelMismatchError(TtsServiceError):
-    def __init__(self, loaded_model: str, requested_model: str) -> None:
-        super().__init__(f'loaded model is {loaded_model}, not {requested_model}')
+    def __init__(self, loaded_models: str | Sequence[str], requested_model: str) -> None:
+        available = (loaded_models,) if isinstance(loaded_models, str) else tuple(loaded_models)
+        if len(available) == 1:
+            message = f'loaded model is {available[0]}, not {requested_model}'
+        else:
+            message = (
+                f'model {requested_model!r} is not loaded; loaded models are {", ".join(available)}'
+            )
+        super().__init__(message)
 
 
 class UnsupportedSpeedError(TtsServiceError):
@@ -93,6 +100,7 @@ class SpeechCommand:
 
 @dataclass(frozen=True, slots=True)
 class PreparedSpeech:
+    model: str
     text: str
     voice: str
 

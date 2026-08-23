@@ -23,6 +23,8 @@ returns `409 Conflict`; a concurrent realtime WebSocket is closed with code
 in place and return a `409` response listing the fields that require restart.
 These are `listen_port` for the assistant; `model_id`, `device`, and
 `listen_port` for STT; and `model_id`, `language`, and `listen_port` for TTS.
+Changing TTS `additional_models` also requires restart because every configured
+model is preloaded during service startup.
 Clearing a live STT `attention_context_size` also requires restart, while
 changing one explicit context pair to another is reloadable.
 
@@ -130,10 +132,10 @@ break an older assistant.
 
 The normal, complete-input pipeline, incremental pipeline, and multi-speaker
 TTS route adapters all delegate validation and lifecycle work to `TtsRuntime`.
-That runtime reuses one `PocketTtsEngine` and one set of direct-generator
-`PcmPipeline` primitives. This keeps API expansion independent of audio
-processing while preserving streaming flow control and avoiding additional
-queues or hot-path serialization.
+That runtime binds each request to one preloaded `PocketTtsEngine` and reuses
+one set of direct-generator `PcmPipeline` primitives. This keeps API expansion
+independent of audio processing while preserving streaming flow control and
+avoiding additional queues or hot-path serialization.
 
 ## Assistant
 
@@ -354,7 +356,23 @@ libraries.
 
 ## TTS
 
-`TtsRuntime` keeps one Pocket TTS model and reusable voice states in memory.
+`TtsRuntime` keeps every configured Pocket TTS model and its reusable voice
+states in memory. `model_id`, `language`, and `voice` define the default model.
+`additional_models` maps additional request-facing model IDs to their language
+and default voice. Model IDs are routing identifiers; Pocket TTS loads each
+entry through its configured language. For example:
+
+```sh
+export TTS_ADDITIONAL_MODELS='{
+  "kyutai/pocket-tts-german": {"language":"german","voice":"juergen"}
+}'
+```
+
+All models load before readiness succeeds and remain resident until shutdown.
+Requests select one with the existing `model` field, and `GET /v1/models` lists
+the complete loaded set. Set the assistant's `tts_model` configuration (or
+`ASSISTANT_TTS_MODEL`) to the desired ID for assistant speech.
+
 The TTS API serves:
 
 - `GET /health/live` and `GET /health/ready`
@@ -369,16 +387,17 @@ The TTS API serves:
 - compatibility endpoints `POST /synthesize` and `POST /synthesize_stream`
 
 `response_format=wav` returns a complete WAV file. `response_format=pcm` streams
-PCM16 and includes format headers. Pocket TTS is not thread-safe, so only one
-generation is admitted and concurrent requests receive `409 Conflict` instead
-of waiting on its model lock. Relevant settings use the `TTS_` prefix; defaults
-are declared in `tts/src/config.py`.
+PCM16 and includes format headers from the selected model. Pocket TTS is not
+thread-safe, so one service-wide gate admits only one generation across all
+loaded models; concurrent requests receive `409 Conflict` instead of waiting.
+Selecting another language never unloads or reloads a model. Relevant settings
+use the `TTS_` prefix; defaults are declared in `tts/src/config.py`.
 
 Speech requests select a voice with the OpenAI-compatible `voice` body field.
 An omitted value or `"voice": "default"` selects `TTS_VOICE`; a named value
 such as `"voice": "bender"` selects the corresponding uploaded voice or Pocket
-TTS canned voice. Voice states are loaded on first use and retained while the
-process is running, sharing the single base model.
+TTS canned voice. Voice states are loaded on first use and retained separately
+for each base model while the process is running.
 
 The server-side voice pipeline accepts one complete speech request at `POST
 /v1/audio/speech/pipeline`. The regular `POST /v1/audio/speech` enables the same
@@ -482,13 +501,15 @@ prediction wait.
 
 The predictor persists Welford running distributions beneath
 `TTS_DATA_DIRECTORY/.pipeline-knowledge`. `voice-<voice>.json` records audio
-seconds per character and word plus first-audio latency for the selected model
-and voice. `llm-<id>.json` records characters and words per sentence plus
-observed sentence-arrival rates. Writes are atomic and occur after eight new
-observations by default, with a final write during clean shutdown. Configure
-the source identity with `pipeline_smart_chunk_llm_id`. Until arrival timing has
-been observed, `pipeline_smart_chunk_cold_start_speedup` assumes text is
-generated three times faster than it is spoken.
+seconds per character and word plus first-audio latency for the default model
+and voice; additional models use model-specific subdirectories so their voice
+statistics cannot collide. `llm-<id>.json` records characters and words per
+sentence plus observed sentence-arrival rates. Writes are atomic and occur
+after eight new observations by default, with a final write during clean
+shutdown. Configure the source identity with `pipeline_smart_chunk_llm_id`.
+Until arrival timing has been observed,
+`pipeline_smart_chunk_cold_start_speedup` assumes text is generated three times
+faster than it is spoken.
 
 `pipeline_smart_chunk_enabled` controls the behavior.
 `pipeline_smart_chunk_confidence` selects the upper statistical estimate
@@ -568,10 +589,11 @@ Uploads are stored atomically as `<name>.safetensors` in
 `TTS_DATA_DIRECTORY`, which defaults to `/data`. `TTS_MAXIMUM_VOICE_UPLOAD_BYTES`
 limits each upload and defaults to 100 MiB. A request with `"voice": "foo"`
 selects `/data/foo.safetensors` (or the corresponding file in the configured
-data directory); setting `TTS_VOICE=foo` makes it the default. Replacing a voice
-through the upload endpoint invalidates its cached state so the next request
-loads the new file. Mount the data directory on persistent storage when uploads
-must survive container replacement.
+data directory); setting `TTS_VOICE=foo` makes it the default model's voice,
+while each additional model has its own `voice` setting. Replacing a voice
+through the upload endpoint invalidates its cached state in every loaded model,
+so each model's next request loads the new file. Mount the data directory on
+persistent storage when uploads must survive container replacement.
 
 The STT and TTS `/metrics` endpoints use Prometheus' text exposition format.
 They include Python process collectors, model readiness/load gauges, request
@@ -579,8 +601,9 @@ counts and latency, active requests, busy rejections, and configuration updates.
 STT additionally reports audio duration, chunk and commit processing latency,
 and time to first stable delta. TTS additionally reports voice load duration,
 time to first PCM audio, output duration, real-time factor, and pipeline
-requests and synthesized segment counts by transport. Metrics stay local until
-a Prometheus server is configured to scrape them.
+requests and synthesized segment counts by transport. TTS model and voice load
+gauges carry a `model` label. Metrics stay local until a Prometheus server is
+configured to scrape them.
 
 ## Dependencies
 
