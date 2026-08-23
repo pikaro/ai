@@ -72,6 +72,29 @@ async def _proxy_configuration_request(
     return _forward_upstream_response(upstream_response)
 
 
+async def _proxy_tts_discovery_request(
+    runtime: AssistantRuntime,
+    resource: Literal['models', 'voices'],
+) -> Response:
+    url = f'{runtime.settings.tts_base_url.rstrip("/")}/v1/{resource}'
+    try:
+        upstream_response = await runtime.http.request('GET', url)
+    except httpx.RequestError as error:
+        LOGGER.warning(
+            'TTS discovery proxy request failed',
+            extra={
+                'event_id': 'ID_assistant_tts_discovery_proxy_failed',
+                'resource': resource,
+                'error_type': type(error).__name__,
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f'TTS {resource} request failed',
+        ) from error
+    return _forward_upstream_response(upstream_response)
+
+
 def _forward_upstream_headers(upstream_response: httpx.Response) -> dict[str, str]:
     return {
         name: value
@@ -308,6 +331,16 @@ async def dashboard_transcription(
     return {'transcript': transcript}
 
 
+@router.get('/dashboard/tts/models', include_in_schema=False)
+async def dashboard_tts_models(request: Request) -> Response:
+    return await _proxy_tts_discovery_request(runtime_from_request(request), 'models')
+
+
+@router.get('/dashboard/tts/voices', include_in_schema=False)
+async def dashboard_tts_voices(request: Request) -> Response:
+    return await _proxy_tts_discovery_request(runtime_from_request(request), 'voices')
+
+
 @router.post('/dashboard/tts', include_in_schema=False)
 async def dashboard_speech(
     request: Request,
@@ -316,7 +349,7 @@ async def dashboard_speech(
     runtime = runtime_from_request(request)
     url = f'{runtime.settings.tts_base_url.rstrip("/")}/v1/audio/speech'
     request_body: dict[str, object] = {
-        'model': runtime.settings.tts_model,
+        'model': speech_request.model or runtime.settings.tts_model,
         'input': speech_request.text,
         'response_format': speech_request.response_format,
     }

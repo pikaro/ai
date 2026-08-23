@@ -60,6 +60,11 @@ class ModelMismatchError(TtsServiceError):
         super().__init__(message)
 
 
+class VoiceModelConflictError(TtsServiceError):
+    def __init__(self) -> None:
+        super().__init__('request voices select different models')
+
+
 class UnsupportedSpeedError(TtsServiceError):
     def __init__(self) -> None:
         super().__init__('Pocket TTS does not support speed adjustment')

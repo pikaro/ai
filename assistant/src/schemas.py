@@ -19,6 +19,7 @@ class DashboardSpeechRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     text: str = Field(min_length=1)
+    model: str | None = Field(default=None, min_length=1)
     voice: str | None = Field(default=None, min_length=1)
     pipeline: bool = False
     response_format: Literal['pcm', 'wav'] = 'wav'

@@ -20,6 +20,7 @@ from tts.src.domain import (
     SpeechCommand,
     UndefinedSpeakerError,
     UnsupportedSpeedError,
+    VoiceModelConflictError,
 )
 from tts.src.engine import PocketTtsEngine, wav_from_pcm
 from tts.src.pipeline import PcmPipeline, SmartChunkKnowledge, SpeakerTurn, TextSegmenter
@@ -28,7 +29,7 @@ from tts.src.streaming import IncrementalPipelineSession, IncrementalTaggedPipel
 from tts.src.voices import StoredVoice, VoiceRepository
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Iterable
     from typing import BinaryIO, Literal
 
     from tts.src.config import Settings
@@ -112,6 +113,7 @@ class TtsRuntime:
                         'language': model.language,
                         'voice': model.voice,
                         'additional_models': {},
+                        'model_by_voice': {},
                     },
                 )
                 for model_id, model in settings.additional_models.items()
@@ -194,6 +196,29 @@ class TtsRuntime:
         except KeyError as error:
             raise ModelMismatchError(self.model_ids, selected) from error
 
+    def _select_model(
+        self,
+        requested_model: str | None,
+        voices: Iterable[str | None],
+    ) -> _ModelRuntime:
+        selected = self._model(requested_model)
+        if selected.settings.model_id != self.settings.model_id:
+            return selected
+        routed_models: set[str] = set()
+        for voice in voices:
+            voice_name = voice.strip() if voice is not None else 'default'
+            model_id = (
+                self.settings.model_id
+                if not voice_name or voice_name == 'default'
+                else self.settings.model_by_voice.get(voice_name, self.settings.model_id)
+            )
+            routed_models.add(model_id)
+        if len(routed_models) > 1:
+            raise VoiceModelConflictError
+        if routed_models:
+            return self._model(routed_models.pop())
+        return selected
+
     def prepare_voice(self, requested_voice: str | None, *, model: str | None = None) -> str:
         return self._model(model).prepare_voice(requested_voice)
 
@@ -203,7 +228,7 @@ class TtsRuntime:
         *,
         model: str | None = None,
     ) -> IncrementalPipelineSession:
-        selected = self._model(model)
+        selected = self._select_model(model, (requested_voice,))
         return IncrementalPipelineSession(
             selected,
             selected.prepare_voice(requested_voice),
@@ -216,29 +241,49 @@ class TtsRuntime:
     ) -> IncrementalTaggedPipelineSession:
         return IncrementalTaggedPipelineSession(self._model(model))
 
-    def validate_speech(self, command: SpeechCommand) -> str:
+    def _validated_speech(self, command: SpeechCommand) -> tuple[str, _ModelRuntime]:
         text = command.text.strip()
-        _ = self.validate_options(command.model, command.speed)
+        selected = self.validate_options(command.model, command.speed, voices=(command.voice,))
         if not text:
             raise EmptyInputError
         if len(text) > self.settings.maximum_input_characters:
             raise InputTooLongError
-        return text
+        return text, selected
+
+    def validate_speech(self, command: SpeechCommand) -> str:
+        return self._validated_speech(command)[0]
 
     def prepare_speech(self, command: SpeechCommand) -> PreparedSpeech:
-        text = self.validate_speech(command)
+        text, selected = self._validated_speech(command)
         return PreparedSpeech(
-            model=command.model,
+            model=selected.settings.model_id,
             text=text,
-            voice=self.prepare_voice(command.voice, model=command.model),
+            voice=selected.prepare_voice(command.voice),
         )
 
-    def prepare_multi_speaker_turns(  # noqa: C901
+    def prepare_multi_speaker(
         self,
         command: MultiSpeakerCommand,
+    ) -> tuple[str, list[SpeakerTurn]]:
+        """Validate structured input and bind every turn to one selected model."""
+        selected = self.validate_options(
+            command.model,
+            command.speed,
+            voices=command.speakers.values(),
+        )
+        turns = self._prepare_multi_speaker_turns(command, selected)
+        return selected.settings.model_id, turns
+
+    def prepare_multi_speaker_turns(self, command: MultiSpeakerCommand) -> list[SpeakerTurn]:
+        """Return validated turns for callers that do not need the routed model ID."""
+        return self.prepare_multi_speaker(command)[1]
+
+    def _prepare_multi_speaker_turns(  # noqa: C901
+        self,
+        command: MultiSpeakerCommand,
+        selected: _ModelRuntime,
     ) -> list[SpeakerTurn]:
         """Validate structured input and preload every voice before streaming."""
-        selected = self.validate_options(command.model, command.speed)
         normalized_segments: list[tuple[str, str]] = []
         total_characters = 0
         for segment in command.segments:
@@ -267,8 +312,14 @@ class TtsRuntime:
             SpeakerTurn(speaker, voices[speaker], text) for speaker, text in normalized_segments
         ]
 
-    def validate_options(self, model: str, speed: float) -> _ModelRuntime:
-        selected = self._model(model)
+    def validate_options(
+        self,
+        model: str,
+        speed: float,
+        *,
+        voices: Iterable[str | None] = (),
+    ) -> _ModelRuntime:
+        selected = self._select_model(model, voices)
         if speed != 1.0:
             raise UnsupportedSpeedError
         return selected

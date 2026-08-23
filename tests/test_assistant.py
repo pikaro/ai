@@ -11,7 +11,7 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import httpx
 from fastapi import WebSocket, WebSocketException, status
@@ -221,6 +221,10 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="assistant-mic"', response.text)
         self.assertIn('fetch(`/dashboard/stt?', response.text)
         self.assertIn("fetch('/dashboard/tts'", response.text)
+        self.assertIn('fetch(`/dashboard/tts/${resource}`', response.text)
+        self.assertIn("fetchTtsChoice('models')", response.text)
+        self.assertIn("fetchTtsChoice('voices')", response.text)
+        self.assertIn('id="tts-model"', response.text)
         self.assertIn('id="tts-voice"', response.text)
         self.assertIn('id="tts-format"', response.text)
         self.assertIn('id="tts-pipeline"', response.text)
@@ -351,6 +355,47 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                     'PATCH',
                     'http://tts.test/config',
                     json=patch_body,
+                )
+            finally:
+                await runtime.close()
+
+    async def test_tts_model_and_voice_discovery_are_proxied(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(
+                tts_base_url='http://tts.test',
+                system_prompt_path=Path(directory) / 'system-prompt',
+            )
+            runtime = AssistantRuntime(settings)
+            assistant_app.state.runtime = runtime
+            models_response = httpx.Response(
+                200,
+                json={'object': 'list', 'data': [{'id': 'english'}, {'id': 'german'}]},
+                request=httpx.Request('GET', 'http://tts.test/v1/models'),
+            )
+            voices_response = httpx.Response(
+                200,
+                json=['alba', 'juergen'],
+                request=httpx.Request('GET', 'http://tts.test/v1/voices'),
+            )
+            request_discovery = AsyncMock(side_effect=[models_response, voices_response])
+            transport = httpx.ASGITransport(app=assistant_app)
+            try:
+                with patch.object(runtime.http, 'request', request_discovery):
+                    async with httpx.AsyncClient(
+                        transport=transport,
+                        base_url='http://test',
+                    ) as client:
+                        models = await client.get('/dashboard/tts/models')
+                        voices = await client.get('/dashboard/tts/voices')
+
+                self.assertEqual(models.json(), models_response.json())
+                self.assertEqual(voices.json(), voices_response.json())
+                self.assertEqual(
+                    request_discovery.await_args_list,
+                    [
+                        call('GET', 'http://tts.test/v1/models'),
+                        call('GET', 'http://tts.test/v1/voices'),
+                    ],
                 )
             finally:
                 await runtime.close()
@@ -522,6 +567,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                             '/dashboard/tts',
                             json={
                                 'text': 'Stream this.',
+                                'model': 'selected-tts',
                                 'voice': 'bender',
                                 'pipeline': True,
                                 'response_format': 'pcm',
@@ -541,7 +587,7 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     json.loads(upstream_request.content),
                     {
-                        'model': 'debug-tts',
+                        'model': 'selected-tts',
                         'input': 'Stream this.',
                         'response_format': 'pcm',
                         'voice': 'bender',

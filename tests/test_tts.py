@@ -26,9 +26,12 @@ from tts.src.domain import (
     InvalidMultiSpeakerMarkupError,
     InvalidVoiceNameError,
     InvalidVoiceSelectorError,
+    MultiSpeakerCommand,
+    SpeakerSegment,
     SpeechCommand,
     UndefinedSpeakerError,
     UnsupportedSpeedError,
+    VoiceModelConflictError,
     VoiceUploadTooLargeError,
 )
 from tts.src.markup import (
@@ -73,6 +76,9 @@ class SettingsTest(unittest.TestCase):
             'TTS_LATEST_WAV_PATH': '/recordings/latest.wav',
             'TTS_MAXIMUM_INPUT_CHARACTERS': '120',
             'TTS_MAXIMUM_VOICE_UPLOAD_BYTES': '2048',
+            'TTS_MODEL_BY_VOICE': json.dumps(
+                {'juergen': 'kyutai/pocket-tts-german'},
+            ),
             'TTS_PIPELINE_CLAUSE_PAUSE_SECONDS': '0.04',
             'TTS_PIPELINE_FIRST_SEGMENT_COMMA_DELIMITER': 'false',
             'TTS_PIPELINE_IDLE_TIMEOUT_SECONDS': '15',
@@ -111,6 +117,10 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.latest_wav_path, Path('/recordings/latest.wav'))
         self.assertEqual(settings.maximum_input_characters, 120)
         self.assertEqual(settings.maximum_voice_upload_bytes, 2048)
+        self.assertEqual(
+            settings.model_by_voice,
+            {'juergen': 'kyutai/pocket-tts-german'},
+        )
         self.assertEqual(settings.pipeline_clause_pause_seconds, 0.04)
         self.assertFalse(settings.pipeline_first_segment_comma_delimiter)
         self.assertEqual(settings.pipeline_idle_timeout_seconds, 15)
@@ -140,6 +150,15 @@ class SettingsTest(unittest.TestCase):
                     MODEL_ID: AdditionalModelSettings(language='german', voice='juergen'),
                 },
             )
+
+    def test_voice_model_map_must_reference_a_configured_model(self) -> None:
+        with self.assertRaises(ValidationError):
+            _ = Settings(model_by_voice={'juergen': 'missing-model'})
+
+    def test_voice_model_map_keys_must_be_valid_voice_names(self) -> None:
+        for voice in ('../juergen', 'default'):
+            with self.subTest(voice=voice), self.assertRaises(ValidationError):
+                _ = Settings(model_by_voice={voice: MODEL_ID})
 
 
 class MultiModelRuntimeTest(unittest.IsolatedAsyncioTestCase):
@@ -233,6 +252,76 @@ class MultiModelRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers['X-Audio-Sample-Rate'], '16000')
         german.model.generate_audio_stream.assert_called_once_with(german_state, 'Guten Tag')
         runtime.engine.model.generate_audio_stream.assert_not_called()
+
+    async def test_http_request_autoselects_model_from_named_voice(self) -> None:
+        settings = self.settings().model_copy(
+            update={'model_by_voice': {'juergen': self.german_model}},
+        )
+        runtime = TtsRuntime(settings)
+        runtime.engine.model = MagicMock(sample_rate=24_000)
+        runtime.engine.voice_states = {'alba': object()}
+        german = runtime._model(self.german_model).engine  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        german_state = object()
+        german.model = MagicMock(sample_rate=16_000)
+        german.voice_states = {'juergen': german_state}
+        german.model.generate_audio_stream.return_value = iter([b'\x01\x02'])
+        app.state.runtime = runtime
+        transport = httpx.ASGITransport(app=app)
+
+        with patch.object(german, '_pcm16_bytes', side_effect=lambda chunk: chunk):
+            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+                response = await client.post(
+                    '/v1/audio/speech',
+                    json={
+                        'input': 'Guten Tag',
+                        'voice': 'juergen',
+                        'response_format': 'pcm',
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers['X-Audio-Sample-Rate'], '16000')
+        german.model.generate_audio_stream.assert_called_once_with(german_state, 'Guten Tag')
+        runtime.engine.model.generate_audio_stream.assert_not_called()
+
+    def test_explicit_additional_model_takes_precedence_over_voice_map(self) -> None:
+        settings = self.settings().model_copy(
+            update={'model_by_voice': {'juergen': MODEL_ID}},
+        )
+        runtime = TtsRuntime(settings)
+        german = runtime._model(self.german_model).engine  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        german.model = MagicMock(sample_rate=16_000)
+        german.voice_states = {'juergen': object()}
+
+        prepared = runtime.prepare_speech(
+            SpeechCommand(
+                model=self.german_model,
+                text='Guten Tag',
+                voice='juergen',
+                speed=1.0,
+            ),
+        )
+
+        self.assertEqual(prepared.model, self.german_model)
+
+    def test_multi_speaker_request_rejects_conflicting_voice_models(self) -> None:
+        settings = self.settings().model_copy(
+            update={
+                'model_by_voice': {
+                    'juergen': self.german_model,
+                },
+            },
+        )
+        runtime = TtsRuntime(settings)
+        command = MultiSpeakerCommand(
+            model=MODEL_ID,
+            speakers={'english': 'alba', 'german': 'juergen'},
+            segments=(SpeakerSegment(speaker='english', text='Hello'),),
+            speed=1.0,
+        )
+
+        with self.assertRaises(VoiceModelConflictError):
+            _ = runtime.prepare_multi_speaker(command)
 
     async def test_models_endpoint_lists_every_resident_model(self) -> None:
         runtime = TtsRuntime(self.settings())
@@ -1239,6 +1328,30 @@ class ConfigurationEndpointTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(runtime.model_ids, (MODEL_ID,))
+
+    async def test_voice_model_map_can_be_updated_without_restart(self) -> None:
+        german_model = 'kyutai/pocket-tts-german'
+        runtime = TtsRuntime(
+            Settings(
+                additional_models={
+                    german_model: AdditionalModelSettings(
+                        language='german',
+                        voice='juergen',
+                    ),
+                },
+            ),
+        )
+        app.state.runtime = runtime
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            response = await client.patch(
+                '/config',
+                json={'model_by_voice': {'juergen': german_model}},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(runtime.settings.model_by_voice, {'juergen': german_model})
+        self.assertEqual(response.json()['changed'], ['model_by_voice'])
 
     async def test_concurrent_synthesis_is_rejected_without_waiting(self) -> None:
         runtime = TtsRuntime(Settings())

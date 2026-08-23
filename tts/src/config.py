@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from service_contracts.tts import MODEL_ID
+from tts.src.voices import is_voice_name
 
 
 class AdditionalModelSettings(BaseModel):
@@ -34,6 +35,7 @@ class Settings(BaseSettings):
     language: str = 'english'
     voice: str = 'alba'
     additional_models: dict[str, AdditionalModelSettings] = Field(default_factory=dict)
+    model_by_voice: dict[str, str] = Field(default_factory=dict)
     data_directory: Path = Path('/data')
     torch_threads: int = Field(default=2, ge=1)
     maximum_input_characters: int = Field(default=50_000, ge=1)
@@ -80,5 +82,16 @@ class Settings(BaseSettings):
         empty_model_ids = [model_id for model_id in self.additional_models if not model_id.strip()]
         if empty_model_ids:
             message = 'additional_models keys must be non-empty model ids'
+            raise ValueError(message)
+        invalid_voices = [
+            voice for voice in self.model_by_voice if voice == 'default' or not is_voice_name(voice)
+        ]
+        if invalid_voices:
+            message = 'model_by_voice keys must be valid named voices, not "default"'
+            raise ValueError(message)
+        loaded_model_ids = {self.model_id, *self.additional_models}
+        unloaded_model_ids = sorted(set(self.model_by_voice.values()) - loaded_model_ids)
+        if unloaded_model_ids:
+            message = 'model_by_voice values must name configured models'
             raise ValueError(message)
         return self

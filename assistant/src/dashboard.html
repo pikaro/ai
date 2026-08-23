@@ -175,7 +175,7 @@
       margin-top: 0;
     }
 
-    .tts-option input[type="text"], .tts-option select {
+    .tts-option select {
       box-sizing: border-box;
       width: 100%;
       margin-top: 6px;
@@ -312,9 +312,17 @@
         <label for="tts-text">Text to synthesize</label>
         <textarea id="tts-text" class="speech-editor" spellcheck="true"></textarea>
         <div class="tts-options">
+          <label class="tts-option" for="tts-model">
+            Model
+            <select id="tts-model">
+              <option value="" selected>Assistant configured model</option>
+            </select>
+          </label>
           <label class="tts-option" for="tts-voice">
-            Voice (`default` or name)
-            <input id="tts-voice" type="text" value="default" spellcheck="false">
+            Voice
+            <select id="tts-voice">
+              <option value="default" selected>default</option>
+            </select>
           </label>
           <label class="tts-option" for="tts-format">
             Response format
@@ -636,7 +644,8 @@
     const assistantMicButton = document.querySelector('#assistant-mic');
     const microphoneStatus = document.querySelector('#mic-status');
     const ttsEditor = document.querySelector('#tts-text');
-    const ttsVoiceInput = document.querySelector('#tts-voice');
+    const ttsModelSelect = document.querySelector('#tts-model');
+    const ttsVoiceSelect = document.querySelector('#tts-voice');
     const ttsFormatSelect = document.querySelector('#tts-format');
     const ttsPipelineToggle = document.querySelector('#tts-pipeline');
     const speakButton = document.querySelector('#speak');
@@ -654,6 +663,61 @@
     function setAudioResult(message, error = false) {
       audioResult.textContent = message;
       audioResult.classList.toggle('error', error);
+    }
+
+    function appendSelectOption(select, value, label = value) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      select.append(option);
+    }
+
+    async function fetchTtsChoice(resource) {
+      const response = await fetch(`/dashboard/tts/${resource}`, {
+        headers: {Accept: 'application/json'},
+      });
+      const body = await responseBody(response);
+      if (!response.ok) throw new Error(`${response.status} ${JSON.stringify(body)}`);
+      return body;
+    }
+
+    async function loadTtsChoices() {
+      const failures = [];
+      const [modelsResult, voicesResult] = await Promise.allSettled([
+        fetchTtsChoice('models'),
+        fetchTtsChoice('voices'),
+      ]);
+      if (modelsResult.status === 'fulfilled') {
+        const models = [...new Set(
+          modelsResult.value?.data?.map(model => model?.id)
+            .filter(model => typeof model === 'string' && model.length),
+        )];
+        if (models.length) {
+          ttsModelSelect.replaceChildren();
+          appendSelectOption(ttsModelSelect, '', 'Assistant configured model');
+          models.forEach(model => appendSelectOption(ttsModelSelect, model));
+        } else {
+          failures.push('models: TTS returned no models');
+        }
+      } else {
+        failures.push(`models: ${String(modelsResult.reason)}`);
+      }
+      if (voicesResult.status === 'fulfilled' && Array.isArray(voicesResult.value)) {
+        const voices = [...new Set(
+          voicesResult.value.filter(voice =>
+            typeof voice === 'string' && voice.length && voice !== 'default'),
+        )];
+        ttsVoiceSelect.replaceChildren();
+        appendSelectOption(ttsVoiceSelect, 'default');
+        voices.forEach(voice => appendSelectOption(ttsVoiceSelect, voice));
+      } else if (voicesResult.status === 'rejected') {
+        failures.push(`voices: ${String(voicesResult.reason)}`);
+      } else {
+        failures.push('voices: TTS returned an invalid voice list');
+      }
+      if (failures.length) {
+        setAudioResult(`Could not load TTS ${failures.join('; ')}`, true);
+      }
     }
 
     function setMicrophoneButtons(recordingMode = null, busy = false) {
@@ -1109,14 +1173,18 @@
         setAudioResult('Enter text to synthesize', true);
         return;
       }
-      const voice = ttsVoiceInput.value.trim() || 'default';
+      const model = ttsModelSelect.value;
+      const voice = ttsVoiceSelect.value;
       const responseFormat = ttsFormatSelect.value;
       const pipeline = ttsPipelineToggle.checked;
       const mode = `${pipeline ? 'pipelined' : 'direct'} ${responseFormat.toUpperCase()}`;
       const startedAt = performance.now();
-      [speakButton, ttsVoiceInput, ttsFormatSelect, ttsPipelineToggle]
+      [speakButton, ttsModelSelect, ttsVoiceSelect, ttsFormatSelect, ttsPipelineToggle]
         .forEach(control => { control.disabled = true; });
-      setAudioResult(`Generating ${mode} speech with voice ${voice}…`);
+      setAudioResult(
+        `Generating ${mode} speech with model ${model || 'configured default'} ` +
+        `and voice ${voice}…`,
+      );
       let pcmContext;
       try {
         if (pcmPlaybackContext) {
@@ -1137,6 +1205,7 @@
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
             text,
+            model: model || undefined,
             voice,
             pipeline,
             response_format: responseFormat,
@@ -1154,7 +1223,8 @@
           }
           const completedMilliseconds = performance.now() - startedAt;
           setAudioResult(
-            `${response.status} ${mode} with voice ${voice}\n` +
+            `${response.status} ${mode} with model ${model || 'configured default'} ` +
+            `and voice ${voice}\n` +
             `First PCM: ${result.firstChunkMilliseconds.toFixed(0)} ms; ` +
             `complete: ${completedMilliseconds.toFixed(0)} ms; ` +
             `${result.audioBytes} bytes`,
@@ -1165,7 +1235,8 @@
           playAudioBlob(audio);
           const completedMilliseconds = performance.now() - startedAt;
           setAudioResult(
-            `${response.status} ${mode} with voice ${voice}; ` +
+            `${response.status} ${mode} with model ${model || 'configured default'} ` +
+            `and voice ${voice}; ` +
             `complete: ${completedMilliseconds.toFixed(0)} ms`,
           );
         }
@@ -1176,7 +1247,7 @@
         }
         setAudioResult(String(error), true);
       } finally {
-        [speakButton, ttsVoiceInput, ttsFormatSelect, ttsPipelineToggle]
+        [speakButton, ttsModelSelect, ttsVoiceSelect, ttsFormatSelect, ttsPipelineToggle]
           .forEach(control => { control.disabled = false; });
       }
     }
@@ -1184,6 +1255,7 @@
     sttMicButton.addEventListener('click', () => toggleMicrophone('stt'));
     assistantMicButton.addEventListener('click', () => toggleMicrophone('assistant'));
     speakButton.addEventListener('click', speakText);
+    loadTtsChoices();
     loadPrompt();
   </script>
 </body>

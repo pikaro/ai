@@ -45,10 +45,12 @@ proxied to their existing `/config` endpoints, so their normal validation, busy
 rejection, and restart restrictions still apply. The dashboard also edits the
 assistant system prompt. Its audio debug controls record mono PCM16 at the
 browser's actual audio-context sample rate and can submit those exact bytes to
-STT or the assistant realtime endpoint. The TTS debug form selects a voice,
-toggles the server-side pipeline, and requests either WAV or PCM. PCM stays
-streamed through the dashboard proxy and is scheduled through the browser audio
-context as chunks arrive. A small playback-ahead bound propagates backpressure
+STT or the assistant realtime endpoint. The TTS debug form selects a voice and
+model, toggles the server-side pipeline, and requests either WAV or PCM. Its
+selectors use dashboard proxies for the TTS service's `GET /v1/voices` and
+`GET /v1/models` endpoints. PCM stays streamed through the dashboard proxy and
+is scheduled through the browser audio context as chunks arrive. A small
+playback-ahead bound propagates backpressure
 instead of buffering an arbitrary response. The page reports first-chunk and
 completion timing, then adds a WAV container locally for replay. Assistant PCM
 responses and TTS audio can therefore both be played in the browser. Browser
@@ -144,6 +146,7 @@ The assistant runtime combines the STT, llama.cpp, and TTS services through:
 - `GET /health/live` and `GET /health/ready`
 - `GET /metrics`
 - `GET /dashboard`
+- `GET /dashboard/tts/models` and `GET /dashboard/tts/voices`
 - `POST /dashboard/stt` and `POST /dashboard/tts` (dashboard debug helpers)
 - `GET /config` and `PATCH /config`
 - `GET /system-prompt` and `PUT /system-prompt`
@@ -366,12 +369,21 @@ entry through its configured language. For example:
 export TTS_ADDITIONAL_MODELS='{
   "kyutai/pocket-tts-german": {"language":"german","voice":"juergen"}
 }'
+export TTS_MODEL_BY_VOICE='{
+  "juergen": "kyutai/pocket-tts-german"
+}'
 ```
 
 All models load before readiness succeeds and remain resident until shutdown.
 Requests select one with the existing `model` field, and `GET /v1/models` lists
-the complete loaded set. Set the assistant's `tts_model` configuration (or
-`ASSISTANT_TTS_MODEL`) to the desired ID for assistant speech.
+the complete loaded set. When a request uses the default model ID,
+`model_by_voice` can route an explicitly named voice to another loaded model.
+An explicitly selected additional model takes precedence over this map. A
+multi-speaker request whose mapped voices select different models is rejected,
+because one request remains bound to one model. The map is validated against
+configured model IDs and can be changed through `PATCH /config` without a
+restart. Set the assistant's `tts_model` configuration (or
+`ASSISTANT_TTS_MODEL`) to the desired default ID for assistant speech.
 
 The TTS API serves:
 
@@ -379,6 +391,7 @@ The TTS API serves:
 - `GET /metrics`
 - `GET /config` and `PATCH /config`
 - `GET /v1/models`
+- `GET /v1/voices`
 - `POST /v1/voices`
 - `POST /v1/audio/speech`
 - `POST /v1/audio/speech/pipeline`
