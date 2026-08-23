@@ -76,6 +76,12 @@ class TtsRuntime:
         self.engine.invalidate_voice(stored.name)
         return stored
 
+    def list_voices(self) -> list[StoredVoice]:
+        return VoiceRepository(
+            self.settings.data_directory,
+            self.settings.maximum_voice_upload_bytes,
+        ).list()
+
     def close(self) -> None:
         for knowledge in self._smart_chunk_knowledge_cache.values():
             knowledge.save(force=True)

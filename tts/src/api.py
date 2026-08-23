@@ -882,6 +882,12 @@ async def speech_pipeline_websocket(websocket: WebSocket) -> None:
     await _stream_pipeline_websocket(websocket, _runtime_from_websocket(websocket))
 
 
+@app.get('/v1/voices', response_model=list[str])
+async def list_voices(request: Request) -> list[str]:
+    runtime = _runtime(request)
+    return [voice.name for voice in runtime.list_voices()]
+
+
 @app.post('/v1/voices', response_model=VoiceUploadResponse, status_code=status.HTTP_201_CREATED)
 async def upload_voice(
     request: Request,

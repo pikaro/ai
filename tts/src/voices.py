@@ -56,6 +56,14 @@ class VoiceRepository:
         self._store_atomic(source, destination)
         return StoredVoice(name=name, filename=destination.name, replaced=replaced)
 
+    def list(self) -> list[StoredVoice]:
+        voices: list[StoredVoice] = []
+        for path in self._directory.glob('*.safetensors'):
+            name = path.stem
+            if is_voice_name(name):
+                voices.append(StoredVoice(name=name, filename=path.name, replaced=False))
+        return voices
+
     def _store_atomic(self, source: BinaryIO, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: Path | None = None
